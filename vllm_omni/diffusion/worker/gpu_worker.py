@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import cloudpickle
 import multiprocessing as mp
 import os
+import pickle
 import time
 
 import torch
@@ -91,6 +93,20 @@ class GPUWorker:
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
 
+    def print_message(self, message: str) -> str:
+        """
+        Print a message from the worker.
+        
+        Args:
+            message: The message to print
+            
+        Returns:
+            A confirmation string with the worker rank
+        """
+        print(f"[Worker {self.rank}] {message}", flush=True)
+        logger.info(f"[Worker {self.rank}] {message}")
+        return f"Worker {self.rank} printed: {message}"
+
     @torch.inference_mode()
     def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """
@@ -124,6 +140,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         gpu_id: int,
         broadcast_handle,
+        rpc_broadcast_handle,
     ):
         self.od_config = od_config
 
@@ -133,8 +150,13 @@ class WorkerProc:
         # Initialize MessageQueue reader from handle
         self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
 
+        # Initialize RPC MessageQueue reader from handle
+        self.rpc_mq = MessageQueue.create_from_handle(rpc_broadcast_handle, gpu_id)
+
         self.result_mq = None
         self.result_mq_handle = None
+        self.rpc_result_mq = None
+        self.rpc_result_mq_handle = None
 
         # Setup result sender (only for rank 0 for now, or whoever needs to reply)
         # Assuming only rank 0 replies to scheduler as per original logic
@@ -144,6 +166,11 @@ class WorkerProc:
             self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
             self.result_mq_handle = self.result_mq.export_handle()
             logger.info(f"Worker {gpu_id} created result MessageQueue")
+
+            # Create MessageQueue for RPC results (1 writer -> 1 reader)
+            self.rpc_result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
+            self.rpc_result_mq_handle = self.rpc_result_mq.export_handle()
+            logger.info(f"Worker {gpu_id} created RPC result MessageQueue")
 
         assert od_config.master_port is not None
         worker = GPUWorker(
@@ -162,11 +189,57 @@ class WorkerProc:
         if self.result_mq is not None:
             self.result_mq.enqueue(output)
 
+    def return_rpc_result(self, result):
+        """
+        replies RPC result to client, only on rank 0
+        """
+        if self.rpc_result_mq is not None:
+            self.rpc_result_mq.enqueue(result)
+
     def recv_reqs(self):
         """
         Receive requests from broadcast queue
         """
         return self.mq.dequeue(indefinite=True)
+
+    def recv_rpc_reqs(self):
+        """
+        Receive RPC requests from RPC broadcast queue
+        """
+        try:
+            return self.rpc_mq.dequeue(timeout=0.001)
+        except Exception:
+            return None
+
+    def execute_rpc(self, rpc_request: dict):
+        """Execute an RPC request and return the result."""
+        try:
+            method = rpc_request["method"]
+            args = rpc_request.get("args", ())
+            kwargs = rpc_request.get("kwargs", {})
+            output_rank = rpc_request.get("output_rank")
+
+            # Only execute if we should reply (either output_rank is None or matches our rank)
+            if output_rank is not None and output_rank != self.gpu_id:
+                return None
+
+            # Deserialize method if it's a callable
+            if isinstance(method, bytes):
+                method = cloudpickle.loads(method)
+
+            # Execute the method
+            if isinstance(method, str):
+                # Method is a string, call it on the worker
+                func = getattr(self.worker, method)
+                result = func(*args, **kwargs)
+            else:
+                # Method is a callable
+                result = method(self.worker, *args, **kwargs)
+
+            return result
+        except Exception as e:
+            logger.error(f"Error executing RPC: {e}", exc_info=True)
+            return {"status": "error", "error": str(e)}
 
     # TODO: queueing, cancellation
     def worker_busy_loop(self) -> None:
@@ -175,6 +248,18 @@ class WorkerProc:
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
         while self._running:
+            # Check for RPC requests (non-blocking)
+            rpc_req = self.recv_rpc_reqs()
+            if rpc_req is not None:
+                try:
+                    result = self.execute_rpc(rpc_req)
+                    if result is not None and self.gpu_id == 0:
+                        self.return_rpc_result(result)
+                except Exception as e:
+                    logger.error(f"Error processing RPC: {e}", exc_info=True)
+                    if self.gpu_id == 0:
+                        self.return_rpc_result({"status": "error", "error": str(e)})
+
             reqs = None
             # 1: receive requests
             try:
@@ -226,6 +311,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
+        rpc_broadcast_handle,
     ) -> None:
         """Worker initialization and execution loops."""
 
@@ -233,12 +319,14 @@ class WorkerProc:
             od_config,
             gpu_id=rank,
             broadcast_handle=broadcast_handle,
+            rpc_broadcast_handle=rpc_broadcast_handle,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
             {
                 "status": "ready",
                 "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
+                "rpc_result_handle": worker_proc.rpc_result_mq_handle if rank == 0 else None,
             }
         )
         worker_proc.worker_busy_loop()

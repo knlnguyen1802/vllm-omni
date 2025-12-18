@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import multiprocessing as mp
+import pickle
 import time
+from typing import Any, Callable
 
+import cloudpickle
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
@@ -35,6 +38,13 @@ class DiffusionEngine:
 
     def step(self, requests: list[OmniDiffusionRequest]):
         try:
+            # Example: Call print_message on all workers (broadcast)
+            # Uncomment to test:
+            # self.collective_rpc(
+            #     method="print_message",
+            #     args=("Starting generation step",),
+            # )
+            
             # Apply pre-processing if available
             if self.pre_process_func is not None:
                 preprocess_start_time = time.time()
@@ -51,6 +61,15 @@ class DiffusionEngine:
             result = self.post_process_func(output.output)
             postprocess_time = time.time() - postprocess_start_time
             logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+
+            # Example: Call print_message on only worker rank 0
+            # Uncomment to test:
+            # result_msg = self.collective_rpc(
+            #     method="print_message",
+            #     args=("Generation completed!",),
+            #     unique_reply_rank=0,
+            # )
+            # logger.info(f"Worker response: {result_msg}")
 
             return result
         except Exception as e:
@@ -75,9 +94,11 @@ class DiffusionEngine:
 
         # Get the broadcast handle from the initialized scheduler
         broadcast_handle = scheduler.get_broadcast_handle()
+        rpc_broadcast_handle = scheduler.get_rpc_broadcast_handle()
 
-        processes, result_handle = self._launch_workers(
+        processes, result_handle, rpc_result_handle = self._launch_workers(
             broadcast_handle=broadcast_handle,
+            rpc_broadcast_handle=rpc_broadcast_handle,
         )
 
         if result_handle is not None:
@@ -85,9 +106,14 @@ class DiffusionEngine:
         else:
             logger.error("Failed to get result queue handle from workers")
 
+        if rpc_result_handle is not None:
+            scheduler.initialize_rpc_result_queue(rpc_result_handle)
+        else:
+            logger.error("Failed to get RPC result queue handle from workers")
+
         self._processes = processes
 
-    def _launch_workers(self, broadcast_handle):
+    def _launch_workers(self, broadcast_handle, rpc_broadcast_handle):
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -112,6 +138,7 @@ class DiffusionEngine:
                     od_config,
                     writer,
                     broadcast_handle,
+                    rpc_broadcast_handle,
                 ),
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
@@ -123,6 +150,7 @@ class DiffusionEngine:
         # Wait for all workers to be ready
         scheduler_infos = []
         result_handle = None
+        rpc_result_handle = None
         for writer in scheduler_pipe_writers:
             writer.close()
 
@@ -140,16 +168,92 @@ class DiffusionEngine:
 
             if i == 0:
                 result_handle = data.get("result_handle")
+                rpc_result_handle = data.get("rpc_result_handle")
 
             scheduler_infos.append(data)
             reader.close()
 
         logger.debug("All workers are ready")
 
-        return processes, result_handle
+        return processes, result_handle, rpc_result_handle
 
     def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
         return scheduler.add_req(requests)
+
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Call a method on worker processes and get results immediately.
+
+        Args:
+            method: The method name (str) or callable to execute on workers
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+            unique_reply_rank: If set, only get reply from this rank
+
+        Returns:
+            Single result if unique_reply_rank is provided, otherwise list of results
+        """
+        if self._closed:
+            raise RuntimeError("DiffusionEngine is closed.")
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        kwargs = kwargs or {}
+
+        # Prepare the method to send
+        if isinstance(method, str):
+            send_method = method
+        else:
+            send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # Prepare RPC request with output_rank specification
+        output_rank = unique_reply_rank
+        rpc_request = {
+            "type": "rpc",
+            "method": send_method,
+            "args": args,
+            "kwargs": kwargs,
+            "output_rank": output_rank,
+        }
+
+        try:
+            # Broadcast RPC request to all workers via scheduler's RPC MessageQueue
+            scheduler.rpc_mq.enqueue(rpc_request)
+
+            # Determine which workers we expect responses from
+            num_responses = 1 if output_rank is not None else self.od_config.num_gpus
+
+            responses = []
+            for _ in range(num_responses):
+                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
+                try:
+                    if scheduler.rpc_result_mq is None:
+                        raise RuntimeError("RPC result queue not initialized")
+
+                    response = scheduler.rpc_result_mq.dequeue(timeout=dequeue_timeout)
+
+                    # Check if response indicates an error
+                    if isinstance(response, dict) and response.get("status") == "error":
+                        raise RuntimeError(
+                            f"Worker failed with error '{response.get('error')}', "
+                            "please check the stack trace above for the root cause"
+                        )
+
+                    responses.append(response)
+                except TimeoutError as e:
+                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+
+            return responses[0] if output_rank is not None else responses
+
+        except Exception as e:
+            logger.error(f"RPC call failed: {e}")
+            raise
 
     def close(self, *, timeout_s: float = 30.0) -> None:
         if self._closed:
