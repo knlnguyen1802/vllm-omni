@@ -111,7 +111,7 @@ class GPUWorker:
         return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self.pipeline.loaded_weights(weights)
+        return self.pipeline.load_weights(weights)
 
     def sleep(self, level: int = 1) -> bool:
         from vllm.device_allocator.cumem import CuMemAllocator
