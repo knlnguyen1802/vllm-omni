@@ -44,15 +44,11 @@ class Scheduler:
         self.result_mq = MessageQueue.create_from_handle(handle, rank=0)
         logger.info("SyncScheduler initialized result MessageQueue")
 
-    def initialize_rpc_result_queue(self, handle):
-        # Deprecated: RPC results now use the same result queue
-        logger.info("RPC results use the unified result queue")
-
     def get_broadcast_handle(self):
         return self.mq.export_handle()
 
     def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
-        """Sends a generation request via RPC to worker rank 0 and waits for the response."""
+        """Sends a request to the scheduler and waits for the response."""
         try:
             # Prepare RPC request for generation
             rpc_request = {
@@ -60,13 +56,12 @@ class Scheduler:
                 "method": "generate",
                 "args": (requests,),
                 "kwargs": {},
-                "output_rank": 0,  # Only rank 0 replies
+                "output_rank": 0,  
             }
 
             # Broadcast RPC request to all workers
             self.mq.enqueue(rpc_request)
 
-            # Wait for result from Rank 0
             if self.result_mq is None:
                 raise RuntimeError("Result queue not initialized")
 
