@@ -10,7 +10,7 @@ from typing import Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, OmniDiffusionConfig
 from vllm_omni.diffusion.registry import get_diffusion_post_process_func, get_diffusion_pre_process_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.scheduler import Scheduler, scheduler
