@@ -3,10 +3,10 @@
 
 import multiprocessing as mp
 import time
-from collections.abc import Callable
-from typing import Any
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from vllm.logger import init_logger
 
