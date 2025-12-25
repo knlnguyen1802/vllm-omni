@@ -191,31 +191,35 @@ class WorkerProc:
         """
         return self.mq.dequeue(indefinite=True)
 
-    def execute_rpc(self, rpc_request: dict):
-        """Execute an RPC request and return the result."""
+    def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
+        """Execute an RPC request and indicate whether to reply."""
+
+        method = rpc_request["method"]
+        args = rpc_request.get("args", ())
+        kwargs = rpc_request.get("kwargs", {})
+        output_rank = rpc_request.get("output_rank")
+        exec_all_ranks = rpc_request.get("exec_all_ranks", False)
+
+        should_execute = (
+            exec_all_ranks or output_rank is None or output_rank == self.gpu_id
+        )
+        should_reply = (
+            output_rank is None or output_rank == self.gpu_id
+        ) and self.result_mq is not None
+
+        if not should_execute:
+            return None, False
+
         try:
-            method = rpc_request["method"]
-            args = rpc_request.get("args", ())
-            kwargs = rpc_request.get("kwargs", {})
-            output_rank = rpc_request.get("output_rank")
-
-            # Only execute if we should reply (either output_rank is None or matches our rank)
-            if output_rank is not None and output_rank != self.gpu_id:
-                return None
-
-            # Execute the method
             if isinstance(method, str):
-                # Method is a string, call it on the worker
                 func = getattr(self.worker, method)
                 result = func(*args, **kwargs)
             else:
-                # Method is a callable
                 result = method(self.worker, *args, **kwargs)
-
-            return result
+            return result, should_reply
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
-            return {"status": "error", "error": str(e)}
+            return {"status": "error", "error": str(e)}, should_reply
 
     # TODO: queueing, cancellation
     def worker_busy_loop(self) -> None:
@@ -243,12 +247,12 @@ class WorkerProc:
             if isinstance(msg, dict) and msg.get("type") == "rpc":
                 # Handle RPC request
                 try:
-                    result = self.execute_rpc(msg)
-                    if result is not None and self.gpu_id == 0:
+                    result, should_reply = self.execute_rpc(msg)
+                    if should_reply:
                         self.return_result(result)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
-                    if self.gpu_id == 0:
+                    if self.result_mq is not None:
                         self.return_result({"status": "error", "error": str(e)})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
