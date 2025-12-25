@@ -58,6 +58,7 @@ class Scheduler:
                 "args": (requests,),
                 "kwargs": {},
                 "output_rank": 0,
+                "exec_all_ranks": True,
             }
 
             # Broadcast RPC request to all workers
