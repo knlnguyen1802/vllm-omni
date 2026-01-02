@@ -7,7 +7,9 @@ from pathlib import Path
 
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
 
@@ -16,10 +18,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image",
-        help="Diffusion model name or local path. Supported models: Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo",
+        help="Diffusion model name or local path. Supported models: "
+        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512",
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic results.")
+    parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
     parser.add_argument(
         "--cfg_scale",
         type=float,
@@ -56,6 +59,18 @@ def parse_args() -> argparse.Namespace:
             "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
             "Default: None (no cache acceleration)."
         ),
+    )
+    parser.add_argument(
+        "--ulysses_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+    parser.add_argument(
+        "--ring_degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
     )
     return parser.parse_args()
 
@@ -98,12 +113,15 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
+    # assert args.ring_degree == 1, "Ring attention is not supported yet"
+    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
     omni = Omni(
         model=args.model,
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
+        parallel_config=parallel_config,
     )
 
     # Time profiling for generation
@@ -112,11 +130,12 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
     print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
     generation_start = time.perf_counter()
-    images = omni.generate(
+    outputs = omni.generate(
         args.prompt,
         height=args.height,
         width=args.width,
@@ -131,11 +150,31 @@ def main():
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
+    # Extract images from OmniRequestOutput
+    # omni.generate() returns Generator[OmniRequestOutput, None, None], convert to list
+    outputs = list(outputs)
+    if not outputs:
+        raise ValueError("No output generated from omni.generate()")
+    logger.info(f"Outputs: {outputs}")
+
+    # Extract images from request_output[0]['images']
+    first_output = outputs[0]
+    if not hasattr(first_output, "request_output") or not first_output.request_output:
+        raise ValueError("No request_output found in OmniRequestOutput")
+
+    req_out = first_output.request_output[0]
+    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
+        raise ValueError("Invalid request_output structure or missing 'images' key")
+
+    images = req_out.images
+    if not images:
+        raise ValueError("No images found in request_output")
+
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix or ".png"
     stem = output_path.stem or "qwen_image_output"
-    if args.num_images_per_prompt <= 1:
+    if len(images) <= 1:
         images[0].save(output_path)
         print(f"Saved generated image to {output_path}")
     else:

@@ -17,7 +17,7 @@ from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
 from vllm.sampling_params import SamplingParams
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
 
@@ -119,7 +119,7 @@ def get_use_audio_in_video_query(
     question = "Describe the content of the video, then convert what the baby say into text."
     prompt = (
         f"<|im_start|>system\n{default_system}<|im_end|>\n"
-        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|>"
+        "<|im_start|>user\n<|vision_bos|><|VIDEO|><|vision_eos|><|audio_bos|><|AUDIO|><|audio_eos|>"
         f"{question}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -319,12 +319,10 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-
     omni_llm = Omni(
         model=model_name,
         log_stats=args.enable_stats,
-        log_file=("omni_llm_pipeline.log" if args.enable_stats else None),
-        init_sleep_seconds=args.init_sleep_seconds,
+        stage_init_timeout=args.stage_init_timeout,
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
@@ -373,19 +371,24 @@ def main(args):
             prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
             print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
 
-    omni_outputs = omni_llm.generate(prompts, sampling_params_list)
+    if args.modalities is not None:
+        output_modalities = args.modalities.split(",")
+        for i, prompt in enumerate(prompts):
+            prompt["modalities"] = output_modalities
+
+    omni_generator = omni_llm.generate(prompts, sampling_params_list)
 
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
-    for stage_outputs in omni_outputs:
+    for stage_outputs in omni_generator:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 text_output = output.outputs[0].text
                 # Save aligned text file per request
-                prompt_text = prompts[request_id]["prompt"]
-                out_txt = os.path.join(output_dir, f"{request_id:05d}.txt")
+                prompt_text = output.prompt
+                out_txt = os.path.join(output_dir, f"{request_id}.txt")
                 lines = []
                 lines.append("Prompt:\n")
                 lines.append(str(prompt_text) + "\n")
@@ -399,9 +402,9 @@ def main(args):
                 print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 audio_tensor = output.multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
+                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
                 sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
@@ -423,10 +426,10 @@ def parse_args():
         help="Enable writing detailed statistics (default: disabled)",
     )
     parser.add_argument(
-        "--init-sleep-seconds",
+        "--stage-init-timeout",
         type=int,
-        default=20,
-        help="Sleep seconds after starting each stage process to allow initialization (default: 20)",
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300)",
     )
     parser.add_argument(
         "--batch-timeout",
@@ -504,6 +507,12 @@ def parse_args():
         type=str,
         default=None,
         help="Address of the Ray cluster.",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default=None,
+        help="Modalities to use for the prompts.",
     )
     return parser.parse_args()
 

@@ -1,4 +1,4 @@
-# vLLM-Omni Test File Structure and Style Guide
+# Test File Structure and Style Guide
 
 To ensure project maintainability and sustainable development, we encourage contributors to submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes. This document outlines the guidelines for organizing and naming test files.
 
@@ -113,11 +113,9 @@ vllm_omni/                          tests/
 
 ### Naming Conventions
 
-- **Unit/System Tests**: Use `test_<module_name>.py` format
-  - Example: `omni_llm.py` → `test_omni_llm.py`
+- **Unit/System Tests**: Use `test_<module_name>.py` format. Example: `omni_llm.py` → `test_omni_llm.py`
 
-- **E2E Tests**: Place in `tests/e2e/offline_inference/` or `tests/e2e/online_serving/` with descriptive names
-  - Example: `tests/e2e/offline_inference/test_qwen3_omni.py`, `tests/e2e/offline_inference/test_diffusion_model.py`
+- **E2E Tests**: Place in `tests/e2e/offline_inference/` or `tests/e2e/online_serving/` with descriptive names. Example: `tests/e2e/offline_inference/test_qwen3_omni.py`, `tests/e2e/offline_inference/test_diffusion_model.py`
 
 ### Best Practices
 
@@ -261,8 +259,8 @@ def test_video_to_audio(omni_runner: type[OmniRunner], model: str) -> None:
         assert has_audio
 ```
 
-## Checklist before submit your test files:
+## Checklist before submitting your test files
 
-1. The file is saved in a suitable places and the file name is clear.
-2. The coding style matches the requirements.
-3. For e2e omni model tests, specify the
+1. The file is saved in an appropriate place and the file name is clear.
+2. The coding style follows the requirements outlined above.
+3. For e2e model test, please ensure the test is configured under the `./buildkite/` folder.

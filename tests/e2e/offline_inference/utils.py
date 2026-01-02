@@ -110,10 +110,10 @@ def fork_new_process_for_each_test(func: Callable[_P, None]) -> Callable[_P, Non
                         ):
                             exc_info = cloudpickle.load(f)
 
-                    if (original_exception := exc_info.get("pickled_exception")) is not None:
+                    original_exception = exc_info.get("pickled_exception")
+                    if original_exception is not None and isinstance(original_exception, Exception):
                         # Re-raise the actual exception object if it was
                         # successfully pickled.
-                        assert isinstance(original_exception, Exception)
                         raise original_exception
 
                     if (original_tb := exc_info.get("traceback")) is not None:
@@ -195,7 +195,11 @@ def create_new_process_for_each_test(
         A decorator to run test functions in separate processes.
     """
     if method is None:
-        use_spawn = current_platform.is_rocm() or current_platform.is_xpu()
+        # TODO: Find out why spawn is not working correctly on ROCm
+        # The test content will not run and tests passed immediately.
+        # For now, using `fork` for ROCm as it can run with `fork`
+        # and tests are running correctly.
+        use_spawn = current_platform.is_xpu()
         method = "spawn" if use_spawn else "fork"
 
     assert method in ["spawn", "fork"], "Method must be either 'spawn' or 'fork'"

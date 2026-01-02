@@ -17,7 +17,7 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
 
@@ -143,11 +143,94 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
     )
 
 
+def get_mixed_modalities_query(
+    video_path: str | None = None,
+    image_path: str | None = None,
+    audio_path: str | None = None,
+    num_frames: int = 16,
+    sampling_rate: int = 16000,
+) -> QueryResult:
+    question = "What is recited in the audio? What is the content of this image? Why is this video funny?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "<|vision_start|><|video_pad|><|vision_end|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+    # Load video
+    if video_path:
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
+    else:
+        video_frames = VideoAsset(name="baby_reading", num_frames=num_frames).np_ndarrays
+
+    # Load image
+    if image_path:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        pil_image = Image.open(image_path)
+        image_data = convert_image_mode(pil_image, "RGB")
+    else:
+        image_data = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
+
+    # Load audio
+    if audio_path:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_data = (audio_signal.astype(np.float32), sr)
+    else:
+        audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
+
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "audio": audio_data,
+                "image": image_data,
+                "video": video_frames,
+            },
+        },
+        limit_mm_per_prompt={"audio": 1, "image": 1, "video": 1},
+    )
+
+
+def get_multi_audios_query() -> QueryResult:
+    question = "Are these two audio clips the same?"
+    prompt = (
+        f"<|im_start|>system\n{default_system}<|im_end|>\n"
+        "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
+        "<|audio_start|><|audio_pad|><|audio_end|>"
+        f"{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+    return QueryResult(
+        inputs={
+            "prompt": prompt,
+            "multi_modal_data": {
+                "audio": [
+                    AudioAsset("winning_call").audio_and_sample_rate,
+                    AudioAsset("mary_had_lamb").audio_and_sample_rate,
+                ],
+            },
+        },
+        limit_mm_per_prompt={
+            "audio": 2,
+        },
+    )
+
+
 query_map = {
     "text": get_text_query,
     "use_audio": get_audio_query,
     "use_image": get_image_query,
     "use_video": get_video_query,
+    "multi_audios": get_multi_audios_query,
+    "mixed_modalities": get_mixed_modalities_query,
 }
 
 
@@ -167,12 +250,22 @@ def main(args):
         query_result = query_func(image_path=image_path)
     elif args.query_type == "use_audio":
         query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
+    elif args.query_type == "mixed_modalities":
+        query_result = query_func(
+            video_path=video_path,
+            image_path=image_path,
+            audio_path=audio_path,
+            num_frames=getattr(args, "num_frames", 16),
+            sampling_rate=getattr(args, "sampling_rate", 16000),
+        )
     else:
         query_result = query_func()
 
     omni_llm = Omni(
         model=model_name,
         stage_configs_path=args.stage_configs_path,
+        log_stats=args.enable_stats,
+        stage_init_timeout=args.stage_init_timeout,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -221,19 +314,24 @@ def main(args):
             prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
             print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
 
-    omni_outputs = omni_llm.generate(prompts, sampling_params_list)
+    if args.modalities is not None:
+        output_modalities = args.modalities.split(",")
+        for i, prompt in enumerate(prompts):
+            prompt["modalities"] = output_modalities
+
+    omni_generator = omni_llm.generate(prompts, sampling_params_list)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
     os.makedirs(output_dir, exist_ok=True)
 
-    for stage_outputs in omni_outputs:
+    for stage_outputs in omni_generator:
         if stage_outputs.final_output_type == "text":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 text_output = output.outputs[0].text
                 # Save aligned text file per request
-                prompt_text = prompts[request_id]["prompt"]
-                out_txt = os.path.join(output_dir, f"{request_id:05d}.txt")
+                prompt_text = output.prompt
+                out_txt = os.path.join(output_dir, f"{request_id}.txt")
                 lines = []
                 lines.append("Prompt:\n")
                 lines.append(str(prompt_text) + "\n")
@@ -247,9 +345,9 @@ def main(args):
                 print(f"Request ID: {request_id}, Text saved to {out_txt}")
         elif stage_outputs.final_output_type == "audio":
             for output in stage_outputs.request_output:
-                request_id = int(output.request_id)
+                request_id = output.request_id
                 audio_tensor = output.multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{output.request_id}.wav")
+                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
                 # Convert to numpy array and ensure correct format
                 audio_numpy = audio_tensor.float().detach().cpu().numpy()
@@ -261,6 +359,7 @@ def main(args):
                 # Save audio file with explicit WAV format
                 sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
                 print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+    omni_llm.close()
 
 
 def parse_args():
@@ -280,10 +379,10 @@ def parse_args():
         help="Enable writing detailed statistics (default: disabled)",
     )
     parser.add_argument(
-        "--init-sleep-seconds",
+        "--stage-init-timeout",
         type=int,
-        default=20,
-        help="Sleep seconds after starting each stage process to allow initialization (default: 20)",
+        default=300,
+        help="Timeout for initializing a single stage in seconds (default: 300)",
     )
     parser.add_argument(
         "--batch-timeout",
@@ -358,6 +457,18 @@ def parse_args():
         type=int,
         default=16000,
         help="Sampling rate for audio loading (default: 16000).",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="logs",
+        help="Log directory (default: logs).",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        default=None,
+        help="Output modalities to use for the prompts.",
     )
 
     return parser.parse_args()
