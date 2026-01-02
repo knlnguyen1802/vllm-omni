@@ -296,7 +296,7 @@ class DiffusionEngine:
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
         unique_reply_rank = kwargs.pop("unique_reply_rank", None)
-        
+
         assert isinstance(method, str)
         send_method = method
 

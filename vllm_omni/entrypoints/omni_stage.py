@@ -14,9 +14,10 @@ import os
 import queue
 import sys
 import traceback
-from dataclasses import fields
-from typing import Any, Callable, TypeVar
 import uuid
+from collections.abc import Callable
+from dataclasses import fields
+from typing import Any, TypeVar
 
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
@@ -51,6 +52,7 @@ from vllm_omni.utils import detect_device_type
 logger = init_logger(__name__)
 
 _R = TypeVar("_R")
+
 
 def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
     """Build OmniDiffusionConfig kwargs from engine args."""
@@ -451,25 +453,28 @@ class OmniStage:
             and set up data-plane communication to pass data.
         """
         assert self._in_q is not None and self._out_q is not None, "Queues must be attached before collective_rpc"
-        
+
         # Submit collective_rpc task to worker
         rpc_id = str(uuid.uuid4())
-        self._in_q.put({
-            "type": OmniStageTaskType.COLLECTIVE_RPC,
-            "rpc_id": rpc_id,
-            "method": method,
-            "timeout": timeout,
-            "args": args,
-            "kwargs": kwargs,
-        })
-        
+        self._in_q.put(
+            {
+                "type": OmniStageTaskType.COLLECTIVE_RPC,
+                "rpc_id": rpc_id,
+                "method": method,
+                "timeout": timeout,
+                "args": args,
+                "kwargs": kwargs,
+            }
+        )
+
         # Wait for result from worker
         import time
+
         start_time = time.time()
         while True:
             if timeout is not None and (time.time() - start_time) > timeout:
                 raise TimeoutError(f"collective_rpc timed out after {timeout} seconds")
-            
+
             result = self.try_collect()
             if result is not None:
                 if result.get("type") == "collective_rpc_result":
@@ -479,6 +484,7 @@ class OmniStage:
                         return result["result"]
 
             time.sleep(0.001)  # Small sleep to avoid busy waiting
+
 
 def _stage_worker(
     model: str,
@@ -703,17 +709,21 @@ def _stage_worker(
             kwargs = task.get("kwargs")
             try:
                 result = stage_engine.collective_rpc(method, timeout, args, kwargs)
-                out_q.put({
-                    "type": "collective_rpc_result",
-                    "rpc_id": rpc_id,
-                    "result": result,
-                })
+                out_q.put(
+                    {
+                        "type": "collective_rpc_result",
+                        "rpc_id": rpc_id,
+                        "result": result,
+                    }
+                )
             except Exception as e:
-                out_q.put({
-                    "type": "collective_rpc_result",
-                    "rpc_id": rpc_id,
-                    "error": str(e),
-                })
+                out_q.put(
+                    {
+                        "type": "collective_rpc_result",
+                        "rpc_id": rpc_id,
+                        "error": str(e),
+                    }
+                )
             continue
 
         batch_tasks: list[dict[str, Any]] = [task]
