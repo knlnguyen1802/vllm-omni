@@ -455,7 +455,7 @@ class OmniStage:
         # Submit collective_rpc task to worker
         rpc_id = str(uuid.uuid4())
         self._in_q.put({
-            "type": "collective_rpc",
+            "type": OmniStageTaskType.COLLECTIVE_RPC,
             "rpc_id": rpc_id,
             "method": method,
             "timeout": timeout,

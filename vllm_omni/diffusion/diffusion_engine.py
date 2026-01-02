@@ -278,7 +278,6 @@ class DiffusionEngine:
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict | None = None,
-        unique_reply_rank: int | None = None,
     ) -> Any:
         """Call a method on worker processes and get results immediately.
 
@@ -287,7 +286,6 @@ class DiffusionEngine:
             timeout: Optional timeout in seconds
             args: Positional arguments for the method
             kwargs: Keyword arguments for the method
-            unique_reply_rank: If set, only get reply from this rank
 
         Returns:
             Single result if unique_reply_rank is provided, otherwise list of results
@@ -297,7 +295,8 @@ class DiffusionEngine:
 
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
-
+        unique_reply_rank = kwargs.pop("unique_reply_rank", None)
+        
         assert isinstance(method, str)
         send_method = method
 
