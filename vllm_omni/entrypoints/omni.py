@@ -44,6 +44,7 @@ logger = init_logger(__name__)
 
 _R = TypeVar("_R")
 
+
 def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
     """Weak reference cleanup function for OmniBase instances."""
     if stage_list:

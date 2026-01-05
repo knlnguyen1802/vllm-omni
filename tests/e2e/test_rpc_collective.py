@@ -20,12 +20,13 @@ omni_models = ["Qwen/Qwen2.5-Omni-3B"]
 
 @pytest.mark.parametrize("model_name", omni_models)
 def test_omni_model(model_name: str):
-    m = Omni(model=model_name,init_timeout=3600)
+    m = Omni(model=model_name, init_timeout=3600)
     results = m.collective_rpc(
         method="sleep",
         args=(1,),
     )
-    assert len(results)==3
+    assert len(results) == 3
+
 
 @pytest.mark.parametrize("model_name", diffusion_models)
 def test_diffusion_model(model_name: str):
@@ -34,4 +35,4 @@ def test_diffusion_model(model_name: str):
         method="sleep",
         args=(1,),
     )
-    assert len(results)==1
+    assert len(results) == 1
