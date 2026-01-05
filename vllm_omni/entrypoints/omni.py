@@ -10,7 +10,7 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pprint import pformat
-from typing import Any
+from typing import Any, TypeVar
 
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
@@ -42,6 +42,7 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+_R = TypeVar("_R")
 
 def _weak_close_cleanup(stage_list, stage_in_queues, ray_pg):
     """Weak reference cleanup function for OmniBase instances."""
@@ -687,6 +688,24 @@ class Omni(OmniBase):
             logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception as e:
             logger.exception(f"[{self._name}] Failed to build/log summary: {e}")
+
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method=method,
+                args=args,
+                timeout=timeout,
+                kwargs=kwargs,
+            )
+            results.append(result)
+        return results
 
     @property
     def _name(self) -> str:

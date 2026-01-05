@@ -297,28 +297,28 @@ def main(args):
     num_frames = getattr(args, "num_frames", 16)
     sampling_rate = getattr(args, "sampling_rate", 16000)
 
-    # Get the query function and call it with appropriate parameters
-    query_func = query_map[args.query_type]
-    if args.query_type == "mixed_modalities":
-        query_result = query_func(
-            video_path=video_path,
-            image_path=image_path,
-            audio_path=audio_path,
-            num_frames=num_frames,
-            sampling_rate=sampling_rate,
-        )
-    elif args.query_type == "use_audio_in_video":
-        query_result = query_func(video_path=video_path, num_frames=num_frames, sampling_rate=sampling_rate)
-    elif args.query_type == "multi_audios":
-        query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
-    elif args.query_type == "use_image":
-        query_result = query_func(image_path=image_path)
-    elif args.query_type == "use_video":
-        query_result = query_func(video_path=video_path, num_frames=num_frames)
-    elif args.query_type == "use_audio":
-        query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
-    else:
-        query_result = query_func()
+    # # Get the query function and call it with appropriate parameters
+    # query_func = query_map[args.query_type]
+    # if args.query_type == "mixed_modalities":
+    #     query_result = query_func(
+    #         video_path=video_path,
+    #         image_path=image_path,
+    #         audio_path=audio_path,
+    #         num_frames=num_frames,
+    #         sampling_rate=sampling_rate,
+    #     )
+    # elif args.query_type == "use_audio_in_video":
+    #     query_result = query_func(video_path=video_path, num_frames=num_frames, sampling_rate=sampling_rate)
+    # elif args.query_type == "multi_audios":
+    #     query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
+    # elif args.query_type == "use_image":
+    #     query_result = query_func(image_path=image_path)
+    # elif args.query_type == "use_video":
+    #     query_result = query_func(video_path=video_path, num_frames=num_frames)
+    # elif args.query_type == "use_audio":
+    #     query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
+    # else:
+    #     query_result = query_func()
     omni_llm = Omni(
         model=model_name,
         log_stats=args.enable_stats,
@@ -327,86 +327,91 @@ def main(args):
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
     )
-    thinker_sampling_params = SamplingParams(
-        temperature=0.0,  # Deterministic - no randomness
-        top_p=1.0,  # Disable nucleus sampling
-        top_k=-1,  # Disable top-k sampling
-        max_tokens=2048,
-        seed=SEED,  # Fixed seed for sampling
-        detokenize=True,
-        repetition_penalty=1.1,
+
+    omni_llm.collective_rpc(
+        method="sleep",
+        args=(1,),
     )
-    talker_sampling_params = SamplingParams(
-        temperature=0.9,
-        top_p=0.8,
-        top_k=40,
-        max_tokens=2048,
-        seed=SEED,  # Fixed seed for sampling
-        detokenize=True,
-        repetition_penalty=1.05,
-        stop_token_ids=[8294],
-    )
-    code2wav_sampling_params = SamplingParams(
-        temperature=0.0,  # Deterministic - no randomness
-        top_p=1.0,  # Disable nucleus sampling
-        top_k=-1,  # Disable top-k sampling
-        max_tokens=2048,
-        seed=SEED,  # Fixed seed for sampling
-        detokenize=True,
-        repetition_penalty=1.1,
-    )
+    # thinker_sampling_params = SamplingParams(
+    #     temperature=0.0,  # Deterministic - no randomness
+    #     top_p=1.0,  # Disable nucleus sampling
+    #     top_k=-1,  # Disable top-k sampling
+    #     max_tokens=2048,
+    #     seed=SEED,  # Fixed seed for sampling
+    #     detokenize=True,
+    #     repetition_penalty=1.1,
+    # )
+    # talker_sampling_params = SamplingParams(
+    #     temperature=0.9,
+    #     top_p=0.8,
+    #     top_k=40,
+    #     max_tokens=2048,
+    #     seed=SEED,  # Fixed seed for sampling
+    #     detokenize=True,
+    #     repetition_penalty=1.05,
+    #     stop_token_ids=[8294],
+    # )
+    # code2wav_sampling_params = SamplingParams(
+    #     temperature=0.0,  # Deterministic - no randomness
+    #     top_p=1.0,  # Disable nucleus sampling
+    #     top_k=-1,  # Disable top-k sampling
+    #     max_tokens=2048,
+    #     seed=SEED,  # Fixed seed for sampling
+    #     detokenize=True,
+    #     repetition_penalty=1.1,
+    # )
 
-    sampling_params_list = [
-        thinker_sampling_params,
-        talker_sampling_params,
-        code2wav_sampling_params,
-    ]
+    # sampling_params_list = [
+    #     thinker_sampling_params,
+    #     talker_sampling_params,
+    #     code2wav_sampling_params,
+    # ]
 
-    if args.txt_prompts is None:
-        prompts = [query_result.inputs for _ in range(args.num_prompts)]
-    else:
-        assert args.query_type == "text", "txt-prompts is only supported for text query type"
-        with open(args.txt_prompts, encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f.readlines()]
-            prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
-            print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
+    # if args.txt_prompts is None:
+    #     prompts = [query_result.inputs for _ in range(args.num_prompts)]
+    # else:
+    #     assert args.query_type == "text", "txt-prompts is only supported for text query type"
+    #     with open(args.txt_prompts, encoding="utf-8") as f:
+    #         lines = [ln.strip() for ln in f.readlines()]
+    #         prompts = [get_text_query(ln).inputs for ln in lines if ln != ""]
+    #         print(f"[Info] Loaded {len(prompts)} prompts from {args.txt_prompts}")
 
-    if args.modalities is not None:
-        output_modalities = args.modalities.split(",")
-        for i, prompt in enumerate(prompts):
-            prompt["modalities"] = output_modalities
+    # if args.modalities is not None:
+    #     output_modalities = args.modalities.split(",")
+    #     for i, prompt in enumerate(prompts):
+    #         prompt["modalities"] = output_modalities
 
-    omni_generator = omni_llm.generate(prompts, sampling_params_list)
+    # omni_generator = omni_llm.generate(prompts, sampling_params_list)
 
-    # Determine output directory: prefer --output-dir; fallback to --output-wav
-    output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
-    os.makedirs(output_dir, exist_ok=True)
-    for stage_outputs in omni_generator:
-        if stage_outputs.final_output_type == "text":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                text_output = output.outputs[0].text
-                # Save aligned text file per request
-                prompt_text = output.prompt
-                out_txt = os.path.join(output_dir, f"{request_id}.txt")
-                lines = []
-                lines.append("Prompt:\n")
-                lines.append(str(prompt_text) + "\n")
-                lines.append("vllm_text_output:\n")
-                lines.append(str(text_output).strip() + "\n")
-                try:
-                    with open(out_txt, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-                except Exception as e:
-                    print(f"[Warn] Failed writing text file {out_txt}: {e}")
-                print(f"Request ID: {request_id}, Text saved to {out_txt}")
-        elif stage_outputs.final_output_type == "audio":
-            for output in stage_outputs.request_output:
-                request_id = output.request_id
-                audio_tensor = output.multimodal_output["audio"]
-                output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
-                sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
-                print(f"Request ID: {request_id}, Saved audio to {output_wav}")
+    # # Determine output directory: prefer --output-dir; fallback to --output-wav
+    # output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
+    # os.makedirs(output_dir, exist_ok=True)
+    # for stage_outputs in omni_generator:
+    #     if stage_outputs.final_output_type == "text":
+    #         for output in stage_outputs.request_output:
+    #             request_id = output.request_id
+    #             text_output = output.outputs[0].text
+    #             # Save aligned text file per request
+    #             prompt_text = output.prompt
+    #             out_txt = os.path.join(output_dir, f"{request_id}.txt")
+    #             lines = []
+    #             lines.append("Prompt:\n")
+    #             lines.append(str(prompt_text) + "\n")
+    #             lines.append("vllm_text_output:\n")
+    #             lines.append(str(text_output).strip() + "\n")
+    #             try:
+    #                 with open(out_txt, "w", encoding="utf-8") as f:
+    #                     f.writelines(lines)
+    #             except Exception as e:
+    #                 print(f"[Warn] Failed writing text file {out_txt}: {e}")
+    #             print(f"Request ID: {request_id}, Text saved to {out_txt}")
+    #     elif stage_outputs.final_output_type == "audio":
+    #         for output in stage_outputs.request_output:
+    #             request_id = output.request_id
+    #             audio_tensor = output.multimodal_output["audio"]
+    #             output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
+    #             sf.write(output_wav, audio_tensor.detach().cpu().numpy(), samplerate=24000)
+    #             print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 
 
 def parse_args():
