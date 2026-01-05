@@ -22,12 +22,21 @@ def parse_args() -> argparse.Namespace:
         "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512",
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
+    parser.add_argument(
+        "--negative_prompt", default="", help="negative prompt for classifier-free conditional guidance."
+    )
     parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
     parser.add_argument(
         "--cfg_scale",
         type=float,
         default=4.0,
         help="True classifier-free guidance scale specific to Qwen-Image.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=1.0,
+        help="Classifier-free guidance scale.",
     )
     parser.add_argument("--height", type=int, default=1024, help="Height of generated image.")
     parser.add_argument("--width", type=int, default=1024, help="Width of generated image.")
@@ -137,10 +146,12 @@ def main():
     generation_start = time.perf_counter()
     outputs = omni.generate(
         args.prompt,
+        negative_prompt=args.negative_prompt,
         height=args.height,
         width=args.width,
         generator=generator,
         true_cfg_scale=args.cfg_scale,
+        guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_outputs_per_prompt=args.num_images_per_prompt,
     )
@@ -151,9 +162,8 @@ def main():
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     # Extract images from OmniRequestOutput
-    # omni.generate() returns Generator[OmniRequestOutput, None, None], convert to list
-    outputs = list(outputs)
-    if not outputs:
+    # omni.generate() returns list[OmniRequestOutput], extract images from the first output
+    if not outputs or len(outputs) == 0:
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
