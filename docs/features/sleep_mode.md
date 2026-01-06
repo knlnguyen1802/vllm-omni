@@ -7,7 +7,7 @@ It is especially useful in **RLHF**, **training**, or **cost-saving scenarios**,
 
 ---
 
-## 🧠 Omni Model
+## Omni Model
 
 Omni model inherit the feature from vLLM' Sleep Mode
 
