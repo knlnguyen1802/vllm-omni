@@ -29,7 +29,9 @@ This means:
 ---
 
 ## Enable sleep mode
-To enable sleep mode, set the `enable_sleep_mode` in `engine_args` to True
+To enable sleep mode, set the `enable_sleep_mode` in `engine_args` to `True`
+
+
 Example:
 ```python
 omni = Omni(model=...,enable_sleep_mode=True)
