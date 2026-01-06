@@ -4,7 +4,7 @@
 import multiprocessing as mp
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -360,3 +360,8 @@ class DiffusionEngine:
 
     def close(self) -> None:
         self._finalizer()
+
+    def abort(self, request_id: str | Iterable[str]) -> None:
+        # TODO implement it
+        logger.warning("DiffusionEngine abort is not implemented yet")
+        pass
