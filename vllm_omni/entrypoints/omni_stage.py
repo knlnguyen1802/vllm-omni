@@ -15,6 +15,7 @@ import queue
 import sys
 import traceback
 import uuid
+import time
 from collections.abc import Callable
 from dataclasses import fields
 from typing import Any, TypeVar
@@ -468,9 +469,6 @@ class OmniStage:
             }
         )
 
-        # Wait for result from worker
-        import time
-
         start_time = time.time()
         while True:
             if timeout is not None and (time.time() - start_time) > timeout:
@@ -743,6 +741,7 @@ def _stage_worker(
                         "result": result,
                     }
                 )
+                continue
             except Exception as e:
                 out_q.put(
                     {
@@ -751,6 +750,7 @@ def _stage_worker(
                         "error": str(e),
                     }
                 )
+                continue
             
         # Handle profiler control commands
         if is_profiler_task(task_type):
@@ -1336,6 +1336,31 @@ async def _stage_worker_async(
             elif task_type == OmniStageTaskType.ABORT:
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
+            elif task_type == OmniStageTaskType.COLLECTIVE_RPC:
+                rpc_id = task.get("rpc_id")
+                method = task.get("method")
+                timeout = task.get("timeout")
+                args = task.get("args")
+                kwargs = task.get("kwargs")
+                try:
+                    result = stage_engine.collective_rpc(method, timeout, args, kwargs)
+                    out_q.put(
+                        {
+                            "type": "collective_rpc_result",
+                            "rpc_id": rpc_id,
+                            "result": result,
+                        }
+                    )
+                    continue
+                except Exception as e:
+                    out_q.put(
+                        {
+                            "type": "collective_rpc_result",
+                            "rpc_id": rpc_id,
+                            "error": str(e),
+                        }
+                    )
+                    continue
             elif is_profiler_task(task_type):
                 await handle_profiler_task_async(task_type)
             else:
