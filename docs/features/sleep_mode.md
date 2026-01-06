@@ -7,6 +7,13 @@ It is especially useful in **RLHF**, **training**, or **cost-saving scenarios**,
 
 ---
 
+## 🧠 Omni Model 
+
+Omni model inherit the feature from vLLM' Sleep Mode
+
+This mean:
+- Support both Level 1 and Level 2 sleep, allow to release and reset both model weights and KV Cache
+
 ## 🧠 Diffusion Model Extension
 
 We added Sleep Mode support for **diffusion models**, which previously lacked this functionality.  
