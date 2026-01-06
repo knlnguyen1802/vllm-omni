@@ -13,9 +13,9 @@ import multiprocessing as mp
 import os
 import queue
 import sys
+import time
 import traceback
 import uuid
-import time
 from collections.abc import Callable
 from dataclasses import fields
 from typing import Any, TypeVar
@@ -751,7 +751,7 @@ def _stage_worker(
                     }
                 )
                 continue
-            
+
         # Handle profiler control commands
         if is_profiler_task(task_type):
             handle_profiler_task(task_type)
