@@ -14,7 +14,7 @@ Omni model inherit the feature from vLLM' Sleep Mode
 This mean:
 - Support both Level 1 and Level 2 sleep, allow to release and reset both model weights and KV Cache
 
-## 🧠 Diffusion Model Extension
+## Diffusion Model Extension
 
 We added Sleep Mode support for **diffusion models**, which previously lacked this functionality.  
 In diffusion pipelines, this currently only offloads **model weight memory**, as these models typically do not use KV caches.
