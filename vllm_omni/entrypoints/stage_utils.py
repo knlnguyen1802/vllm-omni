@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class OmniStageTaskType(enum.Enum):
-    EXECUTE_BATCH = "execute_batch"
+    GENERATE = "generate"
     ABORT = "abort"
     SHUTDOWN = "shutdown"
     PROFILER_START = "profiler_start"
