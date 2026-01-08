@@ -18,7 +18,6 @@ import threading
 import time
 import traceback
 from dataclasses import fields
-from functools import partial
 from typing import Any
 
 from setproctitle import setproctitle
