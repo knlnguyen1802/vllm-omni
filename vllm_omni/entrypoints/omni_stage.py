@@ -85,6 +85,14 @@ class WorkerIOHandler:
         """
         raise NotImplementedError
 
+    def send_task(self, task: dict[str, Any]) -> None:
+        """Send a task to the output channel.
+        
+        Args:
+            task: Task dictionary to send.
+        """
+        raise NotImplementedError
+
     def close(self) -> None:
         """Close the communication channels."""
         pass
@@ -116,6 +124,9 @@ class MPQueueIOHandler(WorkerIOHandler):
 
     def send_result(self, result: dict[str, Any]) -> None:
         self.out_q.put(result)
+
+    def send_task(self, task: dict[str, Any]) -> None:
+        self.out_q.put(task)
 
 
 class AsyncMPQueueIOHandler:
@@ -151,6 +162,10 @@ class AsyncMPQueueIOHandler:
     def send_result(self, result: dict[str, Any]) -> None:
         """Send result to output queue (sync operation)."""
         self.out_q.put(result)
+
+    def send_task(self, task: dict[str, Any]) -> None:
+        """Send task to output queue (sync operation)."""
+        self.out_q.put(task)
 
 
 def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
@@ -312,6 +327,8 @@ class OmniStage:
         """
         self._in_q = in_q
         self._out_q = out_q
+        # For orchestrator: recv_task reads from out_q (results), send_task writes to in_q
+        self._io_handler = MPQueueIOHandler(out_q, in_q)
 
     def init_stage_worker(
         self,
@@ -457,8 +474,8 @@ class OmniStage:
             payload: Dictionary containing task data (request_id, engine_inputs,
                 sampling_params, etc.)
         """
-        assert self._in_q is not None
-        self._in_q.put(payload)
+        assert self._io_handler is not None
+        self._io_handler.send_task(payload)
 
     def try_collect(self) -> dict[str, Any] | None:
         """Try to collect a result from the stage worker without blocking.
@@ -467,11 +484,8 @@ class OmniStage:
             Result dictionary if available, None otherwise. Result contains
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
         """
-        assert self._out_q is not None
-        try:
-            return self._out_q.get_nowait()
-        except Exception:
-            return None
+        assert self._io_handler is not None
+        return self._io_handler.recv_task(timeout=0)
 
     def process_engine_inputs(
         self, stage_list: list[Any], prompt: OmniTokensPrompt | TextPrompt = None
