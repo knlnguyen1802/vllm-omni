@@ -11,7 +11,6 @@ import fcntl
 import importlib
 import multiprocessing as mp
 import os
-import pickle
 import queue
 import signal
 import sys
@@ -21,9 +20,8 @@ import traceback
 from dataclasses import fields
 from functools import partial
 from typing import Any
-from setproctitle import setproctitle
-import cloudpickle
 
+from setproctitle import setproctitle
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
@@ -60,17 +58,17 @@ logger = init_logger(__name__)
 
 class WorkerIOHandler:
     """Abstract interface for worker input/output communication.
-    
+
     This abstraction allows easy swapping of communication backends
     (e.g., multiprocessing queues, ZMQ, RPC, etc.).
     """
 
     def recv_task(self, timeout: float | None = None) -> dict[str, Any] | None:
         """Receive a task from the input channel.
-        
+
         Args:
             timeout: Optional timeout in seconds. None means blocking.
-        
+
         Returns:
             Task dictionary or None if no task available (non-blocking)
             or timeout occurred.
@@ -79,7 +77,7 @@ class WorkerIOHandler:
 
     def send_result(self, result: dict[str, Any]) -> None:
         """Send a result to the output channel.
-        
+
         Args:
             result: Result dictionary to send.
         """
@@ -87,7 +85,7 @@ class WorkerIOHandler:
 
     def send_task(self, task: dict[str, Any]) -> None:
         """Send a task to the output channel.
-        
+
         Args:
             task: Task dictionary to send.
         """
@@ -138,10 +136,10 @@ class AsyncMPQueueIOHandler:
 
     async def recv_task(self, timeout: float | None = None) -> dict[str, Any] | None:
         """Async receive task from queue.
-        
+
         Args:
             timeout: Optional timeout. 0 for non-blocking, None for blocking.
-        
+
         Returns:
             Task or None if not available.
         """
@@ -789,13 +787,13 @@ class OmniStageWorkerProc:
 
     def generate(self, task: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Execute a batch of generation requests.
-        
+
         This method collects tasks from the queue, prepares inputs,
         executes through the engine, and returns results.
-        
+
         Args:
             task: Optional initial task. If not provided, will dequeue from queue.
-        
+
         Returns:
             List of result dictionaries to be sent via IO handler.
         """
@@ -881,7 +879,7 @@ class OmniStageWorkerProc:
         # Execute batch through engine_core
         self.batch_seq += 1
         gen_t0 = time.time()
-        
+
         # Execute based on stage type
         if self.stage_type == "diffusion":
             # Convert inputs to prompts for diffusion
@@ -895,11 +893,11 @@ class OmniStageWorkerProc:
                     prompts.append(ein.prompt)
                 else:
                     prompts.append(str(ein))
-            
+
             # Prepare diffusion kwargs
             diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
             diffusion_results = self.engine_core.generate(prompts, **diffusion_kwargs)
-            
+
             # Convert to list format
             if isinstance(diffusion_results, list):
                 gen_outputs = diffusion_results
@@ -911,13 +909,11 @@ class OmniStageWorkerProc:
             gen_outputs: list[Any] = []
             for ro in self.engine_core.generate(batch_engine_inputs, llm_sampling_params, use_tqdm=False):
                 gen_outputs.append(ro)
-        
+
         gen_t1 = time.time()
         gen_ms = (gen_t1 - gen_t0) * 1000.0
 
-        logger.debug(
-            f"Generate done: batch={len(batch_request_ids)}, req_ids={batch_request_ids}, gen_ms={gen_ms:.1f}"
-        )
+        logger.debug(f"Generate done: batch={len(batch_request_ids)}, req_ids={batch_request_ids}, gen_ms={gen_ms:.1f}")
 
         # Group outputs per request id
         req_to_outputs: dict[Any, list[Any]] = {rid: [] for rid in batch_request_ids}
@@ -985,53 +981,47 @@ class OmniStageWorkerProc:
 
             results.append(result)
             logger.debug("Prepared result for request %s", rid)
-        
-        return results
 
+        return results
 
     def handle_input(self, task: dict[str, Any]) -> tuple[Any, tuple, dict]:
         """Handle input task: prepare method call for execution.
-        
+
         Args:
             task: Task dictionary containing type, method, args, kwargs, etc.
-        
+
         Returns:
             Tuple of (func, args, kwargs) ready for execution.
         """
         # Get task type and method name
         task_type = task.get("type", OmniStageTaskType.GENERATE)
         method_name = task.get("method", None)
-        
+
         # If method name not provided, infer from task type
         if method_name is None:
             method_name = _get_method_name_from_task_type(task_type)
-        
-        # Support cloudpickle-serialized methods (like vLLM)
-        if isinstance(method_name, bytes):
-            func = partial(cloudpickle.loads(method_name), self)
-        elif isinstance(method_name, str):
-            func = getattr(self, method_name)
-        else:
-            raise ValueError(f"Invalid method type: {type(method_name)}")
-        
+
+        assert isinstance(method_name, str)
+        func = getattr(self, method_name)
+
         # Get args and kwargs from task
         args = task.get("args", ())
         kwargs = task.get("kwargs", {})
-        
+
         # Always provide task in kwargs for any method that needs it
         kwargs["task"] = task
-        
+
         return func, args, kwargs
 
     def handle_output(self, output: Any) -> None:
         """Handle output from method execution and send results.
-        
+
         Args:
             output: Output from method execution (None, dict, or list[dict])
         """
         if output is None:
             return
-        
+
         # Handle result collection and emission
         # Methods can return:
         # - None: no result to send
@@ -1045,7 +1035,7 @@ class OmniStageWorkerProc:
 
     def worker_busy_loop(self, cancel: threading.Event | None = None) -> None:
         """Main busy loop for Multiprocessing Workers.
-        
+
         Handles task dispatch, method execution, and result collection.
         This abstraction makes it easy to swap communication backends
         (e.g., ZMQ, RPC) by replacing the IO handler.
@@ -1059,7 +1049,7 @@ class OmniStageWorkerProc:
             try:
                 # Dequeue task (blocking)
                 task = self.io_handler.recv_task()
-                
+
                 # Check for shutdown task
                 if task == SHUTDOWN_TASK:
                     logger.info("Received shutdown signal")
@@ -1067,17 +1057,17 @@ class OmniStageWorkerProc:
 
                 # Handle input: prepare method call
                 func, args, kwargs = self.handle_input(task)
-                
+
                 # Execute the method
                 output = func(*args, **kwargs)
-                
+
                 # If shutdown was called, break the loop
                 if output == "SHUTDOWN":
                     break
-                
+
                 # Handle result collection and emission
                 self.handle_output(output)
-                
+
             except Exception as e:
                 # Add traceback note if supported (Python 3.11+)
                 if hasattr(e, "add_note"):
@@ -1342,10 +1332,10 @@ class AsyncOmniStageWorkerProc:
 
     async def generate(self, task: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Execute a single generation request (async version).
-        
+
         Args:
             task: Task to execute. Contains request_id, sampling_params, etc.
-        
+
         Returns:
             Result dictionary to be sent via IO handler.
         """
@@ -1357,7 +1347,7 @@ class AsyncOmniStageWorkerProc:
 
     async def _generation_single_request(self, task: dict[str, Any]) -> dict[str, Any] | None:
         """Process a single generation request.
-        
+
         Returns:
             Result dictionary to be sent via IO handler, or None on error.
         """
@@ -1396,7 +1386,7 @@ class AsyncOmniStageWorkerProc:
 
             # Execute through engine_core based on stage type
             gen_t0 = time.time()
-            
+
             if self.stage_type == "diffusion":
                 # Convert input to prompt
                 if isinstance(ein, str):
@@ -1407,7 +1397,7 @@ class AsyncOmniStageWorkerProc:
                     prompt = ein.prompt
                 else:
                     prompt = str(ein)
-                
+
                 # Prepare diffusion kwargs
                 diffusion_kwargs = prepare_sampling_params(sampling_params, "diffusion")
                 gen_output = await self.engine_core.generate(prompt=prompt, request_id=rid, **diffusion_kwargs)
@@ -1420,7 +1410,7 @@ class AsyncOmniStageWorkerProc:
 
             gen_t1 = time.time()
             gen_ms = (gen_t1 - gen_t0) * 1000.0
-            
+
             # Prepare metrics and result
             metrics = make_request_stats(
                 [gen_output],
@@ -1432,7 +1422,7 @@ class AsyncOmniStageWorkerProc:
                 in_flight_time_ms,
             )
             self.agg_total_tokens += metrics.num_tokens_out
-            
+
             # Prepare result
             r_outputs = [gen_output]
             try:
@@ -1468,10 +1458,10 @@ class AsyncOmniStageWorkerProc:
 
     def handle_input(self, task: dict[str, Any]) -> tuple[Any, tuple, dict]:
         """Handle input task: prepare method call for execution.
-        
+
         Args:
             task: Task dictionary containing type, method, args, kwargs, etc.
-        
+
         Returns:
             Tuple of (func, args, kwargs) ready for execution.
         """
@@ -1483,13 +1473,8 @@ class AsyncOmniStageWorkerProc:
         if method_name is None:
             method_name = _get_method_name_from_task_type(task_type)
 
-        # Support cloudpickle-serialized methods (like vLLM)
-        if isinstance(method_name, bytes):
-            func = partial(cloudpickle.loads(method_name), self)
-        elif isinstance(method_name, str):
-            func = getattr(self, method_name)
-        else:
-            raise ValueError(f"Invalid method type: {type(method_name)}")
+        assert isinstance(method_name, str)
+        func = getattr(self, method_name)
 
         # Get args and kwargs from task
         args = task.get("args", ())
@@ -1497,7 +1482,7 @@ class AsyncOmniStageWorkerProc:
 
         # Always provide task in kwargs for any method that needs it
         kwargs["task"] = task
-        
+
         # Special handling for abort - extract request_id if not in args
         if method_name == "abort" and not args:
             args = (task["request_id"],)
@@ -1506,29 +1491,27 @@ class AsyncOmniStageWorkerProc:
 
     def handle_output(self, output: Any, batch_gen_t0: float) -> float:
         """Handle output from method execution and send results.
-        
+
         Args:
             output: Output from method execution (None, dict, or list[dict])
             batch_gen_t0: Batch generation start time
-        
+
         Returns:
             Updated batch generation start time
         """
         if output is None:
             return batch_gen_t0
-        
+
         self.batch_seq += 1
-        
+
         # Update stage stats for this batch
         batch_gen_t1 = time.time()
         self.agg_total_gen_time_ms += (batch_gen_t1 - batch_gen_t0) * 1000
-        
+
         if isinstance(output, dict):
             # Add stage stats to the result
             if "metrics" in output:
-                output["metrics"].stage_stats = make_stage_stats(
-                    self.agg_total_tokens, self.agg_total_gen_time_ms
-                )
+                output["metrics"].stage_stats = make_stage_stats(self.agg_total_tokens, self.agg_total_gen_time_ms)
             self.io_handler.send_result(output)
             logger.debug("Sent result for request %s", output.get("request_id"))
         elif isinstance(output, list):
@@ -1536,17 +1519,15 @@ class AsyncOmniStageWorkerProc:
             for i, result in enumerate(output):
                 # Add stage stats to last result only
                 if i == len(output) - 1 and "metrics" in result:
-                    result["metrics"].stage_stats = make_stage_stats(
-                        self.agg_total_tokens, self.agg_total_gen_time_ms
-                    )
+                    result["metrics"].stage_stats = make_stage_stats(self.agg_total_tokens, self.agg_total_gen_time_ms)
                 self.io_handler.send_result(result)
                 logger.debug("Sent result for request %s", result.get("request_id"))
-        
+
         return batch_gen_t1
 
     async def worker_busy_loop(self, cancel: threading.Event | None = None) -> None:
         """Main async busy loop for worker.
-        
+
         Handles task dispatch, method execution, and result collection.
         This abstraction makes it easy to swap communication backends.
         """
@@ -1561,7 +1542,7 @@ class AsyncOmniStageWorkerProc:
             try:
                 # Dequeue task (non-blocking)
                 task = await self.io_handler.recv_task(timeout=0)
-                
+
                 if task is None:
                     await asyncio.sleep(0.001)
                     continue
@@ -1583,7 +1564,7 @@ class AsyncOmniStageWorkerProc:
                 # If shutdown was called, break the loop
                 if output == "SHUTDOWN":
                     break
-                
+
                 # Handle result collection and emission
                 batch_gen_t0 = self.handle_output(output, batch_gen_t0)
 
@@ -1606,7 +1587,7 @@ def _stage_worker(
     stage_init_timeout: int = 300,
 ) -> None:
     """Stage worker entry: device setup, LLM init, batching, SHM IPC.
-    
+
     This is the main entry point for the worker process. It handles
     signal setup, death monitoring, worker initialization, and the
     main busy loop.
@@ -1675,7 +1656,7 @@ async def _stage_worker_async(
     stage_init_timeout: int = 300,
 ) -> None:
     """Async stage worker entry: device setup, LLM init, batching, SHM IPC.
-    
+
     This is the main entry point for the async worker process. It handles
     worker initialization and the main async busy loop.
     """
@@ -1695,7 +1676,7 @@ async def _stage_worker_async(
 
         # Initialize engine_core
         worker.engine_core = await worker._create_engine_core()
-        
+
         # Set engine in omni_stage for access from main process
         omni_stage.set_async_engine(worker.engine_core)
 
@@ -1714,6 +1695,7 @@ async def _stage_worker_async(
         # Cleanup
         if worker is not None:
             logger.debug("Worker cleanup complete")
+
 
 def count_prompt_tokens_from_outputs(engine_outputs: list[Any]) -> int:
     """Count prompt tokens from engine outputs."""
@@ -1760,4 +1742,3 @@ def make_stage_stats(_agg_total_tokens: int, _agg_total_gen_time_ms: float):
     from vllm_omni.entrypoints.log_utils import StageStats
 
     return StageStats(total_token=_agg_total_tokens, total_gen_time=_agg_total_gen_time_ms)
-
