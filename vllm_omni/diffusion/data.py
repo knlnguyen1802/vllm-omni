@@ -321,6 +321,9 @@ class OmniDiffusionConfig:
     # TODO: do not hard code
     master_port: int | None = None
 
+    # Worker extension class for custom functionality
+    worker_extension_cls: str | None = None
+
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
     port: int | None = None

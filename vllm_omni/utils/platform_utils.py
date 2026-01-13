@@ -40,7 +40,7 @@ def get_diffusion_worker_class() -> type:
     """Get the appropriate diffusion WorkerProc class based on current device type.
 
     Returns:
-        The WorkerProc class for the detected device type (either NPUWorkerProc or WorkerProc).
+        The WorkerProc class for the detected device type.
 
     Raises:
         ImportError: If the worker module for the detected device is not available.

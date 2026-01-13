@@ -5,12 +5,14 @@ import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
+from typing import Any
 
 import torch
 import zmq
 from vllm.config import LoadConfig, VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.selector import get_cache_backend
@@ -251,8 +253,10 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         gpu_id: int,
         broadcast_handle,
+        worker_extension_cls: str | None = None,
     ):
         self.od_config = od_config
+        self.gpu_id = gpu_id
 
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
@@ -273,17 +277,19 @@ class WorkerProc:
             logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
-        self.worker = self._create_worker(gpu_id, od_config)
-        self.gpu_id = gpu_id
+        
+        # Create worker using WorkerWrapperBase for extension support
+        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls)
         self._running = True
 
-    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig) -> GPUWorker:
-        """Create a worker instance. Override in subclasses for different worker types."""
-        return GPUWorker(
-            local_rank=gpu_id,
-            rank=gpu_id,
+    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig, worker_extension_cls: str | None):
+        """Create a worker instance using WorkerWrapperBase with extension support."""
+        wrapper = WorkerWrapperBase(
+            gpu_id=gpu_id,
             od_config=od_config,
+            worker_extension_cls=worker_extension_cls,
         )
+        return wrapper
 
     def return_result(self, output: DiffusionOutput):
         """
@@ -315,11 +321,8 @@ class WorkerProc:
             return None, False
 
         try:
-            if isinstance(method, str):
-                func = getattr(self.worker, method)
-                result = func(*args, **kwargs)
-            else:
-                result = method(self.worker, *args, **kwargs)
+            # Use execute_method from WorkerWrapperBase for consistent method resolution
+            result = self.worker.execute_method(method, *args, **kwargs)
             return result, should_reply
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
@@ -398,13 +401,15 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
+        worker_extension_cls: str | None = None,
     ) -> None:
-        """Worker initialization and execution loops."""
+        """Worker initialization and execution loops with extension support."""
 
         worker_proc = WorkerProc(
             od_config,
             gpu_id=rank,
             broadcast_handle=broadcast_handle,
+            worker_extension_cls=worker_extension_cls,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
@@ -415,3 +420,121 @@ class WorkerProc:
         )
         worker_proc.worker_busy_loop()
         logger.info(f"Worker {rank}: Shutdown complete.")
+
+
+class WorkerWrapperBase:
+    """
+    Wrapper base class that creates GPUWorker with optional worker_extension_cls support.
+    This enables dynamic inheritance for GPUWorker to extend with custom functionality.
+    """
+
+    def __init__(
+        self,
+        gpu_id: int,
+        od_config: OmniDiffusionConfig,
+        worker_extension_cls: str | None = None,
+    ):
+        """
+        Initialize WorkerWrapperBase with support for worker extensions.
+        
+        Args:
+            gpu_id: GPU device ID
+            od_config: OmniDiffusionConfig configuration
+            worker_extension_cls: Optional qualified name of worker extension class
+        """
+        self.gpu_id = gpu_id
+        self.od_config = od_config
+        self.worker_extension_cls = worker_extension_cls
+        
+        # Prepare worker class with extension support
+        worker_class = self._prepare_worker_class()
+        
+        # Create the actual worker instance
+        self.worker = worker_class(
+            local_rank=gpu_id,
+            rank=gpu_id,
+            od_config=od_config,
+        )
+
+    def _prepare_worker_class(self) -> type:
+        """
+        Prepare the worker class with optional extension.
+        Dynamically extends GPUWorker with worker_extension_cls if provided.
+        
+        Returns:
+            The worker class (potentially extended)
+        """
+        worker_class = GPUWorker
+        
+        if self.worker_extension_cls:
+            worker_extension_cls = resolve_obj_by_qualname(self.worker_extension_cls)
+            extended_calls = []
+            
+            if worker_extension_cls not in worker_class.__bases__:
+                # Check for conflicts between worker and extension
+                for attr in dir(worker_extension_cls):
+                    if attr.startswith("__"):
+                        continue
+                    if hasattr(worker_class, attr):
+                        logger.warning(
+                            f"Worker class {worker_class} already has attribute "
+                            f"{attr}, which may conflict with worker extension "
+                            f"class {worker_extension_cls}."
+                        )
+                    if callable(getattr(worker_extension_cls, attr)):
+                        extended_calls.append(attr)
+                
+                # Dynamically inherit the worker extension class
+                worker_class.__bases__ = worker_class.__bases__ + (worker_extension_cls,)
+                logger.info(
+                    "Injected %s into %s for extended calls %s",
+                    worker_extension_cls,
+                    worker_class,
+                    extended_calls,
+                )
+        
+        return worker_class
+
+    def execute_method(self, method: str | bytes, *args, **kwargs):
+        """
+        Execute a method on the worker.
+        
+        Args:
+            method: Method name (str) or serialized callable (bytes)
+            *args: Positional arguments to pass to the method
+            **kwargs: Keyword arguments to pass to the method
+            
+        Returns:
+            Result of the method execution
+            
+        Raises:
+            Exception: If method execution fails
+        """
+        try:
+            # Method resolution order:
+            # 1. If method is defined in this class, it will be called directly
+            # 2. Otherwise, since we define `__getattr__` and redirect attribute
+            #    query to `self.worker`, the method will be called on the worker
+            if isinstance(method, str):
+                # Get the method by name
+                func = getattr(self, method)
+                return func(*args, **kwargs)
+            elif isinstance(method, bytes):
+                # Deserialize and execute the callable
+                import cloudpickle
+                func = cloudpickle.loads(method)
+                return func(self.worker, *args, **kwargs)
+            else:
+                raise TypeError(f"Method must be str or bytes, got {type(method)}")
+        except Exception as e:
+            msg = (
+                f"Error executing method {method!r}. "
+                "This might cause issues in distributed execution."
+            )
+            logger.exception(msg)
+            raise e
+
+    def __getattr__(self, attr: str):
+        """Delegate attribute access to the wrapped worker."""
+        return getattr(self.worker, attr)
+

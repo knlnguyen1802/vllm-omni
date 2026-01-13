@@ -236,6 +236,9 @@ class DiffusionEngine:
 
         # Get the appropriate worker class for current device
         worker_proc = get_diffusion_worker_class()
+        
+        # Extract worker_extension_cls from config if provided
+        worker_extension_cls = od_config.worker_extension_cls
 
         # Launch all worker processes
         scheduler_pipe_readers = []
@@ -251,6 +254,7 @@ class DiffusionEngine:
                     od_config,
                     writer,
                     broadcast_handle,
+                    worker_extension_cls,  # Pass worker_extension_cls
                 ),
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
