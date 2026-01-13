@@ -432,6 +432,7 @@ class WorkerWrapperBase:
         self,
         gpu_id: int,
         od_config: OmniDiffusionConfig,
+        base_worker_class: type = GPUWorker,
         worker_extension_cls: str | None = None,
     ):
         """
@@ -444,6 +445,7 @@ class WorkerWrapperBase:
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
+        self.base_worker_class = base_worker_class
         self.worker_extension_cls = worker_extension_cls
         
         # Prepare worker class with extension support
@@ -464,7 +466,7 @@ class WorkerWrapperBase:
         Returns:
             The worker class (potentially extended)
         """
-        worker_class = GPUWorker
+        worker_class = self.base_worker_class
         
         if self.worker_extension_cls:
             worker_extension_cls = resolve_obj_by_qualname(self.worker_extension_cls)
@@ -485,11 +487,12 @@ class WorkerWrapperBase:
                         extended_calls.append(attr)
                 
                 # Dynamically inherit the worker extension class
-                worker_class.__bases__ = worker_class.__bases__ + (worker_extension_cls,)
+                class_name = f"{worker_class.__name__}With{worker_extension_cls.__name__}"
+                worker_class = type(class_name, (worker_extension_cls, worker_class), {})
                 logger.info(
-                    "Injected %s into %s for extended calls %s",
+                    "Created extended worker class %s from %s for extended calls %s",
+                    class_name,
                     worker_extension_cls,
-                    worker_class,
                     extended_calls,
                 )
         
@@ -516,8 +519,8 @@ class WorkerWrapperBase:
             # 2. Otherwise, since we define `__getattr__` and redirect attribute
             #    query to `self.worker`, the method will be called on the worker
             if isinstance(method, str):
-                # Get the method by name
-                func = getattr(self, method)
+                # Get the method by name from the wrapped worker
+                func = getattr(self.worker, method)
                 return func(*args, **kwargs)
             elif isinstance(method, bytes):
                 # Deserialize and execute the callable
