@@ -32,6 +32,37 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 logger = init_logger(__name__)
 
 
+class DummyPipeline:
+    """Dummy pipeline for testing/debugging without loading actual models."""
+
+    def __init__(self, device):
+        self.device = device
+        self.transformer = None
+        self.vae = None
+
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Return a dummy output without actual computation."""
+        logger.info("DummyPipeline: Processing request (no actual computation)")
+        return DiffusionOutput(
+            images=None,
+            request_id=req.request_id if hasattr(req, 'request_id') else None,
+        )
+
+    def load_weights(self, weights):
+        """Dummy weight loading."""
+        logger.info("DummyPipeline: Skipping weight loading")
+        return set()
+
+    def to(self, device, **kwargs):
+        """Dummy device movement."""
+        self.device = device
+        return self
+
+    def named_buffers(self):
+        """Return empty buffers."""
+        return []
+
+
 class GPUWorker:
     """
     A worker that executes the model on a single GPU.
@@ -72,10 +103,91 @@ class GPUWorker:
         self.vllm_config = vllm_config
         load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
 
-        with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
+        # Use dummy pipeline if enabled
+        if self.od_config.use_dummy_pipeline:
+            logger.info(f"Worker {self.rank}: Using dummy pipeline (skipping model loading and profiling)")
+            self.pipeline = DummyPipeline(self.device)
+            logger.info(f"Worker {self.rank}: Dummy pipeline initialized successfully.")
+        else:
+            with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
+                init_distributed_environment(world_size=world_size, rank=rank)
+                logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
+                parallel_config = self.od_config.parallel_config
+                initialize_model_parallel(
+                    data_parallel_size=parallel_config.data_parallel_size,
+                    cfg_parallel_size=parallel_config.cfg_parallel_size,
+                    sequence_parallel_size=parallel_config.sequence_parallel_size,
+                    ulysses_degree=parallel_config.ulysses_degree,
+                    ring_degree=parallel_config.ring_degree,
+                    tensor_parallel_size=parallel_config.tensor_parallel_size,
+                    pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                )
+
+                load_config = LoadConfig()
+                model_loader = DiffusersPipelineLoader(load_config)
+                time_before_load = time.perf_counter()
+                with self._maybe_get_memory_pool_context(tag="weights"):
+                    with DeviceMemoryProfiler() as m:
+                        self.pipeline = model_loader.load_model(
+                            od_config=self.od_config,
+                            load_device=load_device,
+                        )
+                time_after_load = time.perf_counter()
+
+            logger.info(
+                "Model loading took %.4f GiB and %.6f seconds",
+                m.consumed_memory / GiB_bytes,
+                time_after_load - time_before_load,
+            )
+            logger.info(f"Worker {self.rank}: Model loaded successfully.")
+
+        # Apply CPU offloading (DiT <-> encoders mutual exclusion)
+        if self.od_config.enable_cpu_offload and not self.od_config.use_dummy_pipeline:
+            for name in ["vae"]:
+                module = getattr(self.pipeline, name, None)
+                if module is None:
+                    continue
+                try:
+                    module.to(self.device, non_blocking=True)
+                except Exception as exc:
+                    logger.debug("Failed to move %s to GPU: %s", name, exc)
+
+            apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
+
+        if not self.od_config.enforce_eager and not self.od_config.use_dummy_pipeline:
+            try:
+                self.pipeline.transformer = regionally_compile(
+                    self.pipeline.transformer,
+                    dynamic=True,
+                )
+                logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
+            except Exception as e:
+                logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
+
+        # Setup cache backend based on type (both backends use enable()/reset() interface)
+        # Skip cache backend setup for dummy pipeline
+        if self.od_config.use_dummy_pipeline:
+            self.cache_backend = None
+        else:
+            self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
+
+        if self.cache_backend is not None:
+            self.cache_backend.enable(self.pipeline)
+
+    def init_distributed_env(self) -> None:
+        """Initialize distributed environment. Call this when using dummy pipeline initially."""
+        world_size = self.od_config.num_gpus
+        rank = self.rank
+        
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             init_distributed_environment(world_size=world_size, rank=rank)
-            logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
-            parallel_config = self.od_config.parallel_config
+            logger.info(f"Worker {self.rank}: Initialized distributed environment.")
+
+    def init_model_parallel(self) -> None:
+        """Initialize model parallelism. Call this after init_distributed_env when using dummy pipeline."""
+        parallel_config = self.od_config.parallel_config
+        
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             initialize_model_parallel(
                 data_parallel_size=parallel_config.data_parallel_size,
                 cfg_parallel_size=parallel_config.cfg_parallel_size,
@@ -85,7 +197,13 @@ class GPUWorker:
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             )
+            logger.info(f"Worker {self.rank}: Initialized model parallelism.")
 
+    def load_model(self) -> None:
+        """Load the actual model. Call this after init_model_parallel when using dummy pipeline."""
+        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+        
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             load_config = LoadConfig()
             model_loader = DiffusersPipelineLoader(load_config)
             time_before_load = time.perf_counter()
@@ -104,34 +222,55 @@ class GPUWorker:
         )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
-        # Apply CPU offloading (DiT <-> encoders mutual exclusion)
-        if self.od_config.enable_cpu_offload:
-            for name in ["vae"]:
-                module = getattr(self.pipeline, name, None)
-                if module is None:
-                    continue
-                try:
-                    module.to(self.device, non_blocking=True)
-                except Exception as exc:
-                    logger.debug("Failed to move %s to GPU: %s", name, exc)
-
-            apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
-
-        if not self.od_config.enforce_eager:
+    def setup_cpu_offload(self) -> None:
+        """Setup CPU offloading hooks. Call this after load_model if needed."""
+        if not self.od_config.enable_cpu_offload:
+            logger.info(f"Worker {self.rank}: CPU offload not enabled, skipping.")
+            return
+        
+        for name in ["vae"]:
+            module = getattr(self.pipeline, name, None)
+            if module is None:
+                continue
             try:
-                self.pipeline.transformer = regionally_compile(
-                    self.pipeline.transformer,
-                    dynamic=True,
-                )
-                logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
-            except Exception as e:
-                logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
+                module.to(self.device, non_blocking=True)
+            except Exception as exc:
+                logger.debug("Failed to move %s to GPU: %s", name, exc)
 
-        # Setup cache backend based on type (both backends use enable()/reset() interface)
+        apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
+        logger.info(f"Worker {self.rank}: CPU offload hooks applied.")
+
+    def compile_model(self) -> None:
+        """Compile model with torch.compile. Call this after load_model if needed."""
+        if self.od_config.enforce_eager:
+            logger.info(f"Worker {self.rank}: Eager mode enforced, skipping compilation.")
+            return
+        
+        if isinstance(self.pipeline, DummyPipeline):
+            logger.warning(f"Worker {self.rank}: Cannot compile DummyPipeline, load real model first.")
+            return
+        
+        try:
+            self.pipeline.transformer = regionally_compile(
+                self.pipeline.transformer,
+                dynamic=True,
+            )
+            logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
+        except Exception as e:
+            logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
+
+    def setup_cache_backend(self) -> None:
+        """Setup cache backend. Call this after load_model if needed."""
+        if isinstance(self.pipeline, DummyPipeline):
+            logger.warning(f"Worker {self.rank}: Cannot setup cache for DummyPipeline, load real model first.")
+            return
+        
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
-
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
+            logger.info(f"Worker {self.rank}: Cache backend setup complete.")
+        else:
+            logger.info(f"Worker {self.rank}: No cache backend configured.")
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """

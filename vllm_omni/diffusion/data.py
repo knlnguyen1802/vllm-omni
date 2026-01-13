@@ -357,6 +357,9 @@ class OmniDiffusionConfig:
     # Logging
     log_level: str = "info"
 
+    # Dummy pipeline mode - skip model loading for testing/debugging
+    use_dummy_pipeline: bool = False
+
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
         Find an available port with retry logic.
