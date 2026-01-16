@@ -37,7 +37,7 @@ from vllm_omni.diffusion.executor.ray_external_executor import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 
-def create_worker_actors(num_gpus: int, od_config: OmniDiffusionConfig) -> list:
+def create_worker_actors(num_gpus: int, od_config: OmniDiffusionConfig) -> tuple[list, Any]:
     """Create and initialize Ray worker actors.
 
     Args:
@@ -45,21 +45,30 @@ def create_worker_actors(num_gpus: int, od_config: OmniDiffusionConfig) -> list:
         od_config: Diffusion configuration
 
     Returns:
-        List of initialized Ray actor handles
+        Tuple of (list of initialized Ray actor handles, result_handle)
     """
     print(f"Creating {num_gpus} Ray worker actors...")
 
+    # Step 1: Initialize scheduler first (following multiproc pattern)
+    from vllm_omni.diffusion.scheduler import Scheduler
+    
+    scheduler = Scheduler()
+    scheduler.initialize(od_config)
+    broadcast_handle = scheduler.get_broadcast_handle()
+    print("  Scheduler initialized with broadcast handle")
+
+    # Step 2: Create worker actors with broadcast_handle
     worker_actors = []
     for rank in range(num_gpus):
         # Apply @ray.remote decorator to create actor class
         worker_actor_class = ray.remote(RayDiffusionWorkerActor)
         
-        # Create actor with GPU resources
+        # Create actor with GPU resources and broadcast_handle
         actor = worker_actor_class.options(
             num_gpus=1,  # Each actor gets 1 GPU
             name=f"diffusion_worker_{rank}",  # Named actor for discovery
             max_concurrency=1,  # Process one request at a time
-        ).remote(rank=rank, od_config=od_config)
+        ).remote(rank=rank, od_config=od_config, broadcast_handle=broadcast_handle)
 
         worker_actors.append(actor)
         print(f"  Created worker actor for rank {rank}")
@@ -69,14 +78,26 @@ def create_worker_actors(num_gpus: int, od_config: OmniDiffusionConfig) -> list:
     init_futures = [actor.initialize.remote() for actor in worker_actors]
     init_results = ray.get(init_futures)
 
-    # Check initialization results
+    # Check initialization results and get result_handle
+    result_handle = None
     for rank, result in enumerate(init_results):
         if result["status"] != "ready":
             raise RuntimeError(f"Worker {rank} failed to initialize: {result.get('error')}")
         print(f"  Worker {rank} initialized successfully")
+        
+        # Get result_handle from first worker
+        if rank == 0:
+            result_handle = result.get("result_handle")
+
+    # Initialize result queue in scheduler
+    if result_handle is not None:
+        scheduler.initialize_result_queue(result_handle)
+        print("  Result queue initialized in scheduler")
+    else:
+        print("  Warning: No result_handle received from workers")
 
     print("All worker actors ready!")
-    return worker_actors
+    return worker_actors, result_handle
 
 
 def main():
@@ -119,7 +140,7 @@ def main():
         print("Step 3: Create and initialize Ray worker actors")
         print("=" * 60)
 
-        worker_actors = create_worker_actors(num_gpus, od_config)
+        worker_actors, result_handle = create_worker_actors(num_gpus, od_config)
 
         # Step 4: Set up environment for executor to find actors
         print("\n" + "=" * 60)

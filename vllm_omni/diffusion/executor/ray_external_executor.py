@@ -14,21 +14,33 @@ Example Usage:
         RayDiffusionWorkerActor,
         RayExternalDiffusionExecutor,
     )
+    from vllm_omni.diffusion.scheduler import Scheduler
     
     ray.init()
     
-    # Create worker actors
+    # Initialize scheduler first
+    scheduler = Scheduler()
+    scheduler.initialize(od_config)
+    broadcast_handle = scheduler.get_broadcast_handle()
+    
+    # Create worker actors with broadcast_handle
     num_gpus = 2
     worker_actors = []
     for rank in range(num_gpus):
-        actor = RayDiffusionWorkerActor.options(
+        worker_actor_class = ray.remote(RayDiffusionWorkerActor)
+        actor = worker_actor_class.options(
             num_gpus=1,
             name=f"diffusion_worker_{rank}",
-        ).remote(rank=rank, od_config=od_config)
+        ).remote(rank=rank, od_config=od_config, broadcast_handle=broadcast_handle)
         worker_actors.append(actor)
     
     # Wait for actors to be ready
-    ray.get([actor.initialize.remote() for actor in worker_actors])
+    results = ray.get([actor.initialize.remote() for actor in worker_actors])
+    
+    # Get result_handle from first worker
+    result_handle = results[0].get("result_handle")
+    if result_handle:
+        scheduler.initialize_result_queue(result_handle)
     
     # 2. Create engine with Ray external executor
     config = OmniDiffusionConfig(
@@ -81,22 +93,24 @@ class RayDiffusionWorkerActor:
     It receives RPC calls from the executor and executes them on the worker.
     """
 
-    def __init__(self, rank: int, od_config: OmniDiffusionConfig):
+    def __init__(self, rank: int, od_config: OmniDiffusionConfig, broadcast_handle: Any):
         """Initialize the Ray worker actor.
 
         Args:
             rank: The rank of this worker (0-indexed)
             od_config: Diffusion configuration
+            broadcast_handle: Handle to scheduler's broadcast message queue
         """
         self.rank = rank
         self.od_config = od_config
+        self.broadcast_handle = broadcast_handle
         self.worker = None
 
     def initialize(self) -> dict[str, Any]:
         """Initialize the worker.
 
         Returns:
-            Initialization status dict
+            Initialization status dict with result_handle
         """
         logger.info(f"Initializing RayDiffusionWorkerActor rank {self.rank}")
 
@@ -105,25 +119,76 @@ class RayDiffusionWorkerActor:
             from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
             # Get worker class
-            worker_class = get_diffusion_worker_class()
+            worker_proc = get_diffusion_worker_class()
 
-            # Create worker wrapper
-            # Note: This assumes WorkerWrapperBase can be instantiated directly
-            # You may need to adapt this based on your actual worker implementation
-            self.worker = worker_class(
-                rank=self.rank,
-                od_config=self.od_config,
+            # Extract worker_extension_cls from config if provided
+            worker_extension_cls = self.od_config.worker_extension_cls
+
+            # In multiproc, worker_main is called with a pipe writer to send back initialization status
+            # For Ray, we'll simulate this by creating a pipe and calling worker_main in a way that
+            # captures the initialization data, then return it directly
+            # However, worker_main is designed to run in a loop, so we need to adapt.
+            
+            # Instead, we'll directly instantiate the worker the same way worker_main does
+            import multiprocessing as mp
+            
+            # Create a pipe to receive initialization data (same as multiproc pattern)
+            reader, writer = mp.Pipe(duplex=False)
+            
+            # Call worker_main in the Ray actor context
+            # Note: worker_main is expected to send init status via writer and then enter message loop
+            # For Ray, we need to run this in a background thread or adapt the pattern
+            
+            # Actually, let's just call worker_main directly - it will handle everything
+            # We'll run it in the actor's process space
+            import threading
+            
+            # Flag to capture initialization data
+            self.init_data = None
+            self.init_error = None
+            
+            def capture_init_status():
+                """Capture initialization status from pipe."""
+                try:
+                    data = reader.recv()
+                    self.init_data = data
+                    reader.close()
+                except Exception as e:
+                    self.init_error = e
+            
+            # Start thread to capture init status
+            init_thread = threading.Thread(target=capture_init_status, daemon=True)
+            init_thread.start()
+            
+            # Start worker_main in a background thread (it will run the message loop)
+            worker_thread = threading.Thread(
+                target=worker_proc.worker_main,
+                args=(
+                    self.rank,
+                    self.od_config,
+                    writer,
+                    self.broadcast_handle,
+                    worker_extension_cls,
+                ),
+                daemon=True,
             )
-
+            worker_thread.start()
+            
+            # Wait for initialization to complete
+            init_thread.join(timeout=30.0)
+            
+            if self.init_error:
+                raise self.init_error
+            
+            if self.init_data is None:
+                raise RuntimeError("Worker initialization timed out")
+            
             logger.info(f"RayDiffusionWorkerActor rank {self.rank} initialized successfully")
-
-            return {
-                "status": "ready",
-                "rank": self.rank,
-            }
+            
+            return self.init_data
 
         except Exception as e:
-            logger.error(f"Failed to initialize worker rank {self.rank}: {e}")
+            logger.error(f"Failed to initialize worker rank {self.rank}: {e}", exc_info=True)
             return {
                 "status": "error",
                 "error": str(e),
@@ -225,6 +290,13 @@ class RayExternalDiffusionExecutor(ExternalDiffusionExecutor):
                 "RayExternalDiffusionExecutor."
             )
 
+        # Initialize scheduler first (like multiproc_executor)
+        from vllm_omni.diffusion.scheduler import Scheduler
+        self.scheduler = Scheduler()
+        self.scheduler.initialize(od_config)
+        self.broadcast_handle = self.scheduler.get_broadcast_handle()
+        logger.info("Scheduler initialized with broadcast handle")
+
         super().__init__(od_config)
 
     def _connect_to_workers(self) -> None:
@@ -258,6 +330,35 @@ class RayExternalDiffusionExecutor(ExternalDiffusionExecutor):
                 )
 
         logger.info(f"Connected to {len(self.worker_handles)} Ray worker actors")
+        
+        # Workers should already be initialized by the external launcher
+        # We need to get the result_handle from them to initialize scheduler's result queue
+        # This follows the same pattern as multiproc_executor._launch_workers
+        logger.info("Getting result_handle from workers to initialize scheduler result queue")
+        
+        # Get initialization status from first worker to obtain result_handle
+        # In the external pattern, workers are already initialized, but we need the result_handle
+        # that was created during their initialization
+        try:
+            # Workers should have been initialized and should have a result_handle
+            # We can get it by accessing worker's internal state or having a get_result_handle method
+            # For now, we'll assume the external launcher already called initialize() and
+            # stored the result_handle. The scheduler needs this handle.
+            
+            # Since workers are external, we expect the result_handle to be passed differently
+            # For external executors, the result queue should already be set up externally
+            # OR we need a way to retrieve the result_handle from workers
+            
+            # The external launcher should have already called scheduler.initialize_result_queue()
+            # before creating this executor, so we just verify it exists
+            if self.scheduler.result_mq is None:
+                logger.warning(
+                    "Scheduler result queue not initialized. "
+                    "External launcher should have called scheduler.initialize_result_queue() "
+                    "with the result_handle from workers."
+                )
+        except Exception as e:
+            logger.error(f"Failed to verify result queue initialization: {e}")
 
     def _forward_rpc_to_workers(
         self,
