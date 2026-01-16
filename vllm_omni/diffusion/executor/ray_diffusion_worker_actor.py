@@ -1,206 +1,215 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 """
-Ray Actor for Diffusion Workers
+DiffusionWorkerActor
 
-This Ray actor manages diffusion workers internally and provides a unified
-interface for executing diffusion models.
+Ray actor that initializes and manages scheduler and diffusion worker processes.
+Part of the RayActorExecutor system.
 """
 
-from typing import Any
+from __future__ import annotations
 
 import ray
+import multiprocessing as mp
+import time
 from vllm.logger import init_logger
-
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
 
+@ray.remote
 class DiffusionWorkerActor:
-    """Ray actor that manages diffusion workers internally.
+    """
+    Ray actor that encapsulates the entire worker infrastructure.
 
-    This actor initializes and manages WorkerWrapperBase instances for
-    diffusion model execution. It provides methods for RPC calls and
-    request processing.
+    It initializes the scheduler and spawns worker processes inside the actor.
     """
 
     def __init__(self, od_config: OmniDiffusionConfig):
-        """Initialize the diffusion worker actor.
-
-        Args:
-            od_config: Diffusion configuration
-        """
         self.od_config = od_config
-        self.worker = None
-        self._initialized = False
+        self.scheduler = None
+        self.worker_processes = []
 
+    # --------------------------------------------------------------------- #
+    # Initialization
+    # --------------------------------------------------------------------- #
     def initialize(self) -> bool:
-        """Initialize the worker wrapper.
+        """Initialize scheduler and worker processes."""
+        from vllm_omni.diffusion.scheduler import scheduler
+        from vllm_omni.utils.platform_utils import get_diffusion_worker_class
 
-        Returns:
-            True if initialization succeeded, False otherwise
-        """
+        logger.info("Initializing DiffusionWorkerActor...")
+
+        # Initialize scheduler
+        scheduler.initialize(self.od_config)
+        self.scheduler = scheduler
+
+        broadcast_handle = scheduler.get_broadcast_handle()
+
+        num_gpus = self.od_config.num_gpus
         try:
-            logger.info("Initializing DiffusionWorkerActor...")
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
 
-            # Import worker wrapper
-            from vllm_omni.utils.platform_utils import get_diffusion_worker_class
+        worker_proc = get_diffusion_worker_class()
+        # Launch all worker processes
+        scheduler_pipe_readers = []
+        scheduler_pipe_writers = []
 
-            # Get the worker wrapper class
-            worker_wrapper_class = get_diffusion_worker_class()
+        self.worker_processes = []
 
-            # For Ray actor, we use rank 0 and manage single or multiple workers
-            # The worker wrapper will handle the actual initialization
-            self.worker = worker_wrapper_class(
-                rank=0,
-                od_config=self.od_config,
+        for i in range(num_gpus):
+            reader, writer = mp.Pipe(duplex=False)
+            scheduler_pipe_writers.append(writer)
+            proc = mp.Process(
+                target=worker_proc.worker_main,
+                args=(i, self.od_config, writer, broadcast_handle),
+                name=f"DiffusionWorker-{i}",
+                daemon=True,
             )
+            scheduler_pipe_readers.append(reader)
+            proc.start()
+            self.worker_processes.append(proc)
+        
+        # Wait for all workers to be ready
+        scheduler_infos = []
+        result_handle = None
+        for writer in scheduler_pipe_writers:
+            writer.close()
 
-            # Initialize the worker
-            if hasattr(self.worker, "initialize"):
-                self.worker.initialize()
+        for i, reader in enumerate(scheduler_pipe_readers):
+            try:
+                data = reader.recv()
+            except EOFError:
+                logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
+                processes[i].join()
+                logger.error(f"Exit code: {processes[i].exitcode}")
+                raise
 
-            self._initialized = True
-            logger.info("DiffusionWorkerActor initialized successfully")
-            return True
+            if data["status"] != "ready":
+                raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-        except Exception as e:
-            logger.error(f"Failed to initialize DiffusionWorkerActor: {e}", exc_info=True)
-            return False
+            if i == 0:
+                result_handle = data.get("result_handle")
 
+            scheduler_infos.append(data)
+            reader.close()
+        scheduler.initialize_result_queue(result_handle)
+        logger.debug("All workers are ready")
+        #self._wait_for_workers_ready()
+        logger.info("DiffusionWorkerActor initialization complete")
+        return True
+
+    def _wait_for_workers_ready(self):
+        """Wait until all workers report ready."""
+        logger.info("Waiting for workers to be ready...")
+        timeout = 300
+        start = time.time()
+        ready_count = 0
+        while ready_count < self.scheduler.num_workers:
+            if time.time() - start > timeout:
+                raise TimeoutError("Workers did not initialize within timeout")
+            msg = self.scheduler.result_mq.dequeue(timeout=1.0)
+            if msg and msg.get("status") == "ready":
+                ready_count += 1
+                logger.info(f"Worker {ready_count}/{self.scheduler.num_workers} ready")
+        logger.info("All workers ready")
+
+    # --------------------------------------------------------------------- #
+    # RPC and Model Execution
+    # --------------------------------------------------------------------- #
     def collective_rpc(
         self,
         method: str,
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
-    ) -> Any:
-        """Execute an RPC call on the worker.
-
-        Args:
-            method: Method name to call
-            args: Positional arguments
-            kwargs: Keyword arguments
-            unique_reply_rank: Ignored in single-actor mode
-
-        Returns:
-            Result from the method call
-        """
-        if not self._initialized:
-            raise RuntimeError("Worker not initialized. Call initialize() first.")
-
+    ):
         kwargs = kwargs or {}
+        message = {"type": "rpc", "method": method, "args": args, "kwargs": kwargs}
 
-        try:
-            # Get method from worker
-            if not hasattr(self.worker, method):
-                raise AttributeError(f"Worker has no method '{method}'")
+        for _ in range(self.scheduler.num_workers):
+            self.scheduler.mq.enqueue(message)
 
-            method_func = getattr(self.worker, method)
-            result = method_func(*args, **kwargs)
+        if unique_reply_rank is not None:
+            return self.scheduler.result_mq.dequeue(timeout=30.0)
 
-            logger.debug(f"RPC call '{method}' completed successfully")
-            return result
+        responses = []
+        for _ in range(self.scheduler.num_workers):
+            responses.append(self.scheduler.result_mq.dequeue(timeout=30.0))
+        return responses
 
-        except Exception as e:
-            logger.error(f"RPC call '{method}' failed: {e}", exc_info=True)
-            raise
-
-    def execute_model(self, request_dicts: list[dict]) -> DiffusionOutput | dict:
-        """Execute diffusion model for the given requests.
-
-        Args:
-            request_dicts: List of request dictionaries
-
-        Returns:
-            DiffusionOutput or dict with output and error
-        """
-        if not self._initialized:
-            raise RuntimeError("Worker not initialized. Call initialize() first.")
-
-        try:
-            logger.info(f"Executing model with {len(request_dicts)} request(s)")
-
-            # Convert dicts back to OmniDiffusionRequest objects
-            requests = []
-            for req_dict in request_dicts:
-                req = OmniDiffusionRequest(
-                    prompt=req_dict.get("prompt"),
-                    height=req_dict.get("height", 1024),
-                    width=req_dict.get("width", 1024),
-                    num_inference_steps=req_dict.get("num_inference_steps", 50),
-                    num_outputs_per_prompt=req_dict.get("num_outputs_per_prompt", 1),
-                    request_id=req_dict.get("request_id"),
-                    pil_image=req_dict.get("pil_image"),
-                )
-                requests.append(req)
-
-            # Call the worker's generate method
-            if hasattr(self.worker, "generate"):
-                result = self.worker.generate(requests)
-            else:
-                raise RuntimeError("Worker does not have 'generate' method")
-
-            # Return as DiffusionOutput or dict
-            if isinstance(result, DiffusionOutput):
-                return result
-            else:
-                # Wrap in DiffusionOutput if needed
-                return DiffusionOutput(
-                    output=result,
-                    error=None,
-                    trajectory_latents=None,
-                    trajectory_timesteps=None,
-                )
-
-        except Exception as e:
-            logger.error(f"Model execution failed: {e}", exc_info=True)
-            return DiffusionOutput(
-                output=None,
-                error=str(e),
-                trajectory_latents=None,
-                trajectory_timesteps=None,
+    def execute_model(self, requests: list[dict]):
+        """Execute model inference on workers."""
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        
+        # Convert dict representations back to OmniDiffusionRequest objects
+        # because gpu_worker.execute_model expects OmniDiffusionRequest objects
+        omni_requests = []
+        for req_dict in requests:
+            # Reconstruct OmniDiffusionRequest from dict
+            omni_req = OmniDiffusionRequest(
+                prompt=req_dict.get("prompt"),
+                height=req_dict.get("height"),
+                width=req_dict.get("width"),
+                num_inference_steps=req_dict.get("num_inference_steps"),
+                num_outputs_per_prompt=req_dict.get("num_outputs_per_prompt"),
+                request_id=req_dict.get("request_id"),
+                seed=req_dict.get("seed"),
+                # Add other fields as needed
             )
+            omni_requests.append(omni_req)
+        
+        # Send OmniDiffusionRequest objects directly to workers
+        for _ in range(self.scheduler.num_workers):
+            self.scheduler.mq.enqueue(omni_requests)
 
-    def check_health(self) -> bool:
-        """Check if the worker is healthy.
+        results = []
+        for _ in range(self.scheduler.num_workers):
+            res = self.scheduler.result_mq.dequeue(timeout=300.0)
+            if res:
+                results.append(res)
 
-        Returns:
-            True if healthy, False otherwise
-        """
-        try:
-            if not self._initialized:
-                return False
+        return results[0] if results else None
 
-            # Simple health check - verify worker exists and is responsive
-            if self.worker is None:
-                return False
+    # --------------------------------------------------------------------- #
+    # Health Check / Shutdown
+    # --------------------------------------------------------------------- #
+    def check_health(self):
+        """Check all worker heartbeats."""
+        if not self.scheduler:
+            raise RuntimeError("Scheduler not initialized")
 
-            # If worker has a health check method, use it
-            if hasattr(self.worker, "check_health"):
-                return self.worker.check_health()
+        message = {"type": "health_check"}
+        for _ in range(self.scheduler.num_workers):
+            self.scheduler.mq.enqueue(message)
 
-            return True
+        healthy = 0
+        for _ in range(self.scheduler.num_workers):
+            res = self.scheduler.result_mq.dequeue(timeout=5.0)
+            if res and res.get("status") == "ok":
+                healthy += 1
 
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
+        if healthy != self.scheduler.num_workers:
+            raise RuntimeError(f"Only {healthy}/{self.scheduler.num_workers} workers healthy")
 
-    def shutdown(self) -> None:
-        """Shutdown the worker and clean up resources."""
-        try:
-            logger.info("Shutting down DiffusionWorkerActor...")
+        return True
 
-            if self.worker and hasattr(self.worker, "shutdown"):
-                self.worker.shutdown()
+    def shutdown(self):
+        """Terminate worker processes and release scheduler."""
+        from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE
 
-            self.worker = None
-            self._initialized = False
+        logger.info("Shutting down DiffusionWorkerActor...")
+        if self.scheduler:
+            for _ in range(self.scheduler.num_workers):
+                self.scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
 
-            logger.info("DiffusionWorkerActor shutdown complete")
+            for p in self.worker_processes:
+                p.join(timeout=30)
+                if p.is_alive():
+                    logger.warning(f"Terminating {p.name}")
+                    p.terminate()
 
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}", exc_info=True)
+            self.scheduler.close()
+        logger.info("DiffusionWorkerActor shutdown complete")
+        return True

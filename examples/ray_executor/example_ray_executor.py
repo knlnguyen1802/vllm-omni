@@ -7,16 +7,16 @@ import sys
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
-
+from vllm_omni.diffusion.executor.ray_actor_executor import RayActorExecutor
 
 async def example_usage():
     # Note: Replace the model path with your actual model path
-    model_path = "Qwen/Qwen-Image"  # Or use a local path like "/mnt/nvme3n1/n0090/Qwen-Image-Edit"
+    model_path = "/mnt/nvme3n1/n0090/Qwen-Image-Edit"  # Or use a local path like "/mnt/nvme3n1/n0090/Qwen-Image-Edit"
     
     config = OmniDiffusionConfig(
         model=model_path,
         num_gpus=1,
-        distributed_executor_backend="ray_actor",  # Use ray_actor backend instead of executor_class
+        distributed_executor_backend=RayActorExecutor,  # Use ray_actor backend instead of executor_class
     )
 
     print("Creating AsyncOmniDiffusion with Ray executor...")
@@ -46,7 +46,7 @@ async def example_usage():
         print(f"✗ Generation failed: {e}")
         import traceback; traceback.print_exc()
     finally:
-        await async_diffusion.close()
+        async_diffusion.close()
         print("✓ AsyncOmniDiffusion shutdown complete")
 
 
