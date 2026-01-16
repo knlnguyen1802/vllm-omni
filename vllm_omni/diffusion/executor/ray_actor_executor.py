@@ -78,7 +78,9 @@ class RayActorExecutor(DiffusionExecutor):
         # Import and create the worker actor
         from vllm_omni.diffusion.executor.ray_diffusion_worker_actor import DiffusionWorkerActor
 
-        self.worker_actor = DiffusionWorkerActor.options(**actor_opts).remote(self.od_config)
+        # Apply @ray.remote decorator and create actor
+        worker_actor_class = ray.remote(DiffusionWorkerActor)
+        self.worker_actor = worker_actor_class.options(**actor_opts).remote(self.od_config)
 
         # Initialize the actor
         result = ray.get(self.worker_actor.initialize.remote())

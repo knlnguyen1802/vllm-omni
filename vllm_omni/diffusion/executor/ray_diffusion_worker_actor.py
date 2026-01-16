@@ -19,7 +19,6 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 logger = init_logger(__name__)
 
 
-@ray.remote
 class DiffusionWorkerActor:
     """Ray actor that manages diffusion workers internally.
 
