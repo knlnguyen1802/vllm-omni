@@ -4,10 +4,12 @@
 from vllm_omni.diffusion.executor.executor_base import DiffusionExecutor
 from vllm_omni.diffusion.executor.external_executor import ExternalDiffusionExecutor
 from vllm_omni.diffusion.executor.multiproc_executor import MultiProcDiffusionExecutor
+from vllm_omni.diffusion.executor.ray_actor_executor import RayActorExecutor
 
 __all__ = [
     "DiffusionExecutor",
     "ExternalDiffusionExecutor",
     "MultiProcDiffusionExecutor",
+    "RayActorExecutor",
 ]
 

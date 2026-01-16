@@ -50,6 +50,10 @@ class DiffusionExecutor(ABC):
             from vllm_omni.diffusion.executor.multiproc_executor import MultiProcDiffusionExecutor
 
             executor_class = MultiProcDiffusionExecutor
+        elif distributed_executor_backend == "ray_actor":
+            from vllm_omni.diffusion.executor.ray_actor_executor import RayActorExecutor
+
+            executor_class = RayActorExecutor
         elif distributed_executor_backend == "external_launcher":
             from vllm_omni.diffusion.executor.external_executor import ExternalDiffusionExecutor
 
