@@ -50,6 +50,10 @@ class DiffusionExecutor(ABC):
             from vllm_omni.diffusion.executor.multiproc_executor import MultiProcDiffusionExecutor
 
             executor_class = MultiProcDiffusionExecutor
+        elif distributed_executor_backend == "external_launcher":
+            from vllm_omni.diffusion.executor.external_executor import ExternalDiffusionExecutor
+
+            executor_class = ExternalDiffusionExecutor
         elif isinstance(distributed_executor_backend, str):
             executor_class = resolve_obj_by_qualname(distributed_executor_backend)
             if not issubclass(executor_class, DiffusionExecutor):
