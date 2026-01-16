@@ -51,8 +51,11 @@ def create_worker_actors(num_gpus: int, od_config: OmniDiffusionConfig) -> list:
 
     worker_actors = []
     for rank in range(num_gpus):
+        # Apply @ray.remote decorator to create actor class
+        worker_actor_class = ray.remote(RayDiffusionWorkerActor)
+        
         # Create actor with GPU resources
-        actor = RayDiffusionWorkerActor.options(
+        actor = worker_actor_class.options(
             num_gpus=1,  # Each actor gets 1 GPU
             name=f"diffusion_worker_{rank}",  # Named actor for discovery
             max_concurrency=1,  # Process one request at a time
