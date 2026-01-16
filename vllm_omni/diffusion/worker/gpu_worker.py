@@ -155,6 +155,7 @@ class GPUWorker:
         assert self.pipeline is not None
         if not reqs or len(reqs) == 0:
             raise ValueError("Cannot execute model with empty request list")
+        print(f"=============================================================== {reqs}")
         # TODO: dealing with first req for now
         req = reqs[0]
 
