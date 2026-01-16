@@ -263,6 +263,11 @@ class OmniDiffusionConfig:
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
 
+    # Custom executor class for diffusion model execution
+    # Can be a string (e.g., "my_package.MyExecutor") or a class type
+    # If None, defaults to MultiProcDiffusionExecutor
+    executor_class: str | type | None = None
+
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
