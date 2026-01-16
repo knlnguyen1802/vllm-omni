@@ -141,9 +141,28 @@ class DiffusionWorkerActor:
 
     def execute_model(self, requests: list[dict]):
         """Execute model inference on workers."""
-        message = {"type": "execute", "requests": requests}
+        from vllm_omni.diffusion.request import OmniDiffusionRequest
+        
+        # Convert dict representations back to OmniDiffusionRequest objects
+        # because gpu_worker.execute_model expects OmniDiffusionRequest objects
+        omni_requests = []
+        for req_dict in requests:
+            # Reconstruct OmniDiffusionRequest from dict
+            omni_req = OmniDiffusionRequest(
+                prompt=req_dict.get("prompt"),
+                height=req_dict.get("height"),
+                width=req_dict.get("width"),
+                num_inference_steps=req_dict.get("num_inference_steps"),
+                num_outputs_per_prompt=req_dict.get("num_outputs_per_prompt"),
+                request_id=req_dict.get("request_id"),
+                seed=req_dict.get("seed"),
+                # Add other fields as needed
+            )
+            omni_requests.append(omni_req)
+        
+        # Send OmniDiffusionRequest objects directly to workers
         for _ in range(self.scheduler.num_workers):
-            self.scheduler.mq.enqueue(message)
+            self.scheduler.mq.enqueue(omni_requests)
 
         results = []
         for _ in range(self.scheduler.num_workers):
