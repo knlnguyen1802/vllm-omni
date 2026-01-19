@@ -40,6 +40,13 @@ class OmniDiffusionRequest:
     # Text inputs
     prompt: str | list[str] | None = None
     negative_prompt: str | list[str] | None = None
+
+    prompt_ids: list[int] | list[list[int]] | None = None
+    negative_prompt_ids: list[int] | list[list[int]] | None = None
+
+    prompt_mask: torch.Tensor | None = None
+    negative_prompt_mask: torch.Tensor | None = None
+
     prompt_path: str | None = None
     output_path: str = "outputs/"
     # without extension

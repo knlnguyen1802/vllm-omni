@@ -498,6 +498,80 @@ class WorkerWrapperBase:
         
         return worker_class
 
+    def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
+        """
+        Generate output for the given requests.
+
+        Args:
+            requests: List of diffusion requests
+
+        Returns:
+            DiffusionOutput with generated results
+        """
+        return self.worker.generate(requests)
+
+    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
+        """
+        Execute a forward pass.
+
+        Args:
+            reqs: List of diffusion requests
+            od_config: OmniDiffusionConfig configuration
+
+        Returns:
+            DiffusionOutput with generated results
+        """
+        return self.worker.execute_model(reqs, od_config)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """
+        Load model weights.
+
+        Args:
+            weights: Iterable of (name, tensor) tuples
+
+        Returns:
+            Set of loaded weight names
+        """
+        return self.worker.load_weights(weights)
+
+    def sleep(self, level: int = 1) -> bool:
+        """
+        Put the worker to sleep. The worker should not process any requests.
+        The caller should guarantee that no requests are being processed
+        during the sleep period, before `wake_up` is called.
+
+        Args:
+            level: The sleep level. Level 1 sleep will offload the model
+                weights and discard the kv cache.
+                Currently only support level 1.
+
+        Returns:
+            True on success
+        """
+        return self.worker.sleep(level)
+
+    def wake_up(self, tags: list[str] | None = None) -> bool:
+        """
+        Wake up the worker from sleep mode. See the sleep function
+        method for more details.
+
+        Args:
+            tags: An optional list of tags to reallocate the worker memory
+                for specific memory allocations. Values must be in
+                `("weights")`. If None, all memory is reallocated.
+                wake_up should be called with all tags (or None) before the
+                worker is used again.
+
+        Returns:
+            True on success
+        """
+        return self.worker.wake_up(tags)
+
+    def shutdown(self) -> None:
+        """Shutdown the worker and cleanup resources."""
+        return self.worker.shutdown()
+
     def execute_method(self, method: str | bytes, *args, **kwargs):
         """
         Execute a method on the worker.
