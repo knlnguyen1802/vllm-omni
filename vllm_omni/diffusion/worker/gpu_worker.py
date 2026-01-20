@@ -246,7 +246,7 @@ class GPUWorker:
         destroy_distributed_env()
 
 class CustomPipelineWorkerExtension:
-    def re_init_pipeline(self, custom_pipeline_args: dict[str, Any]) -> None:
+    def re_init_pipeline(self, custom_pipeline_args: dict[str, Any], od_config: OmniDiffusionConfig) -> None:
         """
         Re-initialize the pipeline with custom arguments.
 
@@ -254,12 +254,11 @@ class CustomPipelineWorkerExtension:
             custom_pipeline_args: Dictionary of arguments for custom pipeline initialization
         """
         custom_pipeline_cls = resolve_obj_by_qualname(custom_pipeline_args["pipeline_class"])
+        custom_pipeline_args["od_config"] = od_config
         custom_pipeline = custom_pipeline_cls(custom_pipeline_args)
         custom_pipeline.transformer = self.pipeline.transformer
-        if self.pipeline is not None:
-            del self.pipeline
-            gc.collect()
-            torch.cuda.empty_cache()
+        custom_pipeline.text_encoder = self.pipeline.text_encoder
+        custom_pipeline.vae = self.pipeline.vae
         self.pipeline = custom_pipeline
 
 class WorkerProc:
@@ -490,7 +489,7 @@ class WorkerWrapperBase:
         
         # Re-initialize pipeline with custom pipeline if provided
         if self.custom_pipeline_args is not None:
-            self.worker.re_init_pipeline(self.custom_pipeline_args)
+            self.worker.re_init_pipeline(self.custom_pipeline_args, self.od_config)
 
     def _prepare_worker_class(self) -> type:
         """
