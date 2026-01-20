@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import multiprocessing as mp
 import os
 import time
@@ -244,6 +245,22 @@ class GPUWorker:
     def shutdown(self) -> None:
         destroy_distributed_env()
 
+class CustomPipelineWorkerExtension:
+    def re_init_pipeline(self, custom_pipeline_args: dict[str, Any]) -> None:
+        """
+        Re-initialize the pipeline with custom arguments.
+
+        Args:
+            custom_pipeline_args: Dictionary of arguments for custom pipeline initialization
+        """
+        custom_pipeline_cls = resolve_obj_by_qualname(custom_pipeline_args["pipeline_class"])
+        custom_pipeline = custom_pipeline_cls(custom_pipeline_args)
+        custom_pipeline.transformer = self.pipeline.transformer
+        if self.pipeline is not None:
+            del self.pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+        self.pipeline = custom_pipeline
 
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
@@ -434,6 +451,7 @@ class WorkerWrapperBase:
         od_config: OmniDiffusionConfig,
         base_worker_class: type = GPUWorker,
         worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
@@ -442,11 +460,13 @@ class WorkerWrapperBase:
             gpu_id: GPU device ID
             od_config: OmniDiffusionConfig configuration
             worker_extension_cls: Optional qualified name of worker extension class
+            custom_pipeline_args: Optional arguments for custom pipeline initialization
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
         self.base_worker_class = base_worker_class
         self.worker_extension_cls = worker_extension_cls
+        self.custom_pipeline_args = custom_pipeline_args
         
         # Prepare worker class with extension support
         worker_class = self._prepare_worker_class()
@@ -457,6 +477,10 @@ class WorkerWrapperBase:
             rank=gpu_id,
             od_config=od_config,
         )
+        
+        # Re-initialize pipeline with custom pipeline if provided
+        if self.custom_pipeline_args is not None:
+            self.worker.re_init_pipeline(self.custom_pipeline_args)
 
     def _prepare_worker_class(self) -> type:
         """
@@ -468,8 +492,17 @@ class WorkerWrapperBase:
         """
         worker_class = self.base_worker_class
         
+        # If custom_pipeline_args is provided, use CustomPipelineWorkerExtension
+        if self.custom_pipeline_args is not None:
+            # Set worker_extension_cls to CustomPipelineWorkerExtension if not already set
+            if self.worker_extension_cls is None:
+                self.worker_extension_cls = CustomPipelineWorkerExtension
+
         if self.worker_extension_cls:
-            worker_extension_cls = resolve_obj_by_qualname(self.worker_extension_cls)
+            if isinstance(self.worker_extension_cls, str):
+                worker_extension_cls = resolve_obj_by_qualname(self.worker_extension_cls)
+            else:
+                worker_extension_cls = self.worker_extension_cls
             extended_calls = []
             
             if worker_extension_cls not in worker_class.__bases__:
