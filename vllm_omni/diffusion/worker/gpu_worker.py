@@ -271,6 +271,7 @@ class WorkerProc:
         gpu_id: int,
         broadcast_handle,
         worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
     ):
         self.od_config = od_config
         self.gpu_id = gpu_id
@@ -296,15 +297,22 @@ class WorkerProc:
         assert od_config.master_port is not None
         
         # Create worker using WorkerWrapperBase for extension support
-        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls)
+        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
 
-    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig, worker_extension_cls: str | None):
+    def _create_worker(
+        self,
+        gpu_id: int,
+        od_config: OmniDiffusionConfig,
+        worker_extension_cls: str | None,
+        custom_pipeline_args: dict[str, Any] | None = None,
+    ):
         """Create a worker instance using WorkerWrapperBase with extension support."""
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
             worker_extension_cls=worker_extension_cls,
+            custom_pipeline_args=custom_pipeline_args,
         )
         return wrapper
 
@@ -419,6 +427,7 @@ class WorkerProc:
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
         worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
         """Worker initialization and execution loops with extension support."""
 
@@ -427,6 +436,7 @@ class WorkerProc:
             gpu_id=rank,
             broadcast_handle=broadcast_handle,
             worker_extension_cls=worker_extension_cls,
+            custom_pipeline_args=custom_pipeline_args,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(

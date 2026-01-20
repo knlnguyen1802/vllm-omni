@@ -324,6 +324,9 @@ class OmniDiffusionConfig:
     # Worker extension class for custom functionality
     worker_extension_cls: str | None = None
 
+    # Custom pipeline arguments for custom pipelines
+    custom_pipeline_args: dict[str, Any] | None = None
+
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
     port: int | None = None
