@@ -469,6 +469,16 @@ class DiffusionOutput:
     """
 
     output: torch.Tensor | None = None
+
+    all_latents: list[torch.Tensor] | None = None
+    all_log_probs: list[torch.Tensor] | None = None
+    all_timesteps: list[torch.Tensor] | None = None
+
+    prompt_embeds: torch.Tensor | None = None
+    prompt_embeds_mask: torch.Tensor | None = None
+    negative_prompt_embeds: torch.Tensor | None = None
+    negative_prompt_embeds_mask: torch.Tensor | None = None
+    
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
