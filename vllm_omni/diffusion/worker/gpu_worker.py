@@ -248,18 +248,81 @@ class GPUWorker:
 class CustomPipelineWorkerExtension:
     def re_init_pipeline(self, custom_pipeline_args: dict[str, Any], od_config: OmniDiffusionConfig) -> None:
         """
-        Re-initialize the pipeline with custom arguments.
+        Re-initialize the pipeline with custom arguments using the same loading pattern as init_device_and_model.
 
         Args:
             custom_pipeline_args: Dictionary of arguments for custom pipeline initialization
+            od_config: OmniDiffusionConfig configuration
         """
+        from vllm.utils.torch_utils import set_default_torch_dtype
+        
+        # Clean up old pipeline
+        del self.pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Get custom pipeline class
         custom_pipeline_cls = resolve_obj_by_qualname(custom_pipeline_args["pipeline_class"])
-        custom_pipeline_args["od_config"] = od_config
-        custom_pipeline = custom_pipeline_cls(custom_pipeline_args)
-        custom_pipeline.transformer = self.pipeline.transformer
-        custom_pipeline.text_encoder = self.pipeline.text_encoder
-        custom_pipeline.vae = self.pipeline.vae
+        
+        # Use EXACT same pattern as init_device_and_model for loading
+        load_device = "cpu" if od_config.enable_cpu_offload else str(self.device)
+        target_device = torch.device(load_device)
+        
+        load_config = LoadConfig()
+        model_loader = DiffusersPipelineLoader(load_config)
+        time_before_load = time.perf_counter()
+        
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
+            with self._maybe_get_memory_pool_context(tag="weights"):
+                with DeviceMemoryProfiler() as m:
+                    # Replicate model_loader.load_model() pattern but for custom pipeline
+                    with set_default_torch_dtype(od_config.dtype):
+                        with target_device:
+                            custom_pipeline = custom_pipeline_cls(od_config=od_config)
+                    
+                    # Load weights using model_loader (same as original)
+                    if hasattr(custom_pipeline, 'load_weights') and hasattr(custom_pipeline, 'weights_sources'):
+                        model_loader.load_weights(custom_pipeline)
+                    
+                    custom_pipeline = custom_pipeline.eval()
+            
+            time_after_load = time.perf_counter()
+        
+        logger.info(
+            "Custom pipeline loading took %.4f GiB and %.6f seconds",
+            m.consumed_memory / GiB_bytes,
+            time_after_load - time_before_load,
+        )
+        
+        # Apply CPU offloading if enabled (same as init_device_and_model)
+        if od_config.enable_cpu_offload:
+            for name in ["vae"]:
+                module = getattr(custom_pipeline, name, None)
+                if module is None:
+                    continue
+                try:
+                    module.to(self.device, non_blocking=True)
+                except Exception as exc:
+                    logger.debug("Failed to move %s to GPU: %s", name, exc)
+            
+            apply_offload_hooks(custom_pipeline, od_config, device=self.device)
+        
         self.pipeline = custom_pipeline
+        if not self.od_config.enforce_eager:
+            try:
+                self.pipeline.transformer = regionally_compile(
+                    self.pipeline.transformer,
+                    dynamic=True,
+                )
+                logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
+            except Exception as e:
+                logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
+
+        # Setup cache backend based on type (both backends use enable()/reset() interface)
+        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
+
+        if self.cache_backend is not None:
+            self.cache_backend.enable(self.pipeline)
 
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
