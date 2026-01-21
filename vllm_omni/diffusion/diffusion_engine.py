@@ -298,6 +298,8 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        # DEBUGGING PURPOSES ONLY
+        return None
         prompt = "dummy run"
         num_inference_steps = 1
         height = 1024
