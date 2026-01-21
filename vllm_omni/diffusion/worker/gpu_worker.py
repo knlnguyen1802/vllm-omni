@@ -67,7 +67,6 @@ class GPUWorker:
 
         self.device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(self.device)
-
         # hack
         vllm_config = VllmConfig()
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
@@ -94,10 +93,13 @@ class GPUWorker:
             time_before_load = time.perf_counter()
             with self._maybe_get_memory_pool_context(tag="weights"):
                 with DeviceMemoryProfiler() as m:
-                    self.pipeline = model_loader.load_model(
-                        od_config=self.od_config,
-                        load_device=load_device,
-                    )
+                    if self.od_config.enable_dummy_pipeline:
+                        self.pipeline = None
+                    else:
+                        self.pipeline = model_loader.load_model(
+                            od_config=self.od_config,
+                            load_device=load_device,
+                        )
             time_after_load = time.perf_counter()
 
         logger.info(
@@ -122,10 +124,11 @@ class GPUWorker:
 
         if not self.od_config.enforce_eager:
             try:
-                self.pipeline.transformer = regionally_compile(
-                    self.pipeline.transformer,
-                    dynamic=True,
-                )
+                if not self.od_config.enable_dummy_pipeline:  
+                    self.pipeline.transformer = regionally_compile(
+                        self.pipeline.transformer,
+                        dynamic=True,
+                    )
                 logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
             except Exception as e:
                 logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
@@ -133,8 +136,9 @@ class GPUWorker:
         # Setup cache backend based on type (both backends use enable()/reset() interface)
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
-        if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
+        if not self.od_config.enable_dummy_pipeline:
+            if self.cache_backend is not None:
+                self.cache_backend.enable(self.pipeline)
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """
@@ -432,7 +436,6 @@ class WorkerProc:
                     exc_info=True,
                 )
                 continue
-
             if msg is None or len(msg) == 0:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue

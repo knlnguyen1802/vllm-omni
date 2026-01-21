@@ -308,6 +308,8 @@ class OmniDiffusionConfig:
     # Enable sleep mode
     enable_sleep_mode: bool = False
 
+    enable_dummy_pipeline: bool = False
+
     disable_autocast: bool = False
 
     # VSA parameters
