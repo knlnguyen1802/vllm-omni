@@ -114,6 +114,7 @@ class DiffusionEngine:
                         prompt = prompt[0] if prompt else None
                     return OmniRequestOutput.from_diffusion(
                         request_id=request_id,
+                        diffusion_output=output,
                         images=[],
                         prompt=prompt,
                         metrics={},
@@ -146,6 +147,7 @@ class DiffusionEngine:
 
                 return OmniRequestOutput.from_diffusion(
                     request_id=request_id,
+                    diffusion_output=output,
                     images=images,
                     prompt=prompt,
                     metrics=metrics,
@@ -175,6 +177,7 @@ class DiffusionEngine:
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
+                            diffusion_output=output,
                             images=request_images,
                             prompt=prompt,
                             metrics=metrics,
