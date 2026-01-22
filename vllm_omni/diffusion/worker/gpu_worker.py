@@ -566,7 +566,6 @@ class WorkerWrapperBase:
             The worker class (potentially extended)
         """
         worker_class = self.base_worker_class
-        
         # If custom_pipeline_args is provided, use CustomPipelineWorkerExtension
         if self.custom_pipeline_args is not None:
             # Set worker_extension_cls to CustomPipelineWorkerExtension if not already set
