@@ -200,6 +200,7 @@ class AsyncOmniDiffusion:
 
         return OmniRequestOutput.from_diffusion(
             request_id=request_id,
+            diffusion_output=result,
             images=images,
             prompt=prompt,
             metrics={

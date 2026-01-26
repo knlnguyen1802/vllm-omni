@@ -161,6 +161,8 @@ class AsyncOmni(OmniBase):
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
+                    "enable_dummy_pipeline": kwargs.get("enable_dummy_pipeline", False),
+                    "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                 },
                 "final_output": True,
                 "final_output_type": "image",

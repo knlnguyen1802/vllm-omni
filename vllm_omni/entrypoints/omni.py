@@ -167,6 +167,7 @@ class OmniBase:
             num_devices = kwargs["parallel_config"].world_size
             for i in range(1, num_devices):
                 devices += f",{i}"
+        
         default_stage_cfg = [
             {
                 "stage_id": 0,
@@ -205,7 +206,6 @@ class OmniBase:
         tokenizer = kwargs.get("tokenizer", None)
 
         base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
-
         # Load stage configurations from YAML
         if stage_configs_path is None:
             self.config_path = resolve_model_config_path(model)
