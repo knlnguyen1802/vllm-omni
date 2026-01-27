@@ -82,7 +82,7 @@ def try_send_via_connector(
             return False
 
     except Exception as e:
-        logger.info(
+        logger.warning(
             "[Orchestrator] OmniConnector failed for req %s: %s; falling back to queue",
             req_id,
             e,
@@ -106,7 +106,7 @@ def try_recv_via_connector(
         to_stage = str(stage_id)
 
         if not from_stage:
-            logger.info(
+            logger.error(
                 "[Stage-%s] 'from_connector' is true but 'from_stage' is missing for request %s", stage_id, rid
             )
             return None, None
@@ -140,15 +140,15 @@ def try_recv_via_connector(
                     rx_metrics = {"rx_decode_time_ms": decode_ms, "rx_transfer_bytes": serialized_size}
                     return ein, rx_metrics
                 else:
-                    logger.info(
+                    logger.error(
                         "[Stage-%s] Failed to get data from connector for request %s or payload is empty", stage_id, rid
                     )
                     return None, None
             except Exception as e:
-                logger.info("[Stage-%s] Error retrieving data from connector for request %s: %s", stage_id, rid, e)
+                logger.error("[Stage-%s] Error retrieving data from connector for request %s: %s", stage_id, rid, e)
                 return None, None
         else:
-            logger.info(
+            logger.error(
                 "[Stage-%s] No connector found for edge %s -> %s for request %s", stage_id, from_stage, to_stage, rid
             )
             return None, None
