@@ -1,7 +1,6 @@
 # End to end example
 ### Assume these code on custom_pipeline.py
 import inspect
-import json
 import logging
 import math
 import os
@@ -11,33 +10,28 @@ from typing import Any
 import numpy as np
 import PIL.Image
 import torch
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput
-import torch
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models.autoencoders.autoencoder_kl_qwenimage import (
-    AutoencoderKLQwenImage,
-)
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
+from torch import nn
+from transformers import Qwen2Tokenizer, Qwen2VLProcessor
+from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.transformers_utils.config import get_hf_file_to_dict
+
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
-from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
-    QwenImageTransformer2DModel,
-)
-from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_shift
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from torch import nn
-from vllm.transformers_utils.config import get_hf_file_to_dict
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_shift
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+
 logger = logging.getLogger(__name__)
 # class CustomPipeline:
 #     def __init__(self, od_config: OmniDiffusionConfig):
@@ -49,8 +43,9 @@ logger = logging.getLogger(__name__)
 #     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
 #         pass
 
-#     def setup_tranformer_engine(self, ...):
-#         self.tranformer = ...
+#     def setup_transformer_engine(self, ...):
+#         self.transformer = ...
+
 
 def calculate_dimensions(target_area: float, ratio: float):
     """Calculate width and height from target area and aspect ratio."""
@@ -117,6 +112,7 @@ def retrieve_latents(
         return encoder_output.latents
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
+
 
 class CustomPipeline(
     nn.Module,
@@ -806,6 +802,7 @@ class CustomPipeline(
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
+
 class WorkerExtension:
     def re_init_pipeline(self):
         del self.pipeline.vae
@@ -821,10 +818,11 @@ class WorkerExtension:
         custom_pipeline.transformer = self.pipeline.transformer
         self.pipeline = custom_pipeline
         # Set up transformer engine if need
-        # self.pipeline.setup_tranformer_engine()
+        # self.pipeline.setup_transformer_engine()
         # Load weights if need
         # self.pipeline.load_weights()
         # Enable cache backend if need
         # self.cache_backend.enable(self.pipeline)
+
 
 ### Assume these code on custom_pipeline.py

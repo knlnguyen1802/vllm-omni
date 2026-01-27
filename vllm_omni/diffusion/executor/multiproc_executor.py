@@ -82,7 +82,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         # Extract worker_extension_cls and custom_pipeline_args from config if provided
         worker_extension_cls = od_config.worker_extension_cls
-        custom_pipeline_args = getattr(od_config, 'custom_pipeline_args', None)
+        custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
 
         # Launch all worker processes
         scheduler_pipe_readers = []

@@ -124,7 +124,7 @@ class GPUWorker:
 
         if not self.od_config.enforce_eager:
             try:
-                if not self.od_config.enable_dummy_pipeline:  
+                if not self.od_config.enable_dummy_pipeline:
                     self.pipeline.transformer = regionally_compile(
                         self.pipeline.transformer,
                         dynamic=True,
@@ -249,6 +249,7 @@ class GPUWorker:
     def shutdown(self) -> None:
         destroy_distributed_env()
 
+
 class CustomPipelineWorkerExtension:
     def re_init_pipeline(self, custom_pipeline_args: dict[str, Any], od_config: OmniDiffusionConfig) -> None:
         """
@@ -259,23 +260,23 @@ class CustomPipelineWorkerExtension:
             od_config: OmniDiffusionConfig configuration
         """
         from vllm.utils.torch_utils import set_default_torch_dtype
-        
+
         # Clean up old pipeline
         del self.pipeline
         gc.collect()
         torch.cuda.empty_cache()
-        
+
         # Get custom pipeline class
         custom_pipeline_cls = resolve_obj_by_qualname(custom_pipeline_args["pipeline_class"])
-        
+
         # Use EXACT same pattern as init_device_and_model for loading
         load_device = "cpu" if od_config.enable_cpu_offload else str(self.device)
         target_device = torch.device(load_device)
-        
+
         load_config = LoadConfig()
         model_loader = DiffusersPipelineLoader(load_config)
         time_before_load = time.perf_counter()
-        
+
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
             with self._maybe_get_memory_pool_context(tag="weights"):
                 with DeviceMemoryProfiler() as m:
@@ -283,21 +284,21 @@ class CustomPipelineWorkerExtension:
                     with set_default_torch_dtype(od_config.dtype):
                         with target_device:
                             custom_pipeline = custom_pipeline_cls(od_config=od_config)
-                    
+
                     # Load weights using model_loader (same as original)
-                    if hasattr(custom_pipeline, 'load_weights') and hasattr(custom_pipeline, 'weights_sources'):
+                    if hasattr(custom_pipeline, "load_weights") and hasattr(custom_pipeline, "weights_sources"):
                         model_loader.load_weights(custom_pipeline)
-                    
+
                     custom_pipeline = custom_pipeline.eval()
-            
+
             time_after_load = time.perf_counter()
-        
+
         logger.info(
             "Custom pipeline loading took %.4f GiB and %.6f seconds",
             m.consumed_memory / GiB_bytes,
             time_after_load - time_before_load,
         )
-        
+
         # Apply CPU offloading if enabled (same as init_device_and_model)
         if od_config.enable_cpu_offload:
             for name in ["vae"]:
@@ -308,9 +309,9 @@ class CustomPipelineWorkerExtension:
                     module.to(self.device, non_blocking=True)
                 except Exception as exc:
                     logger.debug("Failed to move %s to GPU: %s", name, exc)
-            
+
             apply_offload_hooks(custom_pipeline, od_config, device=self.device)
-        
+
         self.pipeline = custom_pipeline
         if not self.od_config.enforce_eager:
             try:
@@ -327,6 +328,7 @@ class CustomPipelineWorkerExtension:
 
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
+
 
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
@@ -361,7 +363,7 @@ class WorkerProc:
             logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
-        
+
         # Create worker using WorkerWrapperBase for extension support
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
@@ -530,7 +532,7 @@ class WorkerWrapperBase:
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
-        
+
         Args:
             gpu_id: GPU device ID
             od_config: OmniDiffusionConfig configuration
@@ -542,17 +544,17 @@ class WorkerWrapperBase:
         self.base_worker_class = base_worker_class
         self.worker_extension_cls = worker_extension_cls
         self.custom_pipeline_args = custom_pipeline_args
-        
+
         # Prepare worker class with extension support
         worker_class = self._prepare_worker_class()
-        
+
         # Create the actual worker instance
         self.worker = worker_class(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
         )
-        
+
         # Re-initialize pipeline with custom pipeline if provided
         if self.custom_pipeline_args is not None:
             self.worker.re_init_pipeline(self.custom_pipeline_args, self.od_config)
@@ -561,7 +563,7 @@ class WorkerWrapperBase:
         """
         Prepare the worker class with optional extension.
         Dynamically extends GPUWorker with worker_extension_cls if provided.
-        
+
         Returns:
             The worker class (potentially extended)
         """
@@ -578,7 +580,7 @@ class WorkerWrapperBase:
             else:
                 worker_extension_cls = self.worker_extension_cls
             extended_calls = []
-            
+
             if worker_extension_cls not in worker_class.__bases__:
                 # Check for conflicts between worker and extension
                 for attr in dir(worker_extension_cls):
@@ -592,7 +594,7 @@ class WorkerWrapperBase:
                         )
                     if callable(getattr(worker_extension_cls, attr)):
                         extended_calls.append(attr)
-                
+
                 # Dynamically inherit the worker extension class
                 class_name = f"{worker_class.__name__}With{worker_extension_cls.__name__}"
                 worker_class = type(class_name, (worker_extension_cls, worker_class), {})
@@ -602,7 +604,7 @@ class WorkerWrapperBase:
                     worker_extension_cls,
                     extended_calls,
                 )
-        
+
         return worker_class
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
@@ -682,15 +684,15 @@ class WorkerWrapperBase:
     def execute_method(self, method: str | bytes, *args, **kwargs):
         """
         Execute a method on the worker.
-        
+
         Args:
             method: Method name (str) or serialized callable (bytes)
             *args: Positional arguments to pass to the method
             **kwargs: Keyword arguments to pass to the method
-            
+
         Returns:
             Result of the method execution
-            
+
         Raises:
             Exception: If method execution fails
         """
@@ -706,19 +708,16 @@ class WorkerWrapperBase:
             elif isinstance(method, bytes):
                 # Deserialize and execute the callable
                 import cloudpickle
+
                 func = cloudpickle.loads(method)
                 return func(self.worker, *args, **kwargs)
             else:
                 raise TypeError(f"Method must be str or bytes, got {type(method)}")
         except Exception as e:
-            msg = (
-                f"Error executing method {method!r}. "
-                "This might cause issues in distributed execution."
-            )
+            msg = f"Error executing method {method!r}. This might cause issues in distributed execution."
             logger.exception(msg)
             raise e
 
     def __getattr__(self, attr: str):
         """Delegate attribute access to the wrapped worker."""
         return getattr(self.worker, attr)
-

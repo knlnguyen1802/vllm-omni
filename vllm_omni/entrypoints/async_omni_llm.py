@@ -3,7 +3,8 @@
 import asyncio
 import os
 import socket
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 import vllm.envs as envs
@@ -184,6 +185,28 @@ class AsyncOmniLLM(AsyncLLM):
             )
         else:
             self.profiler = None
+
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> Any:
+        return self.engine_core.collective_rpc(
+            method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+        )
+
+    async def sleep(self, level: int = 1) -> None:
+        """Put the engine into sleep mode."""
+        self.collective_rpc(method="sleep", args=(level,))
+
+    async def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up the engine from sleep mode."""
+        self.collective_rpc(method="wake_up", args=(tags,))
 
     @classmethod
     @deprecate_kwargs(

@@ -167,7 +167,7 @@ class OmniBase:
             num_devices = kwargs["parallel_config"].world_size
             for i in range(1, num_devices):
                 devices += f",{i}"
-        
+
         default_stage_cfg = [
             {
                 "stage_id": 0,
@@ -404,6 +404,32 @@ class OmniBase:
                         stage_id,
                         e,
                     )
+
+    def collective_rpc(
+        self,
+        method: str | Callable[..., Any],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method=method,
+                args=args,
+                timeout=timeout,
+                kwargs=kwargs,
+            )
+            results.append(result)
+        return results
+
+    def sleep(self, level: int = 1) -> None:
+        """Put the engine into sleep mode."""
+        self.collective_rpc(method="sleep", args=(level,))
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up the engine from sleep mode."""
+        self.collective_rpc(method="wake_up", args=(tags,))
 
     def close(self) -> None:
         """Close all stage processes and clean up resources."""

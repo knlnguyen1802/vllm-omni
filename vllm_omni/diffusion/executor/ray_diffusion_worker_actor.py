@@ -6,10 +6,11 @@ Part of the RayActorExecutor system.
 
 from __future__ import annotations
 
-import ray
-import multiprocessing as mp
 import time
+
+import ray
 from vllm.logger import init_logger
+
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
@@ -33,6 +34,7 @@ class DiffusionWorkerActor:
     def initialize(self) -> bool:
         """Initialize scheduler and worker processes."""
         from vllm_omni.diffusion.worker.gpu_worker import WorkerWrapperBase
+
         self.worker = WorkerWrapperBase(
             gpu_id=0,
             od_config=self.od_config,
@@ -149,6 +151,7 @@ class DiffusionWorkerActor:
     def execute_model(self, requests: list[dict]):
         """Execute model inference on workers."""
         from vllm_omni.diffusion.request import OmniDiffusionRequest
+
         logger.info(f"Request is ======================================================== {requests}")
         # Convert dict representations back to OmniDiffusionRequest objects
         # because gpu_worker.execute_model expects OmniDiffusionRequest objects

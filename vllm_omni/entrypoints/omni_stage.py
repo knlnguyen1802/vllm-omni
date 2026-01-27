@@ -55,6 +55,7 @@ logger = init_logger(__name__)
 
 _R = TypeVar("_R")
 
+
 def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
     """Build OmniDiffusionConfig kwargs from engine args."""
     od_config = engine_args.get("od_config", {})
@@ -424,7 +425,7 @@ class OmniStage:
             return self.custom_process_input_func(
                 stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )
-    
+
     def collective_rpc(
         self,
         method: str | Callable[..., _R],

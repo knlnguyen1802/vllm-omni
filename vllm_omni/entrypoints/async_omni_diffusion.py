@@ -10,11 +10,10 @@ enabling concurrent request handling and streaming generation.
 
 import asyncio
 import uuid
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from typing import Any
-from collections.abc import Callable
 
 from PIL import Image
 from vllm.logger import init_logger
@@ -246,6 +245,14 @@ class AsyncOmniDiffusion:
             args=args,
             kwargs=kwargs,
         )
+
+    async def sleep(self, level: int = 1) -> None:
+        """Put the engine into sleep mode."""
+        self.collective_rpc(method="sleep", args=(level,))
+
+    async def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up the engine from sleep mode."""
+        self.collective_rpc(method="wake_up", args=(tags,))
 
     def close(self) -> None:
         """Close the engine and release resources.

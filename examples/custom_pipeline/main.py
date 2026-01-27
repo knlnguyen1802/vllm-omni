@@ -1,7 +1,8 @@
 import asyncio
+
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
-from vllm.transformers_utils.config import get_hf_file_to_dict
+
 
 async def main():
     async_diffusion = AsyncOmniDiffusion(
@@ -18,8 +19,6 @@ async def main():
 
     print("Generation result:", results)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
-    
-    
-

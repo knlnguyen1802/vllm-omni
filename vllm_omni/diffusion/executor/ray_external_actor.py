@@ -4,15 +4,16 @@ Custom executor that launches a Ray actor to manage diffusion workers internally
 """
 
 from __future__ import annotations
+
 from typing import Any
+
 import ray
-
 from vllm.logger import init_logger
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.ray_diffusion_worker_actor import DiffusionWorkerActor
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
 
@@ -102,9 +103,9 @@ class RayActorExecutor(DiffusionExecutor):
     def add_req(self, requests: list[OmniDiffusionRequest]):
         # return self.scheduler.add_req(requests)
         return ray.get(self.worker_actor.add_req.remote(requests))
-        #pass
+        # pass
 
-    def close()-> Any:
+    def close() -> Any:
         pass
 
     # ------------------------------------------------------------------ #

@@ -5,7 +5,9 @@ import torch
 from PIL import Image
 from vllm.outputs import RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
+
 from vllm_omni.diffusion.data import DiffusionOutput
+
 
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.

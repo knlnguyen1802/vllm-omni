@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Any
 
 import cloudpickle
@@ -173,6 +174,28 @@ class OmniLLM(LLM):
         self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
         self.model_config = self.llm_engine.model_config
         self.input_processor = self.llm_engine.input_processor
+
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> Any:
+        return self.llm_engine.collective_rpc(
+            method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+        )
+
+    def sleep(self, level: int = 1) -> None:
+        """Put the engine into sleep mode."""
+        self.collective_rpc(method="sleep", args=(level,))
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up the engine from sleep mode."""
+        self.collective_rpc(method="wake_up", args=(tags,))
 
     def close(self) -> None:
         """Close resources.

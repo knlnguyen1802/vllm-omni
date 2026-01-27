@@ -134,6 +134,14 @@ class OmniDiffusion:
             kwargs=kwargs,
         )
 
+    def sleep(self, level: int = 1) -> None:
+        """Put the engine into sleep mode."""
+        self.collective_rpc(method="sleep", args=(level,))
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up the engine from sleep mode."""
+        self.collective_rpc(method="wake_up", args=(tags,))
+
     def close(self) -> None:
         self.engine.close()
 
