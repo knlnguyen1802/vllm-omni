@@ -116,37 +116,37 @@ def try_recv_via_connector(
         connector = connectors.get(connector_key)
 
         if connector:
-            #try:
+            try:
                 # Get data from connector with timeout
-            _t_start = time.time()
-            connector_metadata = task.get("connector_metadata")
-            payload = connector.get(from_stage, to_stage, str(rid), metadata=connector_metadata)
-            _t_end = time.time()
+                _t_start = time.time()
+                connector_metadata = task.get("connector_metadata")
+                payload = connector.get(from_stage, to_stage, str(rid), metadata=connector_metadata)
+                _t_end = time.time()
 
-            if payload:
-                if isinstance(payload, tuple):
-                    payload_data, serialized_size = payload
+                if payload:
+                    if isinstance(payload, tuple):
+                        payload_data, serialized_size = payload
+                    else:
+                        payload_data = payload
+                        serialized_size = len(connector.serialize_obj(payload_data))
                 else:
-                    payload_data = payload
-                    serialized_size = len(connector.serialize_obj(payload_data))
-            else:
-                payload_data = None
-                serialized_size = 0
+                    payload_data = None
+                    serialized_size = 0
 
-            if payload_data and isinstance(payload_data, dict):
-                ein = payload_data.get("engine_inputs")
-                decode_ms = (_t_end - _t_start) * 1000.0
+                if payload_data and isinstance(payload_data, dict):
+                    ein = payload_data.get("engine_inputs")
+                    decode_ms = (_t_end - _t_start) * 1000.0
 
-                rx_metrics = {"rx_decode_time_ms": decode_ms, "rx_transfer_bytes": serialized_size}
-                return ein, rx_metrics
-            else:
-                logger.info(
-                    "[Stage-%s] Failed to get data from connector for request %s or payload is empty", stage_id, rid
-                )
+                    rx_metrics = {"rx_decode_time_ms": decode_ms, "rx_transfer_bytes": serialized_size}
+                    return ein, rx_metrics
+                else:
+                    logger.info(
+                        "[Stage-%s] Failed to get data from connector for request %s or payload is empty", stage_id, rid
+                    )
+                    return None, None
+            except Exception as e:
+                logger.info("[Stage-%s] Error retrieving data from connector for request %s: %s", stage_id, rid, e)
                 return None, None
-            # except Exception as e:
-            #     logger.info("[Stage-%s] Error retrieving data from connector for request %s: %s", stage_id, rid, e)
-            #     return None, None
         else:
             logger.info(
                 "[Stage-%s] No connector found for edge %s -> %s for request %s", stage_id, from_stage, to_stage, rid
@@ -161,15 +161,12 @@ def try_recv_via_connector(
         # Try to use the new stage_utils which uses OmniSerializer
         from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc_with_metrics
 
-        ein, metrics = maybe_load_from_ipc_with_metrics(task, "engine_inputs", "engine_inputs_shm")
-        # If metrics are empty or zero, we might want to populate dummy metrics
-        return ein, metrics
-        # try:
-        #     ein, metrics = maybe_load_from_ipc_with_metrics(task, "engine_inputs", "engine_inputs_shm")
-        #     # If metrics are empty or zero, we might want to populate dummy metrics
-        #     return ein, metrics
-        # except Exception:
-        #     # If engine_inputs is missing, it might be a different kind of payload,
-        #     # but for Stage-0 seed it should be there.
-        #     # We'll return None to let caller handle error if strictly required.
-        #     return None, None
+        try:
+            ein, metrics = maybe_load_from_ipc_with_metrics(task, "engine_inputs", "engine_inputs_shm")
+            # If metrics are empty or zero, we might want to populate dummy metrics
+            return ein, metrics
+        except Exception:
+            # If engine_inputs is missing, it might be a different kind of payload,
+            # but for Stage-0 seed it should be there.
+            # We'll return None to let caller handle error if strictly required.
+            return None, None
