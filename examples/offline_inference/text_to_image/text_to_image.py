@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -23,7 +24,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
-        "--negative_prompt", default="", help="negative prompt for classifier-free conditional guidance."
+        "--negative_prompt",
+        default=None,
+        help="negative prompt for classifier-free conditional guidance.",
     )
     parser.add_argument("--seed", type=int, default=142, help="Random seed for deterministic results.")
     parser.add_argument(
@@ -81,6 +84,24 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of GPUs used for ring sequence parallelism.",
     )
+    parser.add_argument(
+        "--cfg_parallel_size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
+    parser.add_argument(
+        "--enforce_eager",
+        action="store_true",
+        help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
     return parser.parse_args()
 
 
@@ -123,7 +144,16 @@ def main():
         }
 
     # assert args.ring_degree == 1, "Ring attention is not supported yet"
-    parallel_config = DiffusionParallelConfig(ulysses_degree=args.ulysses_degree, ring_degree=args.ring_degree)
+    parallel_config = DiffusionParallelConfig(
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        cfg_parallel_size=args.cfg_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+    )
+
+    # Check if profiling is requested via environment variable
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+
     omni = Omni(
         model=args.model,
         vae_use_slicing=vae_use_slicing,
@@ -131,7 +161,12 @@ def main():
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         parallel_config=parallel_config,
+        enforce_eager=args.enforce_eager,
     )
+
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
 
     # Time profiling for generation
     print(f"\n{'=' * 60}")
@@ -139,7 +174,10 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
-    print(f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}")
+    print(
+        f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
+        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}"
+    )
     print(f"  Image size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
 
@@ -160,6 +198,23 @@ def main():
 
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+
+    if profiler_enabled:
+        print("\n[Profiler] Stopping profiler and collecting results...")
+        profile_results = omni.stop_profile()
+        if profile_results and isinstance(profile_results, dict):
+            traces = profile_results.get("traces", [])
+            print("\n" + "=" * 60)
+            print("PROFILING RESULTS:")
+            for rank, trace in enumerate(traces):
+                print(f"\nRank {rank}:")
+                if trace:
+                    print(f"  • Trace: {trace}")
+            if not traces:
+                print("  No traces collected.")
+            print("=" * 60)
+        else:
+            print("[Profiler] No valid profiling data returned.")
 
     # Extract images from OmniRequestOutput
     # omni.generate() returns list[OmniRequestOutput], extract images from the first output
