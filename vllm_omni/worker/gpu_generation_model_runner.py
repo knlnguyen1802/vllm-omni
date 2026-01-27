@@ -50,6 +50,17 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
     - Executes generation process and returns tensors via `pooler_output`.
     """
 
+    def _update_request_states(self, scheduler_output: SchedulerOutput):
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for _, req_id in enumerate(cached_reqs.req_ids):
+            req_state = self.requests.get(req_id)
+            assert req_state is not None
+            req_state.prompt_token_ids = cached_reqs.prompt_token_ids.get(req_id)
+            self.input_batch.remove_request(req_id)
+            # update the request state in self.input_batch
+            self.input_batch.add_request(req_state)
+            self._init_mrope_positions(req_state)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -74,6 +85,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            if self.model_config.async_chunk:
+                self._update_request_states(scheduler_output)
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -308,8 +321,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     {"model_outputs": out.detach().to("cpu").contiguous() if out is not None else None}
                 )
         elif isinstance(multimodal_outputs, dict):
+            mm_payload = {}
             for key, out in multimodal_outputs.items():
-                pooler_output.append({key: out.detach().to("cpu").contiguous() if out is not None else None})
+                if out is not None and isinstance(out, torch.Tensor):
+                    mm_payload[key] = out.detach().to("cpu").contiguous()
+            pooler_output.append(mm_payload)
         else:
             raise RuntimeError("Unsupported diffusion output type")
         output = OmniModelRunnerOutput(
