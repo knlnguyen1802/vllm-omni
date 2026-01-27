@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+from collections.abc import Callable
 from dataclasses import fields
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
@@ -117,6 +119,20 @@ class OmniDiffusion:
 
     def _run_engine(self, requests: list[OmniDiffusionRequest]):
         return self.engine.step(requests)
+
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> Any:
+        return self.engine.collective_rpc(
+            method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+        )
 
     def close(self) -> None:
         self.engine.close()

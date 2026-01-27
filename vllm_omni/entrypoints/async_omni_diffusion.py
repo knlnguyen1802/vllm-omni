@@ -14,6 +14,7 @@ from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from typing import Any
+from collections.abc import Callable
 
 from PIL import Image
 from vllm.logger import init_logger
@@ -231,6 +232,20 @@ class AsyncOmniDiffusion:
         """
         result = await self.generate(prompt=prompt, request_id=request_id, **kwargs)
         yield result
+
+    def collective_rpc(
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> Any:
+        return self.engine.collective_rpc(
+            method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+        )
 
     def close(self) -> None:
         """Close the engine and release resources.

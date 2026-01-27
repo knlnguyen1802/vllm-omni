@@ -6,7 +6,8 @@ import weakref
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import asdict
 from pprint import pformat
-from typing import Any
+from typing import Any, TypeVar
+from collections.abc import Callable
 
 from vllm.config import VllmConfig
 from vllm.inputs.preprocess import InputPreprocessor
@@ -38,6 +39,7 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+_R = TypeVar("_R")
 
 def _weak_close_cleanup_async(stage_list, stage_in_queues, ray_pg, output_handler):
     """Weak reference cleanup function for AsyncOmni instances."""
@@ -522,6 +524,24 @@ class AsyncOmni(OmniBase):
 
         self.output_handler = asyncio.create_task(output_handler())
 
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method=method,
+                args=args,
+                timeout=timeout,
+                kwargs=kwargs,
+            )
+            results.append(result)
+        return results
+
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.
@@ -597,10 +617,16 @@ class AsyncOmni(OmniBase):
         pass
 
     async def sleep(self, level: int = 1) -> None:
-        pass
+        self.collective_rpc(
+            method="sleep",
+            args=(level,)
+        )
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
-        pass
+        self.collective_rpc(
+            method="wake_up",
+            args=(tags,)
+        )
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""

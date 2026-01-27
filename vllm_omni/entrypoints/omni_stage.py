@@ -13,9 +13,12 @@ import multiprocessing as mp
 import os
 import queue
 import sys
+import time
 import traceback
+import uuid
+from collections.abc import Callable
 from dataclasses import fields
-from typing import Any
+from typing import Any, TypeVar
 
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
@@ -50,6 +53,7 @@ from vllm_omni.utils import detect_device_type
 
 logger = init_logger(__name__)
 
+_R = TypeVar("_R")
 
 def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
     """Build OmniDiffusionConfig kwargs from engine args."""
@@ -420,6 +424,64 @@ class OmniStage:
             return self.custom_process_input_func(
                 stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )
+    
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        """Execute an RPC call on all workers via the stage engine.
+
+        Args:
+            method: Name of the worker method to execute, or a callable that
+                is serialized and sent to all workers to execute.
+
+                If the method is a callable, it should accept an additional
+                `self` argument, in addition to the arguments passed in `args`
+                and `kwargs`. The `self` argument will be the worker object.
+            timeout: Maximum time in seconds to wait for execution. Raises a
+                [`TimeoutError`][] on timeout. `None` means wait indefinitely.
+            args: Positional arguments to pass to the worker method.
+            kwargs: Keyword arguments to pass to the worker method.
+
+        Returns:
+            A list containing the results from each worker.
+
+        Note:
+            It is recommended to use this API to only pass control messages,
+            and set up data-plane communication to pass data.
+        """
+        assert self._in_q is not None and self._out_q is not None, "Queues must be attached before collective_rpc"
+
+        # Submit collective_rpc task to worker
+        rpc_id = str(uuid.uuid4())
+        self._in_q.put(
+            {
+                "type": OmniStageTaskType.COLLECTIVE_RPC,
+                "rpc_id": rpc_id,
+                "method": method,
+                "timeout": timeout,
+                "args": args,
+                "kwargs": kwargs,
+            }
+        )
+
+        start_time = time.time()
+        while True:
+            if timeout is not None and (time.time() - start_time) > timeout:
+                raise TimeoutError(f"collective_rpc timed out after {timeout} seconds")
+
+            result = self.try_collect()
+            if result is not None:
+                if result.get("type") == "collective_rpc_result":
+                    if result.get("rpc_id") == rpc_id:
+                        if "error" in result:
+                            raise RuntimeError(f"collective_rpc failed: {result['error']}")
+                        return result["result"]
+
+            time.sleep(0.001)  # Small sleep to avoid busy waiting
 
 
 def _stage_worker(
@@ -672,6 +734,32 @@ def _stage_worker(
         if task_type == OmniStageTaskType.SHUTDOWN:
             logger.info("Received shutdown signal")
             break
+
+        if task_type == OmniStageTaskType.COLLECTIVE_RPC:
+            rpc_id = task.get("rpc_id")
+            method = task.get("method")
+            timeout = task.get("timeout")
+            args = task.get("args")
+            kwargs = task.get("kwargs")
+            try:
+                result = stage_engine.collective_rpc(method, timeout, args, kwargs)
+                out_q.put(
+                    {
+                        "type": "collective_rpc_result",
+                        "rpc_id": rpc_id,
+                        "result": result,
+                    }
+                )
+                continue
+            except Exception as e:
+                out_q.put(
+                    {
+                        "type": "collective_rpc_result",
+                        "rpc_id": rpc_id,
+                        "error": str(e),
+                    }
+                )
+                continue
 
         # Handle profiler control commands
         if is_profiler_task(task_type):
@@ -1273,6 +1361,31 @@ async def _stage_worker_async(
             elif task_type == OmniStageTaskType.ABORT:
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
+            elif task_type == OmniStageTaskType.COLLECTIVE_RPC:
+                rpc_id = task.get("rpc_id")
+                method = task.get("method")
+                timeout = task.get("timeout")
+                args = task.get("args")
+                kwargs = task.get("kwargs")
+                try:
+                    result = stage_engine.collective_rpc(method, timeout, args, kwargs)
+                    out_q.put(
+                        {
+                            "type": "collective_rpc_result",
+                            "rpc_id": rpc_id,
+                            "result": result,
+                        }
+                    )
+                    continue
+                except Exception as e:
+                    out_q.put(
+                        {
+                            "type": "collective_rpc_result",
+                            "rpc_id": rpc_id,
+                            "error": str(e),
+                        }
+                    )
+                    continue
             elif is_profiler_task(task_type):
                 await handle_profiler_task_async(task_type)
             else:

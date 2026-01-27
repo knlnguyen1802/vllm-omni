@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 class OmniStageTaskType(enum.Enum):
     GENERATE = "generate"
+    COLLECTIVE_RPC = "collective_rpc"
     ABORT = "abort"
     SHUTDOWN = "shutdown"
     PROFILER_START = "profiler_start"

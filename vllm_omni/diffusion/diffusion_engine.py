@@ -201,7 +201,6 @@ class DiffusionEngine:
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict | None = None,
-        unique_reply_rank: int | None = None,
     ) -> Any:
         """Call a method on worker processes and get results immediately.
 
@@ -210,12 +209,13 @@ class DiffusionEngine:
             timeout: Optional timeout in seconds
             args: Positional arguments for the method
             kwargs: Keyword arguments for the method
-            unique_reply_rank: If set, only get reply from this rank
 
         Returns:
             Single result if unique_reply_rank is provided, otherwise list of results
         """
         assert isinstance(method, str), "Only string method names are supported for now"
+        kwargs = kwargs or {}
+        unique_reply_rank = kwargs.pop("unique_reply_rank", None)
         return self.executor.collective_rpc(
             method=method,
             timeout=timeout,
