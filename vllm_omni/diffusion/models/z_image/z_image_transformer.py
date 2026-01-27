@@ -457,6 +457,10 @@ class RopeEmbedder:
 
 class ZImageTransformer2DModel(nn.Module):
     _repeated_blocks = ["ZImageTransformerBlock"]
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "w13": ["w1", "w3"],
+    }
 
     def __init__(
         self,
