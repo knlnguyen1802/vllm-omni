@@ -110,14 +110,17 @@ class GPUWorker:
             m.consumed_memory / GiB_bytes,
             time_after_load - time_before_load,
         )
-        self.lora_manager = DiffusionLoRAManager(
-            pipeline=self.pipeline,
-            device=self.device,
-            dtype=self.od_config.dtype,
-            max_cached_adapters=self.od_config.max_cpu_loras,
-            lora_path=self.od_config.lora_path,
-            lora_scale=self.od_config.lora_scale,
-        )
+        if self.od_config.enable_dummy_pipeline:
+            self.lora_manager = None
+        else:
+            self.lora_manager = DiffusionLoRAManager(
+                pipeline=self.pipeline,
+                device=self.device,
+                dtype=self.od_config.dtype,
+                max_cached_adapters=self.od_config.max_cpu_loras,
+                lora_path=self.od_config.lora_path,
+                lora_scale=self.od_config.lora_scale,
+            )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
         # Apply CPU offloading (DiT <-> encoders mutual exclusion)
@@ -349,6 +352,15 @@ class CustomPipelineWorkerExtension:
             "Custom pipeline loading took %.4f GiB and %.6f seconds",
             m.consumed_memory / GiB_bytes,
             time_after_load - time_before_load,
+        )
+
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipeline,
+            device=self.device,
+            dtype=self.od_config.dtype,
+            max_cached_adapters=self.od_config.max_cpu_loras,
+            lora_path=self.od_config.lora_path,
+            lora_scale=self.od_config.lora_scale,
         )
 
         # Apply CPU offloading if enabled (same as init_device_and_model)
