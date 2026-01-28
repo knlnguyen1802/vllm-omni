@@ -422,8 +422,8 @@ class AsyncOmniDiffusion:
         results = await self.collective_rpc(
             method="sleep",
             timeout=None,
-            args=(level,),
-            kwargs={},
+            args=(),
+            kwargs={"level": level},
         )
         return all(results) if isinstance(results, list) else results
 

@@ -254,8 +254,8 @@ class OmniLLM(LLM):
         results = self.llm_engine.collective_rpc(
             method="sleep",
             timeout=None,
-            args=(level,),
-            kwargs={},
+            args=(),
+            kwargs={"level": level},
         )
         return all(results) if isinstance(results, list) else results
 
