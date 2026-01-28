@@ -884,3 +884,45 @@ class Omni(OmniBase):
     @property
     def _name(self) -> str:
         return "Orchestrator"
+
+    def sleep(self, level: int = 1) -> list[bool]:
+        """Put all stage workers to sleep, offloading model weights.
+
+        Args:
+            level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
+
+        Returns:
+            List of results from each stage
+        """
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method="sleep",
+                timeout=None,
+                args=(level,),
+                kwargs={},
+            )
+            results.append(result)
+        return results
+
+    def wake_up(self, tags: list[str] | None = None) -> list[bool]:
+        """Wake up all stage workers from sleep mode.
+
+        Args:
+            tags: Optional list of tags to reallocate worker memory for specific
+                allocations. Values must be in ("weights",). If None, all memory
+                is reallocated.
+
+        Returns:
+            List of results from each stage
+        """
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method="wake_up",
+                timeout=None,
+                args=(),
+                kwargs={"tags": tags},
+            )
+            results.append(result)
+        return results

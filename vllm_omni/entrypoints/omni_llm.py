@@ -241,3 +241,39 @@ class OmniLLM(LLM):
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
         return sorted(outputs, key=lambda x: int(x.request_id.split("-")[0]))
+
+    def sleep(self, level: int = 1) -> bool:
+        """Put the worker to sleep, offloading model weights.
+
+        Args:
+            level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
+
+        Returns:
+            True if successful
+        """
+        results = self.llm_engine.collective_rpc(
+            method="sleep",
+            timeout=None,
+            args=(level,),
+            kwargs={},
+        )
+        return all(results) if isinstance(results, list) else results
+
+    def wake_up(self, tags: list[str] | None = None) -> bool:
+        """Wake up the worker from sleep mode.
+
+        Args:
+            tags: Optional list of tags to reallocate worker memory for specific
+                allocations. Values must be in ("weights",). If None, all memory
+                is reallocated.
+
+        Returns:
+            True if successful
+        """
+        results = self.llm_engine.collective_rpc(
+            method="wake_up",
+            timeout=None,
+            args=(),
+            kwargs={"tags": tags},
+        )
+        return all(results) if isinstance(results, list) else results

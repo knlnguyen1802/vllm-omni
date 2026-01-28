@@ -719,10 +719,38 @@ class AsyncOmni(OmniBase):
         pass
 
     async def sleep(self, level: int = 1) -> None:
-        pass
+        """Put all stage workers to sleep, offloading model weights.
+
+        Args:
+            level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
+        """
+        for stage in self.stage_list:
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                stage.collective_rpc,
+                "sleep",
+                None,
+                (level,),
+                {},
+            )
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
-        pass
+        """Wake up all stage workers from sleep mode.
+
+        Args:
+            tags: Optional list of tags to reallocate worker memory for specific
+                allocations. Values must be in ("weights",). If None, all memory
+                is reallocated.
+        """
+        for stage in self.stage_list:
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                stage.collective_rpc,
+                "wake_up",
+                None,
+                (),
+                {"tags": tags},
+            )
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""

@@ -185,6 +185,42 @@ class AsyncOmniLLM(AsyncLLM):
         else:
             self.profiler = None
 
+    async def sleep(self, level: int = 1) -> bool:
+        """Put the worker to sleep, offloading model weights.
+
+        Args:
+            level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
+
+        Returns:
+            True if successful
+        """
+        results = await self.engine_core.collective_rpc(
+            method="sleep",
+            timeout=None,
+            args=(level,),
+            kwargs={},
+        )
+        return all(results) if isinstance(results, list) else results
+
+    async def wake_up(self, tags: list[str] | None = None) -> bool:
+        """Wake up the worker from sleep mode.
+
+        Args:
+            tags: Optional list of tags to reallocate worker memory for specific
+                allocations. Values must be in ("weights",). If None, all memory
+                is reallocated.
+
+        Returns:
+            True if successful
+        """
+        results = await self.engine_core.collective_rpc(
+            method="wake_up",
+            timeout=None,
+            args=(tags,),
+            kwargs={},
+        )
+        return all(results) if isinstance(results, list) else results
+
     @classmethod
     @deprecate_kwargs(
         "disable_log_requests",

@@ -184,3 +184,39 @@ class OmniDiffusion:
             return self.engine.stop_profile()
         else:
             raise RuntimeError("Diffusion engine not initialized")
+
+    def sleep(self, level: int = 1) -> bool:
+        """Put the worker to sleep, offloading model weights.
+
+        Args:
+            level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
+
+        Returns:
+            True if successful
+        """
+        results = self.collective_rpc(
+            method="sleep",
+            timeout=None,
+            args=(level,),
+            kwargs={},
+        )
+        return all(results) if isinstance(results, list) else results
+
+    def wake_up(self, tags: list[str] | None = None) -> bool:
+        """Wake up the worker from sleep mode.
+
+        Args:
+            tags: Optional list of tags to reallocate worker memory for specific
+                allocations. Values must be in ("weights",). If None, all memory
+                is reallocated.
+
+        Returns:
+            True if successful
+        """
+        results = self.collective_rpc(
+            method="wake_up",
+            timeout=None,
+            args=(tags,),
+            kwargs={},
+        )
+        return all(results) if isinstance(results, list) else results
