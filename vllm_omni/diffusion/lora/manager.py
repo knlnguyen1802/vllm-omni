@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
-from vllm.lora.lora_model import LoRAModel
+from vllm.lora.models import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.request import LoRARequest
