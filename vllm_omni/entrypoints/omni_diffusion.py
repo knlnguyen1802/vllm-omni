@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-from collections.abc import Callable
 import uuid
+from collections.abc import Callable
 from dataclasses import fields
 from typing import Any
 

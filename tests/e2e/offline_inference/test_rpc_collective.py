@@ -1,9 +1,9 @@
+import asyncio
 import os
 import sys
 from pathlib import Path
 
 import pytest
-import asyncio
 
 from .utils import create_new_process_for_each_test
 
@@ -12,12 +12,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 models = ["/mnt/nvme3n1/n0090/Z-Image-Turbo"]
+
 
 @create_new_process_for_each_test()
 @pytest.mark.parametrize("model_name", models)
@@ -46,4 +47,3 @@ def test_rpc_collective_async_omni(model_name: str):
         assert len(wake_up_results) == 1
 
     asyncio.run(_run())
-

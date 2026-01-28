@@ -760,7 +760,7 @@ class AsyncOmni(OmniBase):
             method="sleep",
             timeout=None,
             args=(),
-            kwargs={"level":level},
+            kwargs={"level": level},
         )
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
