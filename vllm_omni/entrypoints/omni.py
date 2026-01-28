@@ -10,7 +10,7 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pprint import pformat
-from typing import Any, TypeVar, Literal, overload
+from typing import Any, Literal, TypeVar, overload
 
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
@@ -41,8 +41,8 @@ from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
-from vllm_omni.lora.request import LoRARequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)

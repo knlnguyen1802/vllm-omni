@@ -18,7 +18,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import fields
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from vllm import PromptType, RequestOutput
 from vllm.inputs import TextPrompt
