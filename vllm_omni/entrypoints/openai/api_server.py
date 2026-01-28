@@ -38,23 +38,15 @@ from vllm.entrypoints.openai.protocol import (
     ModelPermission,
 )
 
+from vllm.entrypoints.utils import process_lora_modules
 # yapf conflicts with isort for this block
 # yapf: disable
 # yapf: enable
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+
+from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
-from vllm.entrypoints.openai.serving_responses import OpenAIServingResponses
-from vllm.entrypoints.openai.serving_transcription import (
-    OpenAIServingTranscription,
-    OpenAIServingTranslation,
-)
+
 from vllm.entrypoints.openai.utils import validate_json_request
-from vllm.entrypoints.pooling.classify.serving import ServingClassification
-from vllm.entrypoints.pooling.embed.serving import OpenAIServingEmbedding
-from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
-from vllm.entrypoints.pooling.score.serving import ServingScores
-from vllm.entrypoints.serve.disagg.serving import ServingTokens
-from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
 from vllm.entrypoints.tool_server import DemoToolServer, MCPToolServer, ToolServer
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
@@ -388,23 +380,13 @@ async def omni_init_app_state(
         tool_server = None
 
     # Merge default_mm_loras into the static lora_modules
-    default_mm_loras = {}
-    if vllm_config is not None and vllm_config.lora_config is not None:
-        default_mm_loras = vllm_config.lora_config.default_mm_loras
+    default_mm_loras = (
+        vllm_config.lora_config.default_mm_loras 
+        if vllm_config is not None and vllm_config.lora_config is not None 
+        else {}
+    )
 
-    lora_modules = args.lora_modules
-    if default_mm_loras:
-        default_mm_lora_paths = [
-            LoRAModulePath(
-                name=modality,
-                path=lora_path,
-            )
-            for modality, lora_path in default_mm_loras.items()
-        ]
-        if args.lora_modules is None:
-            lora_modules = default_mm_lora_paths
-        else:
-            lora_modules += default_mm_lora_paths
+    lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
 
     # Ensure input_processor, io_processor, and model_config exist for OpenAIServingModels compatibility
     if (
