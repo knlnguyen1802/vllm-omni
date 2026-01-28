@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ import PIL.Image
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
@@ -57,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second for the output video.")
+    parser.add_argument(
+        "--enable-cpu-offload",
+        action="store_true",
+        help="Enable CPU offloading for diffusion models.",
+    )
     return parser.parse_args()
 
 
@@ -95,26 +102,38 @@ def main():
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
 
+    # Check if profiling is requested via environment variable
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+
     omni = Omni(
         model=args.model,
         vae_use_slicing=vae_use_slicing,
         vae_use_tiling=vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
+        enable_cpu_offload=args.enable_cpu_offload,
     )
+
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
 
     # omni.generate() returns Generator[OmniRequestOutput, None, None]
     frames = omni.generate(
-        args.prompt,
-        negative_prompt=args.negative_prompt,
-        pil_image=image,
-        height=height,
-        width=width,
-        generator=generator,
-        guidance_scale=args.guidance_scale,
-        guidance_scale_2=args.guidance_scale_high,
-        num_inference_steps=args.num_inference_steps,
-        num_frames=args.num_frames,
+        {
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+            "multi_modal_data": {"image": image},
+        },
+        OmniDiffusionSamplingParams(
+            height=height,
+            width=width,
+            generator=generator,
+            guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_high,
+            num_inference_steps=args.num_inference_steps,
+            num_frames=args.num_frames,
+        ),
     )
 
     # Extract video frames from OmniRequestOutput
@@ -177,6 +196,23 @@ def main():
 
     export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
+
+    if profiler_enabled:
+        print("\n[Profiler] Stopping profiler and collecting results...")
+        profile_results = omni.stop_profile()
+        if profile_results and isinstance(profile_results, dict):
+            traces = profile_results.get("traces", [])
+            print("\n" + "=" * 60)
+            print("PROFILING RESULTS:")
+            for rank, trace in enumerate(traces):
+                print(f"\nRank {rank}:")
+                if trace:
+                    print(f"  • Trace: {trace}")
+            if not traces:
+                print("  No traces collected.")
+            print("=" * 60)
+        else:
+            print("[Profiler] No valid profiling data returned.")
 
 
 if __name__ == "__main__":

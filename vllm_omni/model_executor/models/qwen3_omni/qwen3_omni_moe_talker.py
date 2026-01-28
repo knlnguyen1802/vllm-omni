@@ -234,13 +234,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                 # Use the corresponding lm_head for this layer
                 logits = self.code_predictor.lm_head[layer_idx](hidden_state[:, -1:, :])  # [batch, 1, vocab_size]
 
-                if len(pos_codes) > 1:
-                    input_ids_for_logits_processors = torch.cat(pos_codes[1:], dim=1).to(
-                        device=logits.device, dtype=torch.long
-                    )
-                else:
-                    input_ids_for_logits_processors = self.empty_code
-                logits = logits_processors(input_ids_for_logits_processors, logits.squeeze(0)).unsqueeze(0)
+                logits = logits_processors(None, logits[:, -1])
 
                 # Sample from the filtered distribution
                 probs = F.softmax(logits, dim=-1)
@@ -288,7 +282,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             all_summed_embeddings.append(pos_summed)
 
         # Concatenate across positions: [batch, seq_len, hidden_size]
-        summed_embeddings = torch.cat(all_summed_embeddings, dim=1)
+        summed_embeddings = torch.cat(all_summed_embeddings, dim=1).squeeze(1)
 
         return result_codes, summed_embeddings
 
@@ -569,7 +563,10 @@ class Qwen3OmniMoeTalkerSharedExpertWrapper(nn.Module):
     - mlp.shared_expert.{gate_proj, up_proj, down_proj}.weight
     - mlp.shared_expert_gate.weight  (sibling, not child)
 
-    The wrapper applies: sigmoid(shared_expert_gate(x)) * shared_expert(x)
+    The wrapper applies: sigmoid(shared_expert_gate(x)) * shared_expert(x).
+
+    It also exposes the underlying shared_expert interface to keep
+    compatibility with backends that split shared-expert computation.
     """
 
     def __init__(
@@ -581,9 +578,30 @@ class Qwen3OmniMoeTalkerSharedExpertWrapper(nn.Module):
         self._shared_expert = shared_expert
         self._shared_expert_gate = shared_expert_gate
 
+    @property
+    def gate_up_proj(self):
+        return self._shared_expert.gate_up_proj
+
+    @property
+    def down_proj(self):
+        return self._shared_expert.down_proj
+
+    @property
+    def act_fn(self):
+        return self._shared_expert.act_fn
+
+    def expert_gate(self, x: torch.Tensor):
+        gate_out = self._shared_expert_gate(x)
+        if isinstance(gate_out, tuple):
+            return gate_out
+        return gate_out, None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self._shared_expert(x)
-        gate_values = F.sigmoid(self._shared_expert_gate(x))  # [batch, 1]
+        gate_out = self._shared_expert_gate(x)
+        if isinstance(gate_out, tuple):
+            gate_out = gate_out[0]
+        gate_values = F.sigmoid(gate_out)  # [batch, 1]
         return gate_values * out  # Broadcasting: [batch, 1] * [batch, hidden]
 
 

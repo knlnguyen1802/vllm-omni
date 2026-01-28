@@ -5,6 +5,10 @@ E2E offline tests for Omni model with video input and audio output.
 """
 
 import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+
 from pathlib import Path
 
 import pytest
@@ -13,8 +17,6 @@ from vllm.assets.video import VideoAsset
 from vllm_omni.utils import is_rocm
 
 from .conftest import OmniRunner
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
