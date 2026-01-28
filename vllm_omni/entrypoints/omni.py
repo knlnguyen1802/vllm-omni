@@ -42,6 +42,7 @@ from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_yaml,
     resolve_model_config_path,
 )
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -926,3 +927,90 @@ class Omni(OmniBase):
             )
             results.append(result)
         return results
+
+    def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
+        """Load a new LoRA adapter into the engine for future requests.
+
+        Args:
+            lora_request: LoRA adapter request to load
+            lora_scale: Scale factor for LoRA weights
+
+        Returns:
+            True if successful on all stages
+        """
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method="add_lora",
+                timeout=None,
+                args=(),
+                kwargs={"lora_request": lora_request, "lora_scale": lora_scale},
+            )
+            results.append(result)
+        return all(results) if isinstance(results, list) else results
+
+    def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA adapter from all stages.
+
+        Args:
+            adapter_id: The adapter ID to remove
+
+        Returns:
+            True if successful on all stages
+        """
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method="remove_lora",
+                timeout=None,
+                args=(),
+                kwargs={"adapter_id": adapter_id},
+            )
+            results.append(result)
+        return all(results) if isinstance(results, list) else results
+
+    def list_loras(self) -> list[int]:
+        """List all registered LoRA adapter IDs across all stages.
+
+        Returns:
+            List of unique adapter IDs
+        """
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method="list_loras",
+                timeout=None,
+                args=(),
+                kwargs={},
+            )
+            results.append(result)
+        # Flatten and deduplicate adapter IDs from all stages
+        if not isinstance(results, list):
+            return results or []
+        merged: set[int] = set()
+        for part in results:
+            if isinstance(part, list):
+                merged.update(part or [])
+            elif part is not None:
+                merged.add(part)
+        return sorted(merged)
+
+    def pin_lora(self, adapter_id: int) -> bool:
+        """Prevent a LoRA adapter from being evicted on all stages.
+
+        Args:
+            adapter_id: The adapter ID to pin
+
+        Returns:
+            True if successful on all stages
+        """
+        results = []
+        for stage in self.stage_list:
+            result = stage.collective_rpc(
+                method="pin_lora",
+                timeout=None,
+                args=(),
+                kwargs={"adapter_id": adapter_id},
+            )
+            results.append(result)
+        return all(results) if isinstance(results, list) else results

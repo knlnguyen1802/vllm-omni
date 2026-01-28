@@ -350,8 +350,8 @@ class AsyncOmniDiffusion:
         results = await self.collective_rpc(
             method="remove_lora",
             timeout=None,
-            args=(adapter_id,),
-            kwargs={},
+            args=(),
+            kwargs={"adapter_id": adapter_id},
         )
         return all(results) if isinstance(results, list) else results
 

@@ -782,7 +782,7 @@ class AsyncOmni(OmniBase):
         """Check whether the engine is sleeping"""
         return False
 
-    async def add_lora(self, lora_request: LoRARequest) -> bool:
+    async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
         """Load a new LoRA adapter into the engine for future requests.
 
         Args:
@@ -795,7 +795,7 @@ class AsyncOmni(OmniBase):
             method="add_lora",
             timeout=None,
             args=(),
-            kwargs={"lora_request": lora_request},
+            kwargs={"lora_request": lora_request, "lora_scale": lora_scale},
         )
         return all(results) if isinstance(results, list) else results
 
@@ -811,8 +811,8 @@ class AsyncOmni(OmniBase):
         results = await self.collective_rpc(
             method="remove_lora",
             timeout=None,
-            args=(adapter_id,),
-            kwargs={},
+            args=(),
+            kwargs={"adapter_id": adapter_id},
         )
         return all(results) if isinstance(results, list) else results
 

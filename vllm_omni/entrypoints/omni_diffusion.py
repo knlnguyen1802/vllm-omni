@@ -13,6 +13,7 @@ from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.lora.request import LoRARequest
 
 # TODO configure logging properly
 logging.basicConfig(level=logging.INFO)
@@ -218,5 +219,77 @@ class OmniDiffusion:
             timeout=None,
             args=(tags,),
             kwargs={},
+        )
+        return all(results) if isinstance(results, list) else results
+
+    def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
+        """Add a LoRA adapter.
+
+        Args:
+            lora_request: LoRA adapter request to load
+            lora_scale: Scale factor for LoRA weights
+
+        Returns:
+            True if successful
+        """
+        results = self.collective_rpc(
+            method="add_lora",
+            timeout=None,
+            args=(),
+            kwargs={"lora_request": lora_request, "lora_scale": lora_scale},
+        )
+        return all(results) if isinstance(results, list) else results
+
+    def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA adapter.
+
+        Args:
+            adapter_id: The adapter ID to remove
+
+        Returns:
+            True if successful
+        """
+        results = self.collective_rpc(
+            method="remove_lora",
+            timeout=None,
+            args=(),
+            kwargs={"adapter_id": adapter_id},
+        )
+        return all(results) if isinstance(results, list) else results
+
+    def list_loras(self) -> list[int]:
+        """List all registered LoRA adapter IDs.
+
+        Returns:
+            List of unique adapter IDs
+        """
+        results = self.collective_rpc(
+            method="list_loras",
+            timeout=None,
+            args=(),
+            kwargs={},
+        )
+        # collective_rpc returns list from workers; flatten unique ids
+        if not isinstance(results, list):
+            return results or []
+        merged: set[int] = set()
+        for part in results:
+            merged.update(part or [])
+        return sorted(merged)
+
+    def pin_lora(self, lora_id: int) -> bool:
+        """Prevent an adapter from being evicted.
+
+        Args:
+            lora_id: The adapter ID to pin
+
+        Returns:
+            True if successful
+        """
+        results = self.collective_rpc(
+            method="pin_lora",
+            timeout=None,
+            args=(),
+            kwargs={"adapter_id": lora_id},
         )
         return all(results) if isinstance(results, list) else results
