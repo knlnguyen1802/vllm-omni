@@ -31,6 +31,8 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.lora.request import LoRARequest
 
 logger = init_logger(__name__)
 
@@ -52,6 +54,7 @@ class GPUWorker:
         self.pipeline = None
         self.device = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device_and_model()
 
     def init_device_and_model(self) -> None:
@@ -107,6 +110,14 @@ class GPUWorker:
             m.consumed_memory / GiB_bytes,
             time_after_load - time_before_load,
         )
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipeline,
+            device=self.device,
+            dtype=self.od_config.dtype,
+            max_cached_adapters=self.od_config.max_cpu_loras,
+            lora_path=self.od_config.lora_path,
+            lora_scale=self.od_config.lora_scale,
+        )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
         # Apply CPU offloading (DiT <-> encoders mutual exclusion)
@@ -160,6 +171,35 @@ class GPUWorker:
         assert self.pipeline is not None
         if not reqs or len(reqs) == 0:
             raise ValueError("Cannot execute model with empty request list")
+
+
+        if self.lora_manager is not None and reqs:
+            req = reqs[0]
+
+            if len(reqs) > 1:
+                # This worker (and the current diffusion model runner) applies
+                # a single LoRA to the whole batch. Reject inconsistent LoRA
+                # settings to avoid silently applying the wrong adapter.
+                def _lora_key(r: OmniDiffusionRequest):
+                    if r.lora_request is None:
+                        return None
+                    lr = r.lora_request
+                    return (lr.lora_name, lr.lora_int_id, lr.lora_path, lr.tensorizer_config_dict)
+
+                key0 = _lora_key(req)
+                scale0 = req.lora_scale if key0 is not None else None
+                for other in reqs[1:]:
+                    if _lora_key(other) != key0:
+                        raise ValueError("All requests in a diffusion batch must share the same LoRARequest.")
+                    if key0 is not None and other.lora_scale != scale0:
+                        raise ValueError("All requests in a diffusion batch must share the same lora_scale.")
+
+            try:
+                self.lora_manager.set_active_adapter(req.lora_request, req.lora_scale)
+            except Exception as exc:
+                if req.lora_request is not None:
+                    raise
+                logger.warning("LoRA activation skipped: %s", exc)
         # TODO: dealing with first req for now
         req = reqs[0]
 
@@ -175,6 +215,18 @@ class GPUWorker:
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return self.pipeline.load_weights(weights)
+
+    def remove_lora(self, adapter_id: int) -> bool:
+        return self.lora_manager.remove_adapter(adapter_id)
+
+    def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
+        return self.lora_manager.add_adapter(lora_request, lora_scale)
+
+    def list_loras(self) -> list[int]:
+        return self.lora_manager.list_adapters()
+
+    def pin_lora(self, adapter_id: int) -> bool:
+        return self.lora_manager.pin_adapter(adapter_id)
 
     def sleep(self, level: int = 1) -> bool:
         """
