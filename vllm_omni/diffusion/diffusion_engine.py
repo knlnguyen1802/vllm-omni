@@ -354,7 +354,7 @@ class DiffusionEngine:
             timeout: Optional timeout in seconds
             args: Positional arguments for the method
             kwargs: Keyword arguments for the method
-            unique_reply_rank: If set, only get the result from this rank
+            unique_reply_rank: If set, only get reply from this rank
 
         Returns:
             Single result if unique_reply_rank is provided, otherwise list of results
