@@ -93,23 +93,24 @@ class GPUWorker:
 
             load_config = LoadConfig()
             model_loader = DiffusersPipelineLoader(load_config)
-            time_before_load = time.perf_counter()
-            with self._maybe_get_memory_pool_context(tag="weights"):
-                with DeviceMemoryProfiler() as m:
-                    if self.od_config.enable_dummy_pipeline:
-                        self.pipeline = None
-                    else:
+            if self.od_config.enable_dummy_pipeline:
+                self.pipeline = None
+            else:
+                time_before_load = time.perf_counter()
+                with self._maybe_get_memory_pool_context(tag="weights"):
+                    with DeviceMemoryProfiler() as m:
                         self.pipeline = model_loader.load_model(
                             od_config=self.od_config,
                             load_device=load_device,
                         )
-            time_after_load = time.perf_counter()
+                time_after_load = time.perf_counter()
 
-        logger.info(
-            "Model loading took %.4f GiB and %.6f seconds",
-            m.consumed_memory / GiB_bytes,
-            time_after_load - time_before_load,
-        )
+                logger.info(
+                    "Model loading took %.4f GiB and %.6f seconds",
+                    m.consumed_memory / GiB_bytes,
+                    time_after_load - time_before_load,
+                )
+
         if self.od_config.enable_dummy_pipeline:
             self.lora_manager = None
         else:
