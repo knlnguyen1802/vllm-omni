@@ -354,15 +354,6 @@ class CustomPipelineWorkerExtension:
             time_after_load - time_before_load,
         )
 
-        self.lora_manager = DiffusionLoRAManager(
-            pipeline=self.pipeline,
-            device=self.device,
-            dtype=self.od_config.dtype,
-            max_cached_adapters=self.od_config.max_cpu_loras,
-            lora_path=self.od_config.lora_path,
-            lora_scale=self.od_config.lora_scale,
-        )
-
         # Apply CPU offloading if enabled (same as init_device_and_model)
         if od_config.enable_cpu_offload:
             for name in ["vae"]:
@@ -377,6 +368,7 @@ class CustomPipelineWorkerExtension:
             apply_offload_hooks(custom_pipeline, od_config, device=self.device)
 
         self.pipeline = custom_pipeline
+
         if not self.od_config.enforce_eager:
             try:
                 self.pipeline.transformer = regionally_compile(
@@ -392,6 +384,15 @@ class CustomPipelineWorkerExtension:
 
         if self.cache_backend is not None:
             self.cache_backend.enable(self.pipeline)
+        
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipeline,
+            device=self.device,
+            dtype=self.od_config.dtype,
+            max_cached_adapters=self.od_config.max_cpu_loras,
+            lora_path=self.od_config.lora_path,
+            lora_scale=self.od_config.lora_scale,
+        )
 
 
 class WorkerProc:
