@@ -166,6 +166,7 @@ class AsyncOmni(OmniBase):
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
+                    "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
                 },
                 "final_output": True,
@@ -740,13 +741,11 @@ class AsyncOmni(OmniBase):
         """
         results = []
         for stage in self.stage_list:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                stage.collective_rpc,
-                method,
-                timeout,
-                args,
-                kwargs,
+            result = stage.collective_rpc(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
             )
             results.append(result)
         return results

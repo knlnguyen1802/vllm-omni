@@ -1495,6 +1495,30 @@ async def _stage_worker_async(
                 }
             )
 
+    async def execute_rpc(task: dict[str, Any]):
+        try:
+            rpc_id = task.get("rpc_id")
+            method = task.get("method")
+            timeout = task.get("timeout")
+            args = task.get("args")
+            kwargs = task.get("kwargs")
+            result = await stage_engine.collective_rpc(method, timeout, args, kwargs)
+            out_q.put(
+                {
+                    "type": "collective_rpc_result",
+                    "rpc_id": rpc_id,
+                    "result": result,
+                }
+            )
+        except Exception as e:
+            out_q.put(
+                {
+                    "type": "collective_rpc_result",
+                    "rpc_id": rpc_id,
+                    "error": str(e),
+                }
+            )
+
     _batch_gen_t0 = _time.time()
     while True:
         try:
@@ -1508,30 +1532,8 @@ async def _stage_worker_async(
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
             elif task_type == OmniStageTaskType.COLLECTIVE_RPC:
-                rpc_id = task.get("rpc_id")
-                method = task.get("method")
-                timeout = task.get("timeout")
-                args = task.get("args")
-                kwargs = task.get("kwargs")
-                try:
-                    result = stage_engine.collective_rpc(method, timeout, args, kwargs)
-                    out_q.put(
-                        {
-                            "type": "collective_rpc_result",
-                            "rpc_id": rpc_id,
-                            "result": result,
-                        }
-                    )
-                    continue
-                except Exception as e:
-                    out_q.put(
-                        {
-                            "type": "collective_rpc_result",
-                            "rpc_id": rpc_id,
-                            "error": str(e),
-                        }
-                    )
-                    continue
+                asyncio.create_task(execute_rpc(task))
+                continue
             elif is_profiler_task(task_type):
                 await handle_profiler_task_async(task_type)
             else:
