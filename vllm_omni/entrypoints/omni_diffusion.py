@@ -197,8 +197,8 @@ class OmniDiffusion:
         results = self.collective_rpc(
             method="sleep",
             timeout=None,
-            args=(level,),
-            kwargs={},
+            args=(),
+            kwargs={"level": level},
         )
         return all(results) if isinstance(results, list) else results
 
@@ -216,7 +216,7 @@ class OmniDiffusion:
         results = self.collective_rpc(
             method="wake_up",
             timeout=None,
-            args=(tags,),
-            kwargs={},
+            args=(),
+            kwargs={"tags": tags},
         )
         return all(results) if isinstance(results, list) else results

@@ -899,8 +899,8 @@ class Omni(OmniBase):
             result = stage.collective_rpc(
                 method="sleep",
                 timeout=None,
-                args=(level,),
-                kwargs={},
+                args=(),
+                kwargs={"level": level},
             )
             results.append(result)
         return results

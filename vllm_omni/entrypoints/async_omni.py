@@ -759,8 +759,8 @@ class AsyncOmni(OmniBase):
         await self.collective_rpc(
             method="sleep",
             timeout=None,
-            args=(level,),
-            kwargs={},
+            args=(),
+            kwargs={"level":level},
         )
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
