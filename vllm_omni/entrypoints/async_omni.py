@@ -167,6 +167,7 @@ class AsyncOmni(OmniBase):
                     "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enable_dummy_pipeline": kwargs.get("enable_dummy_pipeline", False),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+                    "worker_extension_cls": kwargs.get("worker_extension_cls", None),
                 },
                 "final_output": True,
                 "final_output_type": "image",
