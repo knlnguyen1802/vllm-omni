@@ -5,7 +5,7 @@
 Diffusion Worker for vLLM-Omni.
 
 Handles GPU infrastructure initialization and delegates model operations
-to GPUDiffusionModelRunner.
+to DiffusionModelRunner.
 """
 import gc
 import multiprocessing as mp
@@ -34,13 +34,14 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.gpu_diffusion_model_runner import GPUDiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.lora.request import LoRARequest
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 
-class GPUDiffusionWorker:
+class DiffusionWorker:
     """
     A worker that manages GPU infrastructure and delegates to the model runner.
 
@@ -50,7 +51,7 @@ class GPUDiffusionWorker:
     - Memory management (sleep/wake)
 
     All model-related operations (loading, compilation, execution) are
-    delegated to GPUDiffusionModelRunner.
+    delegated to DiffusionModelRunner.
     """
 
     def __init__(
@@ -64,7 +65,7 @@ class GPUDiffusionWorker:
         self.od_config = od_config
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
-        self.model_runner: GPUDiffusionModelRunner | None = None
+        self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
@@ -82,8 +83,8 @@ class GPUDiffusionWorker:
         os.environ["WORLD_SIZE"] = str(world_size)
 
         # Setup device
-        self.device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(self.device)
+        self.device = current_omni_platform.get_torch_device(rank)
+        current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration
         vllm_config = VllmConfig()
@@ -108,7 +109,7 @@ class GPUDiffusionWorker:
             )
 
         # Create model runner and load model
-        self.model_runner = GPUDiffusionModelRunner(
+        self.model_runner = DiffusionModelRunner(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
             device=self.device,
@@ -179,7 +180,7 @@ class GPUDiffusionWorker:
         """
         from vllm.device_allocator.cumem import CuMemAllocator
 
-        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+        free_bytes_before_sleep = current_omni_platform.get_free_memory()
 
         # Save the buffers before level 2 sleep
         if level == 2 and self.model_runner is not None:
@@ -188,7 +189,9 @@ class GPUDiffusionWorker:
 
         allocator = CuMemAllocator.get_instance()
         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
-        free_bytes_after_sleep, total = torch.cuda.mem_get_info()
+        free_bytes_after_sleep = current_omni_platform.get_free_memory()
+        device_id = self.device.index if self.device.index is not None else 0
+        total = current_omni_platform.get_device_total_memory(device_id)
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
@@ -292,8 +295,8 @@ class WorkerProc:
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls)
         self._running = True
 
-    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig, worker_extension_cls: str | None):
-        """Create a worker instance using WorkerWrapperBase with extension support."""
+    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig, worker_extension_cls: str|None) -> DiffusionWorker:
+        """Create a worker instance. Override in subclasses for different worker types."""
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
@@ -399,8 +402,10 @@ class WorkerProc:
         broadcast_handle,
         worker_extension_cls: str | None = None,
     ) -> None:
-        """Worker initialization and execution loops with extension support."""
+        """Worker initialization and execution loops."""
+        from vllm_omni.plugins import load_omni_general_plugins
 
+        load_omni_general_plugins()
         worker_proc = WorkerProc(
             od_config,
             gpu_id=rank,
@@ -420,15 +425,15 @@ class WorkerProc:
 
 class WorkerWrapperBase:
     """
-    Wrapper base class that creates GPUWorker with optional worker_extension_cls support.
-    This enables dynamic inheritance for GPUWorker to extend with custom functionality.
+    Wrapper base class that creates DiffusionWorker with optional worker_extension_cls support.
+    This enables dynamic inheritance for DiffusionWorker to extend with custom functionality.
     """
 
     def __init__(
         self,
         gpu_id: int,
         od_config: OmniDiffusionConfig,
-        base_worker_class: type = GPUWorker,
+        base_worker_class: type = DiffusionWorker,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ):
