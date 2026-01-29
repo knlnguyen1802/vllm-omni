@@ -19,6 +19,7 @@ from torch.profiler import record_function
 from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.selector import get_cache_backend
@@ -68,6 +69,8 @@ class DiffusionModelRunner:
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
+        load_format: str | None = None,
+        custom_pipeline_name: str | None = None,
     ) -> None:
         """
         Load the diffusion model, apply compilation and offloading.
@@ -76,6 +79,10 @@ class DiffusionModelRunner:
             memory_pool_context_fn: Optional function that returns a context manager
                 for memory pool allocation (used for sleep mode).
         """
+
+        if load_format == "dummy":
+            return
+        
         load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
 
         def get_memory_context():
@@ -91,10 +98,16 @@ class DiffusionModelRunner:
 
             with get_memory_context():
                 with DeviceMemoryProfiler() as m:
-                    self.pipeline = model_loader.load_model(
-                        od_config=self.od_config,
-                        load_device=load_device,
-                    )
+                    if load_format == "custom_pipeline":
+                        self.pipeline = resolve_obj_by_qualname(custom_pipeline_name)
+                        if hasattr(self.pipeline, "load_weights") and hasattr(self.pipeline, "weights_sources"):
+                            model_loader.load_weights(self.pipeline)
+                        self.pipeline = self.pipeline.eval()
+                    else:
+                        self.pipeline = model_loader.load_model(
+                            od_config=self.od_config,
+                            load_device=load_device,
+                        )
             time_after_load = time.perf_counter()
 
         logger.info(

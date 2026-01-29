@@ -19,7 +19,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.utils.mem_utils import GiB_bytes
 
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
@@ -69,6 +69,15 @@ class DiffusionWorker:
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
+        # Create model runner
+        self.model_runner = DiffusionModelRunner(
+            vllm_config=self.vllm_config,
+            od_config=self.od_config,
+            device=self.device,
+        )
+        self.load_model(load_format=self.od_config.diffusion_load_format)
+        self.init_lora_manager()
+        logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
@@ -81,7 +90,7 @@ class DiffusionWorker:
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
-
+    
         # Setup device
         self.device = current_omni_platform.get_torch_device(rank)
         current_omni_platform.set_device(self.device)
@@ -108,16 +117,17 @@ class DiffusionWorker:
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             )
 
-        # Create model runner and load model
-        self.model_runner = DiffusionModelRunner(
-            vllm_config=self.vllm_config,
-            od_config=self.od_config,
-            device=self.device,
-        )
+    def load_model(self , load_format: str|None = None) -> None:
+        """Load the diffusion model using DiffusionModelRunner."""
         self.model_runner.load_model(
             memory_pool_context_fn=self._maybe_get_memory_pool_context,
+            load_format= load_format,
         )
-        assert self.model_runner.pipeline is not None
+    
+    def init_lora_manager(self) -> None:
+        """Initialize the LoRA manager for this worker."""
+        if self.model_runner.pipeline is None:
+            return
         self.lora_manager = DiffusionLoRAManager(
             pipeline=self.model_runner.pipeline,
             device=self.device,
@@ -126,7 +136,6 @@ class DiffusionWorker:
             lora_path=self.od_config.lora_path,
             lora_scale=self.od_config.lora_scale,
         )
-        logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def generate(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Generate output for the given requests."""
@@ -252,14 +261,21 @@ class CustomPipelineWorkerExtension:
         Args:
             custom_pipeline_args: Dictionary of arguments for custom pipeline initialization
         """
-        custom_pipeline_cls = resolve_obj_by_qualname(custom_pipeline_args["pipeline_class"])
-        custom_pipeline = custom_pipeline_cls(custom_pipeline_args)
-        custom_pipeline.transformer = self.pipeline.transformer
-        if self.pipeline is not None:
-            del self.pipeline
+
+        # Clean up old pipeline
+        if self.model_runner.pipeline is not None:
+            del self.model_runner.pipeline
             gc.collect()
             torch.cuda.empty_cache()
-        self.pipeline = custom_pipeline
+        
+        # Get custom pipeline class name
+        custom_pipeline_name = custom_pipeline_args["pipeline_class"]
+        self.model_runner.load_model(
+            load_format="custom_pipeline",
+            custom_pipeline_name=custom_pipeline_name,
+        )
+        self.model_runner.init_lora_manager()
+
 
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
@@ -270,6 +286,7 @@ class WorkerProc:
         gpu_id: int,
         broadcast_handle,
         worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
     ):
         self.od_config = od_config
         self.gpu_id = gpu_id
@@ -292,15 +309,16 @@ class WorkerProc:
         assert od_config.master_port is not None
         
         # Create worker using WorkerWrapperBase for extension support
-        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls)
+        self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
 
-    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig, worker_extension_cls: str|None) -> DiffusionWorker:
+    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig, worker_extension_cls: str|None, custom_pipeline_args: dict[str, Any] | None = None) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
             worker_extension_cls=worker_extension_cls,
+            custom_pipeline_args=custom_pipeline_args,
         )
         return wrapper
 
@@ -401,6 +419,7 @@ class WorkerProc:
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
         worker_extension_cls: str | None = None,
+        custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
@@ -411,6 +430,7 @@ class WorkerProc:
             gpu_id=rank,
             broadcast_handle=broadcast_handle,
             worker_extension_cls=worker_extension_cls,
+            custom_pipeline_args=custom_pipeline_args,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
@@ -609,17 +629,10 @@ class WorkerWrapperBase:
             # 1. If method is defined in this class, it will be called directly
             # 2. Otherwise, since we define `__getattr__` and redirect attribute
             #    query to `self.worker`, the method will be called on the worker
-            if isinstance(method, str):
-                # Get the method by name from the wrapped worker
-                func = getattr(self.worker, method)
-                return func(*args, **kwargs)
-            elif isinstance(method, bytes):
-                # Deserialize and execute the callable
-                import cloudpickle
-                func = cloudpickle.loads(method)
-                return func(self.worker, *args, **kwargs)
-            else:
-                raise TypeError(f"Method must be str or bytes, got {type(method)}")
+            assert isinstance(method, str), "Method must be str"
+            func = getattr(self.worker, method)
+            return func(*args, **kwargs)
+
         except Exception as e:
             msg = (
                 f"Error executing method {method!r}. "
