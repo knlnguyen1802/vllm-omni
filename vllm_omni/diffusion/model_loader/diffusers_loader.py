@@ -21,8 +21,8 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_download_from_modelscope,
     safetensors_weights_iterator,
 )
-from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.registry import initialize_model
@@ -208,7 +208,13 @@ class DiffusersPipelineLoader:
             allow_patterns_overrides=None,
         )
 
-    def load_model(self, od_config: OmniDiffusionConfig, load_device: str, load_format: str = "default", custom_pipeline_name: str | None = None) -> nn.Module:
+    def load_model(
+        self,
+        od_config: OmniDiffusionConfig,
+        load_device: str,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> nn.Module:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):

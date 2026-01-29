@@ -7,10 +7,11 @@ Diffusion Worker for vLLM-Omni.
 Handles GPU infrastructure initialization and delegates model operations
 to DiffusionModelRunner.
 """
-from collections.abc import Iterable
+
 import gc
 import multiprocessing as mp
 import os
+from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -91,7 +92,7 @@ class DiffusionWorker:
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
-    
+
         # Setup device
         self.device = current_omni_platform.get_torch_device(rank)
         current_omni_platform.set_device(self.device)
@@ -118,13 +119,13 @@ class DiffusionWorker:
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             )
 
-    def load_model(self , load_format: str|None = None) -> None:
+    def load_model(self, load_format: str | None = None) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
         self.model_runner.load_model(
             memory_pool_context_fn=self._maybe_get_memory_pool_context,
-            load_format= load_format,
+            load_format=load_format,
         )
-    
+
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
         if self.model_runner.pipeline is None:
@@ -254,6 +255,7 @@ class DiffusionWorker:
         """Shutdown the worker and cleanup distributed environment."""
         destroy_distributed_env()
 
+
 class CustomPipelineWorkerExtension:
     def re_init_pipeline(self, custom_pipeline_args: dict[str, Any]) -> None:
         """
@@ -268,7 +270,7 @@ class CustomPipelineWorkerExtension:
             del self.model_runner.pipeline
             gc.collect()
             torch.cuda.empty_cache()
-        
+
         # Get custom pipeline class name
         custom_pipeline_name = custom_pipeline_args["pipeline_class"]
         self.model_runner.load_model(
@@ -309,12 +311,18 @@ class WorkerProc:
             logger.info(f"Worker {gpu_id} created result MessageQueue")
 
         assert od_config.master_port is not None
-        
+
         # Create worker using WorkerWrapperBase for extension support
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
 
-    def _create_worker(self, gpu_id: int, od_config: OmniDiffusionConfig, worker_extension_cls: str|None, custom_pipeline_args: dict[str, Any] | None = None) -> DiffusionWorker:
+    def _create_worker(
+        self,
+        gpu_id: int,
+        od_config: OmniDiffusionConfig,
+        worker_extension_cls: str | None,
+        custom_pipeline_args: dict[str, Any] | None = None,
+    ) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
@@ -461,7 +469,7 @@ class WorkerWrapperBase:
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
-        
+
         Args:
             gpu_id: GPU device ID
             od_config: OmniDiffusionConfig configuration
@@ -473,17 +481,17 @@ class WorkerWrapperBase:
         self.base_worker_class = base_worker_class
         self.worker_extension_cls = worker_extension_cls
         self.custom_pipeline_args = custom_pipeline_args
-        
+
         # Prepare worker class with extension support
         worker_class = self._prepare_worker_class()
-        
+
         # Create the actual worker instance
         self.worker = worker_class(
             local_rank=gpu_id,
             rank=gpu_id,
             od_config=od_config,
         )
-        
+
         # Re-initialize pipeline with custom pipeline if provided
         if self.custom_pipeline_args is not None:
             self.worker.re_init_pipeline(self.custom_pipeline_args)
@@ -492,12 +500,12 @@ class WorkerWrapperBase:
         """
         Prepare the worker class with optional extension.
         Dynamically extends GPUWorker with worker_extension_cls if provided.
-        
+
         Returns:
             The worker class (potentially extended)
         """
         worker_class = self.base_worker_class
-        
+
         # If custom_pipeline_args is provided, use CustomPipelineWorkerExtension
         if self.custom_pipeline_args is not None:
             # Set worker_extension_cls to CustomPipelineWorkerExtension if not already set
@@ -510,7 +518,7 @@ class WorkerWrapperBase:
             else:
                 worker_extension_cls = self.worker_extension_cls
             extended_calls = []
-            
+
             if worker_extension_cls not in worker_class.__bases__:
                 # Check for conflicts between worker and extension
                 for attr in dir(worker_extension_cls):
@@ -524,7 +532,7 @@ class WorkerWrapperBase:
                         )
                     if callable(getattr(worker_extension_cls, attr)):
                         extended_calls.append(attr)
-                
+
                 # Dynamically inherit the worker extension class
                 class_name = f"{worker_class.__name__}With{worker_extension_cls.__name__}"
                 worker_class = type(class_name, (worker_extension_cls, worker_class), {})
@@ -534,7 +542,7 @@ class WorkerWrapperBase:
                     worker_extension_cls,
                     extended_calls,
                 )
-        
+
         return worker_class
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
@@ -614,15 +622,15 @@ class WorkerWrapperBase:
     def execute_method(self, method: str | bytes, *args, **kwargs):
         """
         Execute a method on the worker.
-        
+
         Args:
             method: Method name (str) or serialized callable (bytes)
             *args: Positional arguments to pass to the method
             **kwargs: Keyword arguments to pass to the method
-            
+
         Returns:
             Result of the method execution
-            
+
         Raises:
             Exception: If method execution fails
         """
@@ -636,14 +644,10 @@ class WorkerWrapperBase:
             return func(*args, **kwargs)
 
         except Exception as e:
-            msg = (
-                f"Error executing method {method!r}. "
-                "This might cause issues in distributed execution."
-            )
+            msg = f"Error executing method {method!r}. This might cause issues in distributed execution."
             logger.exception(msg)
             raise e
 
     def __getattr__(self, attr: str):
         """Delegate attribute access to the wrapped worker."""
         return getattr(self.worker, attr)
-

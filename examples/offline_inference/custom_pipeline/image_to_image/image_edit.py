@@ -77,7 +77,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -362,7 +362,6 @@ async def main():
         custom_pipeline_args={
             "pipeline_class": "custom_pipeline.CustomPipeline",
         },
-
     )
 
     print("Pipeline loaded")

@@ -19,7 +19,6 @@ from torch.profiler import record_function
 from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
-from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.selector import get_cache_backend
@@ -82,7 +81,7 @@ class DiffusionModelRunner:
 
         if load_format == "dummy":
             return
-        
+
         load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
 
         def get_memory_context():
@@ -104,7 +103,7 @@ class DiffusionModelRunner:
                         load_format=load_format,
                         custom_pipeline_name=custom_pipeline_name,
                     )
-                        
+
             time_after_load = time.perf_counter()
 
         logger.info(

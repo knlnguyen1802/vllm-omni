@@ -282,16 +282,18 @@ class OmniDiffusionSamplingParams:
         Compute a hash based on key immutable fields only.
         Mutable or tensor fields are ignored to prevent hash instability.
         """
-        return hash((
-            self.num_inference_steps,
-            self.guidance_scale,
-            self.resolution,
-            self.seed,
-            self.layers,
-            self.profile,
-            self.debug,
-            self.num_outputs_per_prompt,
-        ))
+        return hash(
+            (
+                self.num_inference_steps,
+                self.guidance_scale,
+                self.resolution,
+                self.seed,
+                self.layers,
+                self.profile,
+                self.debug,
+                self.num_outputs_per_prompt,
+            )
+        )
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
