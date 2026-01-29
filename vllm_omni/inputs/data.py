@@ -277,5 +277,21 @@ class OmniDiffusionSamplingParams:
     def clone(self) -> "OmniDiffusionSamplingParams":
         return copy.deepcopy(self)
 
+    def __hash__(self):
+        """
+        Compute a hash based on key immutable fields only.
+        Mutable or tensor fields are ignored to prevent hash instability.
+        """
+        return hash((
+            self.num_inference_steps,
+            self.guidance_scale,
+            self.resolution,
+            self.seed,
+            self.layers,
+            self.profile,
+            self.debug,
+            self.num_outputs_per_prompt,
+        ))
+
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams

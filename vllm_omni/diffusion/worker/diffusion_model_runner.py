@@ -98,16 +98,13 @@ class DiffusionModelRunner:
 
             with get_memory_context():
                 with DeviceMemoryProfiler() as m:
-                    if load_format == "custom_pipeline":
-                        self.pipeline = resolve_obj_by_qualname(custom_pipeline_name)
-                        if hasattr(self.pipeline, "load_weights") and hasattr(self.pipeline, "weights_sources"):
-                            model_loader.load_weights(self.pipeline)
-                        self.pipeline = self.pipeline.eval()
-                    else:
-                        self.pipeline = model_loader.load_model(
-                            od_config=self.od_config,
-                            load_device=load_device,
-                        )
+                    self.pipeline = model_loader.load_model(
+                        od_config=self.od_config,
+                        load_device=load_device,
+                        load_format=load_format,
+                        custom_pipeline_name=custom_pipeline_name,
+                    )
+                        
             time_after_load = time.perf_counter()
 
         logger.info(

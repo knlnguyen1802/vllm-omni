@@ -7,6 +7,7 @@ Diffusion Worker for vLLM-Omni.
 Handles GPU infrastructure initialization and delegates model operations
 to DiffusionModelRunner.
 """
+from collections.abc import Iterable
 import gc
 import multiprocessing as mp
 import os
@@ -272,9 +273,10 @@ class CustomPipelineWorkerExtension:
         custom_pipeline_name = custom_pipeline_args["pipeline_class"]
         self.model_runner.load_model(
             load_format="custom_pipeline",
+            memory_pool_context_fn=self._maybe_get_memory_pool_context,
             custom_pipeline_name=custom_pipeline_name,
         )
-        self.model_runner.init_lora_manager()
+        self.init_lora_manager()
 
 
 class WorkerProc:
