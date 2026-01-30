@@ -102,6 +102,9 @@ class AsyncOmni(OmniBase):
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
 
+        # Sleep mode tracking
+        self._is_sleeping: bool = False
+
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
@@ -620,18 +623,32 @@ class AsyncOmni(OmniBase):
         pass
 
     async def sleep(self, level: int = 1) -> None:
+        self._is_sleeping = True
         self.collective_rpc(method="sleep", args=(level,))
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
+        self._is_sleeping = False
         self.collective_rpc(method="wake_up", args=(tags,))
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""
-        return False
+        return self._is_sleeping
 
-    async def add_lora(self, lora_request: LoRARequest) -> bool:
+    async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
-        return False
+        return self.collective_rpc(method="add_lora", args=(lora_request, lora_scale))[0]
+
+    async def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA adapter from the engine."""
+        return self.collective_rpc(method="remove_lora", args=(adapter_id,))[0]
+
+    async def list_loras(self) -> list[int]:
+        """List all LoRA adapters currently loaded in the engine."""
+        return self.collective_rpc(method="list_loras")[0]
+
+    async def pin_lora(self, adapter_id: int) -> bool:
+        """Pin a LoRA adapter in memory to avoid eviction."""
+        return self.collective_rpc(method="pin_lora", args=(adapter_id,))[0]
 
     async def encode(
         self,
