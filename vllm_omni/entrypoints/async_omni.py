@@ -530,16 +530,27 @@ class AsyncOmni(OmniBase):
 
         self.output_handler = asyncio.create_task(output_handler())
 
-    def collective_rpc(
+    async def collective_rpc(
         self,
         method: str | Callable[..., _R],
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
+        """Execute an RPC call on all stages asynchronously.
+        
+        Args:
+            method: Name of the method to execute or callable
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+            
+        Returns:
+            List of results from each stage
+        """
         results = []
         for stage in self.stage_list:
-            result = stage.collective_rpc(
+            result = await stage.collective_rpc(
                 method=method,
                 args=args,
                 timeout=timeout,
@@ -623,12 +634,14 @@ class AsyncOmni(OmniBase):
         pass
 
     async def sleep(self, level: int = 1) -> None:
+        """Put the engine into sleep mode asynchronously."""
         self._is_sleeping = True
-        self.collective_rpc(method="sleep", args=(level,))
+        await self.collective_rpc(method="sleep", args=(level,))
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
+        """Wake up the engine from sleep mode asynchronously."""
         self._is_sleeping = False
-        self.collective_rpc(method="wake_up", args=(tags,))
+        await self.collective_rpc(method="wake_up", args=(tags,))
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""
@@ -636,19 +649,23 @@ class AsyncOmni(OmniBase):
 
     async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
-        return self.collective_rpc(method="add_lora", args=(lora_request, lora_scale))[0]
+        results = await self.collective_rpc(method="add_lora", args=(lora_request, lora_scale))
+        return results[0]
 
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from the engine."""
-        return self.collective_rpc(method="remove_lora", args=(adapter_id,))[0]
+        results = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
+        return results[0]
 
     async def list_loras(self) -> list[int]:
         """List all LoRA adapters currently loaded in the engine."""
-        return self.collective_rpc(method="list_loras")[0]
+        results = await self.collective_rpc(method="list_loras")
+        return results[0]
 
     async def pin_lora(self, adapter_id: int) -> bool:
         """Pin a LoRA adapter in memory to avoid eviction."""
-        return self.collective_rpc(method="pin_lora", args=(adapter_id,))[0]
+        results = await self.collective_rpc(method="pin_lora", args=(adapter_id,))
+        return results[0]
 
     async def encode(
         self,

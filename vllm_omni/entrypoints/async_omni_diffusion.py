@@ -235,27 +235,45 @@ class AsyncOmniDiffusion:
         result = await self.generate(prompt=prompt, request_id=request_id, **kwargs)
         yield result
 
-    def collective_rpc(
+    async def collective_rpc(
         self,
         method: str | Callable,
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict | None = None,
     ) -> Any:
-        return self.engine.collective_rpc(
+        """Execute RPC call on engine workers asynchronously.
+        
+        Args:
+            method: Method name or callable to execute
+            timeout: Optional timeout in seconds
+            args: Positional arguments
+            kwargs: Keyword arguments
+            
+        Returns:
+            Result from the RPC call
+        """
+        # Get the event loop
+        loop = asyncio.get_event_loop()
+        
+        # Run in executor to avoid blocking
+        result = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
             method,
-            timeout=timeout,
-            args=args,
-            kwargs=kwargs,
+            timeout,
+            args,
+            kwargs or {},
         )
+        return result
 
     async def sleep(self, level: int = 1) -> None:
-        """Put the engine into sleep mode."""
-        self.collective_rpc(method="sleep", args=(level,))
+        """Put the engine into sleep mode asynchronously."""
+        await self.collective_rpc(method="sleep", args=(level,))
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
-        """Wake up the engine from sleep mode."""
-        self.collective_rpc(method="wake_up", args=(tags,))
+        """Wake up the engine from sleep mode asynchronously."""
+        await self.collective_rpc(method="wake_up", args=(tags,))
 
     def close(self) -> None:
         """Close the engine and release resources.
@@ -304,44 +322,32 @@ class AsyncOmniDiffusion:
         return self._closed
 
     async def remove_lora(self, adapter_id: int) -> bool:
-        """Remove a LoRA"""
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            self._executor,
-            self.engine.collective_rpc,
+        """Remove a LoRA adapter asynchronously."""
+        results = await self.collective_rpc(
             "remove_lora",
             None,
             (adapter_id,),
             {},
-            None,
         )
         return all(results) if isinstance(results, list) else results
 
     async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
-        """Add a LoRA adapter"""
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            self._executor,
-            self.engine.collective_rpc,
+        """Add a LoRA adapter asynchronously."""
+        results = await self.collective_rpc(
             "add_lora",
             None,
             (),
             {"lora_request": lora_request, "lora_scale": lora_scale},
-            None,
         )
         return all(results) if isinstance(results, list) else results
 
     async def list_loras(self) -> list[int]:
-        """List all registered LoRA adapter IDs."""
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            self._executor,
-            self.engine.collective_rpc,
+        """List all registered LoRA adapter IDs asynchronously."""
+        results = await self.collective_rpc(
             "list_loras",
             None,
             (),
             {},
-            None,
         )
         # collective_rpc returns list from workers; flatten unique ids
         if not isinstance(results, list):
@@ -352,15 +358,11 @@ class AsyncOmniDiffusion:
         return sorted(merged)
 
     async def pin_lora(self, lora_id: int) -> bool:
-        """Prevent an adapter from being evicted."""
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            self._executor,
-            self.engine.collective_rpc,
+        """Prevent an adapter from being evicted asynchronously."""
+        results = await self.collective_rpc(
             "pin_lora",
             None,
             (),
             {"adapter_id": lora_id},
-            None,
         )
         return all(results) if isinstance(results, list) else results

@@ -426,14 +426,14 @@ class OmniStage:
                 stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )
 
-    def collective_rpc(
+    async def collective_rpc(
         self,
         method: str | Callable[..., _R],
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        """Execute an RPC call on all workers via the stage engine.
+        """Execute an RPC call on all workers via the stage engine (async).
 
         Args:
             method: Name of the worker method to execute, or a callable that
@@ -482,7 +482,7 @@ class OmniStage:
                             raise RuntimeError(f"collective_rpc failed: {result['error']}")
                         return result["result"]
 
-            time.sleep(0.001)  # Small sleep to avoid busy waiting
+            await asyncio.sleep(0.001)  # Async sleep to avoid blocking event loop
 
 
 def _stage_worker(
