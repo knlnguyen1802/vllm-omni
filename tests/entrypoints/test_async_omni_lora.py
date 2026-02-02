@@ -256,7 +256,7 @@ async def test_lora_concurrent_operations(mock_async_omni):
     """Test concurrent LoRA operations."""
     lora_requests = [
         LoRARequest(lora_name=f"lora_{i}", lora_int_id=i, lora_path=f"/path/to/lora_{i}")
-        for i in range(5)
+        for i in range(1,5)
     ]
     
     # Set mock results

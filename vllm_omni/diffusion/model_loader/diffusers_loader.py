@@ -207,7 +207,7 @@ class DiffusersPipelineLoader:
             allow_patterns_overrides=None,
         )
 
-    def load_model(self, od_config: OmniDiffusionConfig, load_device: str) -> nn.Module:
+    def load_model(self, od_config: OmniDiffusionConfig, load_device: str, enable_dummy_pipeline: bool = False, custom_pipeline_args: dict[str, Any]| None = None) -> nn.Module:
         """Load a model with the given configurations."""
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):

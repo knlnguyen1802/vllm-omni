@@ -55,9 +55,14 @@ class GPUWorker:
         self.device = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
-        self.init_device_and_model()
+        self.init_device()
+        self.load_model()
+        if not self.od_config.enable_dummy_pipeline:
+            self.init_lora_manager()
+            self.apply_cpu_offload()
+            self.init_cache_backend()
 
-    def init_device_and_model(self) -> None:
+    def init_device(self) -> None:
         """Initialize the device and load the model."""
         world_size = self.od_config.num_gpus
         rank = self.rank
@@ -75,7 +80,7 @@ class GPUWorker:
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         self.vllm_config = vllm_config
-        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+        
 
         with set_forward_context(vllm_config=vllm_config, omni_diffusion_config=self.od_config):
             init_distributed_environment(world_size=world_size, rank=rank)
@@ -90,70 +95,59 @@ class GPUWorker:
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             )
+    def load_model(self) -> None:
+        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+        load_config = LoadConfig()
+        model_loader = DiffusersPipelineLoader(load_config)
 
-            load_config = LoadConfig()
-            model_loader = DiffusersPipelineLoader(load_config)
-            if self.od_config.enable_dummy_pipeline:
-                self.pipeline = None
-            else:
-                time_before_load = time.perf_counter()
-                with self._maybe_get_memory_pool_context(tag="weights"):
-                    with DeviceMemoryProfiler() as m:
-                        self.pipeline = model_loader.load_model(
-                            od_config=self.od_config,
-                            load_device=load_device,
-                        )
-                time_after_load = time.perf_counter()
-
-                logger.info(
-                    "Model loading took %.4f GiB and %.6f seconds",
-                    m.consumed_memory / GiB_bytes,
-                    time_after_load - time_before_load,
+        time_before_load = time.perf_counter()
+        with self._maybe_get_memory_pool_context(tag="weights"):
+            with DeviceMemoryProfiler() as m:
+                self.pipeline = model_loader.load_model(
+                    od_config=self.od_config,
+                    load_device=load_device,
+                    enable_dummy_pipeline=self.od_config.enable_dummy_pipeline,
                 )
+        time_after_load = time.perf_counter()
 
-        if self.od_config.enable_dummy_pipeline:
-            self.lora_manager = None
-        else:
-            self.lora_manager = DiffusionLoRAManager(
-                pipeline=self.pipeline,
-                device=self.device,
-                dtype=self.od_config.dtype,
-                max_cached_adapters=self.od_config.max_cpu_loras,
-                lora_path=self.od_config.lora_path,
-                lora_scale=self.od_config.lora_scale,
-            )
+        logger.info(
+            "Model loading took %.4f GiB and %.6f seconds",
+            m.consumed_memory / GiB_bytes,
+            time_after_load - time_before_load,
+        )
+    def init_lora_manager(self) -> None:
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipeline,
+            device=self.device,
+            dtype=self.od_config.dtype,
+            max_cached_adapters=self.od_config.max_cpu_loras,
+            lora_path=self.od_config.lora_path,
+            lora_scale=self.od_config.lora_scale,
+        )
         logger.info(f"Worker {self.rank}: Model loaded successfully.")
 
-        # Apply CPU offloading (DiT <-> encoders mutual exclusion)
-        if self.od_config.enable_cpu_offload:
-            for name in ["vae"]:
-                module = getattr(self.pipeline, name, None)
-                if module is None:
-                    continue
-                try:
-                    module.to(self.device, non_blocking=True)
-                except Exception as exc:
-                    logger.debug("Failed to move %s to GPU: %s", name, exc)
-
+    def apply_cpu_offload(self) -> None:
+        # Apply CPU offloading
+        logger.info(f"Enable cpu offload is {self.od_config.enable_cpu_offload} and enable layerwise offload is {self.od_config.enable_layerwise_offload}")
+        if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
             apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
 
         if not self.od_config.enforce_eager:
             try:
-                if not self.od_config.enable_dummy_pipeline:
-                    self.pipeline.transformer = regionally_compile(
-                        self.pipeline.transformer,
-                        dynamic=True,
-                    )
+                self.pipeline.transformer = regionally_compile(
+                    self.pipeline.transformer,
+                    dynamic=True,
+                )
                 logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
             except Exception as e:
                 logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
 
+    def init_cache_backend(self) -> None:
         # Setup cache backend based on type (both backends use enable()/reset() interface)
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
-        if not self.od_config.enable_dummy_pipeline:
-            if self.cache_backend is not None:
-                self.cache_backend.enable(self.pipeline)
+        if self.cache_backend is not None:
+            self.cache_backend.enable(self.pipeline)
 
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """
@@ -307,7 +301,7 @@ class GPUWorker:
 
 
 class CustomPipelineWorkerExtension:
-    def re_init_pipeline(self, custom_pipeline_args: dict[str, Any], od_config: OmniDiffusionConfig) -> None:
+    def re_init_pipeline(self, custom_pipeline_args, od_config: OmniDiffusionConfig) -> None:
         """
         Re-initialize the pipeline with custom arguments using the same loading pattern as init_device_and_model.
 
@@ -322,10 +316,14 @@ class CustomPipelineWorkerExtension:
         gc.collect()
         torch.cuda.empty_cache()
 
+        rank = self.rank
+        self.device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(self.device)
         # Get custom pipeline class
         custom_pipeline_cls = resolve_obj_by_qualname(custom_pipeline_args["pipeline_class"])
 
         # Use EXACT same pattern as init_device_and_model for loading
+
         load_device = "cpu" if od_config.enable_cpu_offload else str(self.device)
         target_device = torch.device(load_device)
 
@@ -355,18 +353,11 @@ class CustomPipelineWorkerExtension:
             time_after_load - time_before_load,
         )
 
-        # Apply CPU offloading if enabled (same as init_device_and_model)
-        if od_config.enable_cpu_offload:
-            for name in ["vae"]:
-                module = getattr(custom_pipeline, name, None)
-                if module is None:
-                    continue
-                try:
-                    module.to(self.device, non_blocking=True)
-                except Exception as exc:
-                    logger.debug("Failed to move %s to GPU: %s", name, exc)
-
-            apply_offload_hooks(custom_pipeline, od_config, device=self.device)
+        # Apply CPU offloading
+        # if not self.od_config.enable_dummy_pipeline:
+        #     logger.info(f"Enable cpu offload is {self.od_config.enable_cpu_offload} and enable layerwise offload is {self.od_config.enable_layerwise_offload}")
+        #     if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
+        #         apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
 
         self.pipeline = custom_pipeline
 

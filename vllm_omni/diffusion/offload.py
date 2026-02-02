@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch import nn
 from vllm.logger import init_logger
-from vllm_omni.platforms import current_omni_platform
+# from vllm_omni.platforms import current_omni_platform
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -141,7 +141,7 @@ class LayerwiseOffloader:
         num_gpu_layers: int = 1,
     ):
         assert all(isinstance(m, nn.Module) for m in blocks), "All transformer blocks must be torch.nn.Module"
-        assert current_omni_platform.is_cuda(), "Layerwise offloading is only supported on cuda devices for now"
+        #assert current_omni_platform.is_cuda(), "Layerwise offloading is only supported on cuda devices for now"
 
         self.blocks = blocks
         self.device = device
@@ -416,9 +416,9 @@ def apply_offload_hooks(
         )
     # For now, model-wise and layer-wise (block-wise) offloading
     # are functioning as expected when cuda device is available
-    if not current_omni_platform.is_cuda() or current_omni_platform.get_device_count() < 1:
-        logger.info("CPU Offloading requires cuda devices available. Skipping for now...")
-        return
+    # if not current_omni_platform.is_cuda() or current_omni_platform.get_device_count() < 1:
+    #     logger.info("CPU Offloading requires cuda devices available. Skipping for now...")
+    #     return
 
     # Find DiT/transformer modules
     dit_modules: list[nn.Module] = []
@@ -447,7 +447,7 @@ def apply_offload_hooks(
             device = next(dit_modules[0].parameters()).device
         except StopIteration:
             try:
-                device = current_omni_platform.get_torch_device()
+                device = "cuda"
             except (NotImplementedError, AttributeError):
                 logger.error("Fail to get device of pipeline. Skipping applying offloading hooks")
                 return

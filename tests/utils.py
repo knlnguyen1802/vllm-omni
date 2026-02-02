@@ -3,6 +3,7 @@
 
 import os
 import time
+import threading
 from contextlib import contextmanager
 
 from vllm.platforms import current_platform
@@ -105,3 +106,43 @@ def wait_for_gpu_memory_to_clear(
             raise ValueError(f"Memory of devices {devices=} not free after {dur_s=:.02f} ({threshold=})")
 
         time.sleep(5)
+
+class GPUMemoryMonitor:
+    """Poll global device memory usage via CUDA APIs."""
+
+    def __init__(self, device_index: int, interval: float = 0.05):
+        self.device_index = device_index
+        self.interval = interval
+        self._peak_used_mb = 0.0
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        def monitor_loop() -> None:
+            while not self._stop_event.is_set():
+                try:
+                    with torch.cuda.device(self.device_index):
+                        free_bytes, total_bytes = torch.cuda.mem_get_info()
+                    used_mb = (total_bytes - free_bytes) / (1024**2)
+                    self._peak_used_mb = max(self._peak_used_mb, used_mb)
+                except Exception:
+                    pass
+                time.sleep(self.interval)
+
+        self._thread = threading.Thread(target=monitor_loop, daemon=False)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+
+    @property
+    def peak_used_mb(self) -> float:
+        fallback_alloc = torch.cuda.max_memory_allocated(device=self.device_index) / (1024**2)
+        fallback_reserved = torch.cuda.max_memory_reserved(device=self.device_index) / (1024**2)
+        return max(self._peak_used_mb, fallback_alloc, fallback_reserved)
+
+    def __del__(self):
+        self.stop()
