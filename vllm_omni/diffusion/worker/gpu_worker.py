@@ -56,7 +56,9 @@ class GPUWorker:
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
-        self.load_model()
+        self.load_model(
+            enable_dummy_pipeline=self.od_config.enable_dummy_pipeline
+        )
         if not self.od_config.enable_dummy_pipeline:
             self.init_lora_manager()
             self.apply_cpu_offload()
@@ -95,7 +97,7 @@ class GPUWorker:
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
             )
-    def load_model(self) -> None:
+    def load_model(self, enable_dummy_pipeline: bool = False, custom_pipeline_args: dict[str, Any]| None = None) -> None:
         load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
         load_config = LoadConfig()
         model_loader = DiffusersPipelineLoader(load_config)
@@ -106,7 +108,8 @@ class GPUWorker:
                 self.pipeline = model_loader.load_model(
                     od_config=self.od_config,
                     load_device=load_device,
-                    enable_dummy_pipeline=self.od_config.enable_dummy_pipeline,
+                    enable_dummy_pipeline=enable_dummy_pipeline,
+                    custom_pipeline_args=custom_pipeline_args,
                 )
         time_after_load = time.perf_counter()
 
@@ -316,75 +319,15 @@ class CustomPipelineWorkerExtension:
         gc.collect()
         torch.cuda.empty_cache()
 
-        rank = self.rank
-        self.device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(self.device)
-        # Get custom pipeline class
-        custom_pipeline_cls = resolve_obj_by_qualname(custom_pipeline_args["pipeline_class"])
-
-        # Use EXACT same pattern as init_device_and_model for loading
-
-        load_device = "cpu" if od_config.enable_cpu_offload else str(self.device)
-        target_device = torch.device(load_device)
-
-        load_config = LoadConfig()
-        model_loader = DiffusersPipelineLoader(load_config)
-        time_before_load = time.perf_counter()
-
-        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
-            with self._maybe_get_memory_pool_context(tag="weights"):
-                with DeviceMemoryProfiler() as m:
-                    # Replicate model_loader.load_model() pattern but for custom pipeline
-                    with set_default_torch_dtype(od_config.dtype):
-                        with target_device:
-                            custom_pipeline = custom_pipeline_cls(od_config=od_config)
-
-                    # Load weights using model_loader (same as original)
-                    if hasattr(custom_pipeline, "load_weights") and hasattr(custom_pipeline, "weights_sources"):
-                        model_loader.load_weights(custom_pipeline)
-
-                    custom_pipeline = custom_pipeline.eval()
-
-            time_after_load = time.perf_counter()
-
-        logger.info(
-            "Custom pipeline loading took %.4f GiB and %.6f seconds",
-            m.consumed_memory / GiB_bytes,
-            time_after_load - time_before_load,
+        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+        self.load_model(
+            enable_dummy_pipeline=False,
+            custom_pipeline_args=custom_pipeline_args,
         )
 
-        # Apply CPU offloading
-        # if not self.od_config.enable_dummy_pipeline:
-        #     logger.info(f"Enable cpu offload is {self.od_config.enable_cpu_offload} and enable layerwise offload is {self.od_config.enable_layerwise_offload}")
-        #     if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload:
-        #         apply_offload_hooks(self.pipeline, self.od_config, device=self.device)
-
-        self.pipeline = custom_pipeline
-
-        if not self.od_config.enforce_eager:
-            try:
-                self.pipeline.transformer = regionally_compile(
-                    self.pipeline.transformer,
-                    dynamic=True,
-                )
-                logger.info(f"Worker {self.rank}: Model compiled with torch.compile.")
-            except Exception as e:
-                logger.warning(f"Worker {self.rank}: torch.compile failed with error: {e}. Using eager mode.")
-
-        # Setup cache backend based on type (both backends use enable()/reset() interface)
-        self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
-
-        if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
-        
-        self.lora_manager = DiffusionLoRAManager(
-            pipeline=self.pipeline,
-            device=self.device,
-            dtype=self.od_config.dtype,
-            max_cached_adapters=self.od_config.max_cpu_loras,
-            lora_path=self.od_config.lora_path,
-            lora_scale=self.od_config.lora_scale,
-        )
+        self.init_lora_manager()
+        self.apply_cpu_offload()
+        self.init_cache_backend()
 
 
 class WorkerProc:

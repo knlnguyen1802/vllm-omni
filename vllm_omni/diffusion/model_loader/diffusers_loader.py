@@ -7,6 +7,7 @@ import time
 from collections.abc import Generator, Iterable
 from pathlib import Path
 from typing import cast
+from typing import Any
 
 import torch
 from torch import nn
@@ -25,6 +26,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.registry import initialize_model
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 logger = init_logger(__name__)
 
@@ -212,7 +214,12 @@ class DiffusersPipelineLoader:
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
             with target_device:
-                model = initialize_model(od_config)
+                if enable_dummy_pipeline:
+                    model = None
+                    return model
+                else:
+                    custom_pipeline_cls = resolve_obj_by_qualname(custom_pipeline_args["pipeline_class"])
+                    model = custom_pipeline_cls(od_config=od_config)
 
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
