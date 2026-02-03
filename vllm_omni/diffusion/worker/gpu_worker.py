@@ -289,7 +289,7 @@ class GPUWorker:
         return True
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
-        if self.od_config.enable_sleep_mode:
+        if self.od_config.enable_sleep_mode and not self.od_config.enable_dummy_pipeline:
             from vllm.device_allocator.cumem import CuMemAllocator
 
             allocator = CuMemAllocator.get_instance()
