@@ -533,23 +533,40 @@ class AsyncOmni(OmniBase):
 
         self.output_handler = asyncio.create_task(output_handler())
 
-    def collective_rpc(
+    async def collective_rpc(
         self,
         method: str | Callable[..., _R],
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
-        results = []
-        for stage in self.stage_list:
-            result = stage.collective_rpc(
-                method=method,
-                args=args,
-                timeout=timeout,
-                kwargs=kwargs,
+        """Execute an RPC call on all stages asynchronously.
+        
+        Args:
+            method: Name of the method to execute or callable
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+            
+        Returns:
+            List of results from each stage
+        """
+        # Run synchronous collective_rpc in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        
+        async def run_stage_rpc(stage: OmniStage) -> _R:
+            return await loop.run_in_executor(
+                None,
+                stage.collective_rpc,
+                method,
+                timeout,
+                args,
+                kwargs,
             )
-            results.append(result)
-        return results
+        
+        # Run all stages concurrently
+        results = await asyncio.gather(*[run_stage_rpc(stage) for stage in self.stage_list])
+        return list(results)
 
     @property
     def is_running(self) -> bool:
@@ -627,11 +644,11 @@ class AsyncOmni(OmniBase):
 
     async def sleep(self, level: int = 1) -> None:
         self._is_sleeping = True
-        self.collective_rpc(method="sleep", args=(level,))
+        await self.collective_rpc(method="sleep", args=(level,))
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
         self._is_sleeping = False
-        self.collective_rpc(method="wake_up", args=(tags,))
+        await self.collective_rpc(method="wake_up", args=(tags,))
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""
@@ -639,19 +656,19 @@ class AsyncOmni(OmniBase):
 
     async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
-        return self.collective_rpc(method="add_lora", args=(lora_request, lora_scale))[0]
+        return await self.collective_rpc(method="add_lora", args=(lora_request, lora_scale))[0]
 
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from the engine."""
-        return self.collective_rpc(method="remove_lora", args=(adapter_id,))[0]
+        return await self.collective_rpc(method="remove_lora", args=(adapter_id,))[0]
 
     async def list_loras(self) -> list[int]:
         """List all LoRA adapters currently loaded in the engine."""
-        return self.collective_rpc(method="list_loras")[0]
+        return await self.collective_rpc(method="list_loras")[0]
 
     async def pin_lora(self, adapter_id: int) -> bool:
         """Pin a LoRA adapter in memory to avoid eviction."""
-        return self.collective_rpc(method="pin_lora", args=(adapter_id,))[0]
+        return await self.collective_rpc(method="pin_lora", args=(adapter_id,))[0]
 
     async def encode(
         self,
