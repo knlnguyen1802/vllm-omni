@@ -478,11 +478,14 @@ class OmniStage:
             if timeout is not None and (time.time() - start_time) > timeout:
                 raise TimeoutError(f"collective_rpc timed out after {timeout} seconds")
 
-            # Use external RPC result checker if available (to avoid race condition with output_handler)
-            # Otherwise fall back to direct try_collect()
+            # First check if result was already collected by output_handler (stored in shared dict)
+            # If not found, try to collect directly from queue
+            result = None
             if self._rpc_result_checker is not None:
                 result = self._rpc_result_checker(rpc_id)
-            else:
+            
+            # If not in shared dict, try collecting from queue directly
+            if result is None:
                 result = self.try_collect()
                 
             if result is not None:
