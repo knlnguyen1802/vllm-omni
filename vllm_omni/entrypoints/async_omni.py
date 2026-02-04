@@ -756,3 +756,26 @@ class AsyncOmni(OmniBase):
 
         async with self._pause_cond:
             return self._paused
+
+    async def wait_for_all_requests(self, poll_interval: float = 0.1) -> None:
+        """Wait for all in-flight requests to finish.
+
+        This method blocks until all requests currently tracked in
+        `self.request_states` have completed. It polls the request states
+        dictionary at regular intervals to check if all requests are done.
+
+        Args:
+            poll_interval: Time in seconds to wait between checks.
+                Default is 0.1 seconds.
+
+        Example:
+            >>> async_omni = AsyncOmni(model="...")
+            >>> # Start some requests
+            >>> async for output in async_omni.generate(...):
+            ...     pass
+            >>> # Wait for all requests to complete
+            >>> await async_omni.wait_for_all_requests()
+        """
+        while self.request_states:
+            await asyncio.sleep(poll_interval)
+        logger.info(f"[{self._name}] All requests have finished.")
