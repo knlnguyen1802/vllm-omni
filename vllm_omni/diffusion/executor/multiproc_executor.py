@@ -102,11 +102,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             scheduler_pipe_writers.append(writer)
             
             # Create request pipe (scheduler -> worker)
-            sched_req_conn, worker_req_conn = mp.Pipe(duplex=False)
+            # First conn is receiver (read), second is sender (write)
+            worker_req_conn, sched_req_conn = mp.Pipe(duplex=False)
             scheduler_request_pipes.append(sched_req_conn)
             worker_request_pipes.append(worker_req_conn)
             
             # Create result pipe (worker -> scheduler)
+            # First conn is receiver (read), second is sender (write)
             sched_res_conn, worker_res_conn = mp.Pipe(duplex=False)
             scheduler_result_pipes.append(sched_res_conn)
             worker_result_pipes.append(worker_res_conn)
