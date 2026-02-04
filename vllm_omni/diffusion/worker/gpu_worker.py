@@ -449,8 +449,13 @@ class WorkerProc:
         """
         Receive messages (RPC requests, shutdown) from request pipe.
         Blocks until a message arrives.
+        Returns None if pipe is closed (EOFError).
         """
-        return self.request_pipe.recv()
+        try:
+            return self.request_pipe.recv()
+        except EOFError:
+            # Pipe closed, scheduler has shutdown
+            return None
 
     def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
@@ -492,7 +497,12 @@ class WorkerProc:
                     exc_info=True,
                 )
                 continue
-            if msg is None or len(msg) == 0:
+            if msg is None:
+                # Pipe closed or empty message - shutdown gracefully
+                logger.info("Worker %s: Pipe closed, shutting down", self.gpu_id)
+                self._running = False
+                break
+            if len(msg) == 0:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 
