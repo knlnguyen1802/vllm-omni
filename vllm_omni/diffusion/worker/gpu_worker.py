@@ -462,7 +462,7 @@ class WorkerProc:
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
-        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
+        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_pipe is not None
 
         if not should_execute:
             return None, False
@@ -505,7 +505,7 @@ class WorkerProc:
                         self.return_result(result)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
-                    if self.result_mq is not None:
+                    if self.result_pipe is not None and self.gpu_id == 0:
                         self.return_result({"status": "error", "error": str(e)})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
