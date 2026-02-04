@@ -128,6 +128,10 @@ class OmniStage:
         self.is_comprehension = getattr(stage_config, "is_comprehension", False)
         # Support for different stage types: "llm" (default) or "diffusion"
         self.stage_type = getattr(stage_config, "stage_type", "llm")
+        
+        # External RPC result checker function to avoid race condition with output_handler
+        # If set, collective_rpc will use this instead of try_collect()
+        self._rpc_result_checker: Callable[[str], dict[str, Any] | None] | None = None
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -474,7 +478,13 @@ class OmniStage:
             if timeout is not None and (time.time() - start_time) > timeout:
                 raise TimeoutError(f"collective_rpc timed out after {timeout} seconds")
 
-            result = self.try_collect()
+            # Use external RPC result checker if available (to avoid race condition with output_handler)
+            # Otherwise fall back to direct try_collect()
+            if self._rpc_result_checker is not None:
+                result = self._rpc_result_checker(rpc_id)
+            else:
+                result = self.try_collect()
+                
             if result is not None:
                 if result.get("type") == "collective_rpc_result":
                     if result.get("rpc_id") == rpc_id:
