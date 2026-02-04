@@ -108,6 +108,10 @@ class AsyncOmni(OmniBase):
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
+        
+        # RPC results storage: {stage_id: {rpc_id: result}}
+        # Used to avoid race condition between output_handler and collective_rpc
+        self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
 
         super().__init__(*args, **kwargs)
 
@@ -229,6 +233,19 @@ class AsyncOmni(OmniBase):
             self.input_processor = None
             self.io_processor = None
             self.model_config = None
+        
+        # Set up RPC result checkers for all stages to avoid race condition
+        # between output_handler and collective_rpc
+        for stage in self.stage_list:
+            stage_id = stage.stage_id
+            # Create a closure that captures stage_id
+            def make_rpc_checker(sid: int):
+                def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
+                    if sid in self._rpc_results and rpc_id in self._rpc_results[sid]:
+                        return self._rpc_results[sid].pop(rpc_id)
+                    return None
+                return rpc_checker
+            stage._rpc_result_checker = make_rpc_checker(stage_id)
 
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC.
@@ -507,6 +524,15 @@ class AsyncOmni(OmniBase):
                             # Only happens when stage is initialized slower than expected,
                             # so we wait for a short time and try again
                             await asyncio.sleep(0.05)
+                            continue
+                        # Handle collective_rpc results separately to avoid race condition
+                        # Store them in shared dictionary for collective_rpc to retrieve
+                        if result.get("type") == "collective_rpc_result":
+                            rpc_id = result.get("rpc_id")
+                            if rpc_id:
+                                if stage_id not in self._rpc_results:
+                                    self._rpc_results[stage_id] = {}
+                                self._rpc_results[stage_id][rpc_id] = result
                             continue
                         req_id = result.get("request_id")
                         req_state = request_states.get(req_id)
