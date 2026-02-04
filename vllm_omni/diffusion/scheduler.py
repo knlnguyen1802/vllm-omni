@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import zmq
-from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+import multiprocessing as mp
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -14,32 +13,37 @@ logger = init_logger(__name__)
 class Scheduler:
     def initialize(self, od_config: OmniDiffusionConfig):
         existing_context = getattr(self, "context", None)
-        if existing_context is not None and not existing_context.closed:
+        if existing_context is not None:
             logger.warning("SyncSchedulerClient is already initialized. Re-initializing.")
             self.close()
 
         self.num_workers = od_config.num_gpus
         self.od_config = od_config
-        self.context = zmq.Context()  # Standard synchronous context
 
-        # Initialize single MessageQueue for all message types (generation & RPC)
-        # Assuming all readers are local for now as per current launch_engine implementation
-        self.mq = MessageQueue(
-            n_reader=self.num_workers,
-            n_local_reader=self.num_workers,
-            local_reader_ranks=list(range(self.num_workers)),
-        )
+        # Initialize pipes for worker communication
+        # request_pipes: scheduler sends requests to workers
+        # result_pipes: scheduler receives results from workers
+        self.request_pipes = []  # List of Connection objects to send to workers
+        self.result_pipes = []   # List of Connection objects to receive from workers
 
-        self.result_mq = None
+    def initialize_pipes(self, request_pipes, result_pipes):
+        """Initialize Pipe connections for communicating with workers.
+        
+        Args:
+            request_pipes: List of Connection objects for sending requests to workers
+            result_pipes: List of Connection objects for receiving results from workers
+        """
+        self.request_pipes = request_pipes
+        self.result_pipes = result_pipes
+        logger.info("Scheduler initialized Pipe connections")
 
-    def initialize_result_queue(self, handle):
-        # Initialize MessageQueue for receiving results
-        # We act as rank 0 reader for this queue
-        self.result_mq = MessageQueue.create_from_handle(handle, rank=0)
-        logger.info("SyncScheduler initialized result MessageQueue")
-
-    def get_broadcast_handle(self):
-        return self.mq.export_handle()
+    def get_pipe_endpoints(self):
+        """Return pipe endpoints for workers.
+        
+        Returns:
+            Tuple of (request_pipes, result_pipes) for workers to use
+        """
+        return self.request_pipes, self.result_pipes
 
     def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
         """Sends a request to the scheduler and waits for the response."""
@@ -53,22 +57,33 @@ class Scheduler:
                 "output_rank": 0,
                 "exec_all_ranks": True,
             }
-            # Broadcast RPC request to all workers
-            self.mq.enqueue(rpc_request)
-            # Wait for result from Rank 0 (or whoever sends it)
-            if self.result_mq is None:
-                raise RuntimeError("Result queue not initialized")
+            # Send RPC request to all workers via their request pipes
+            for pipe in self.request_pipes:
+                pipe.send(rpc_request)
+            
+            # Wait for result from Rank 0 via result pipe
+            if not self.result_pipes:
+                raise RuntimeError("Result pipes not initialized")
 
-            output = self.result_mq.dequeue()
+            output = self.result_pipes[0].recv()
             return output
-        except zmq.error.Again:
-            logger.error("Timeout waiting for response from scheduler.")
-            raise TimeoutError("Scheduler did not respond in time.")
+        except Exception as e:
+            logger.error(f"Error communicating with workers: {e}")
+            raise
 
     def close(self):
-        """Closes the socket and terminates the context."""
-        if hasattr(self, "context"):
-            self.context.term()
-        self.context = None
-        self.mq = None
-        self.result_mq = None
+        """Closes the pipe connections."""
+        if hasattr(self, "request_pipes"):
+            for pipe in self.request_pipes:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        if hasattr(self, "result_pipes"):
+            for pipe in self.result_pipes:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        self.request_pipes = []
+        self.result_pipes = []

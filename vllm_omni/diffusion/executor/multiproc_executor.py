@@ -28,8 +28,12 @@ class BackgroundResources:
         """Clean up background resources."""
         if self.scheduler is not None:
             try:
-                for _ in range(self.scheduler.num_workers):
-                    self.scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
+                # Send shutdown message to all workers via request pipes
+                for pipe in self.scheduler.request_pipes:
+                    try:
+                        pipe.send(SHUTDOWN_MESSAGE)
+                    except Exception as exc:
+                        logger.warning("Failed to send shutdown signal to worker: %s", exc)
                 self.scheduler.close()
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
@@ -54,22 +58,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # Initialize scheduler
         self.scheduler = Scheduler()
         self.scheduler.initialize(self.od_config)
-        broadcast_handle = self.scheduler.get_broadcast_handle()
 
-        # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle)
-
-        if result_handle is not None:
-            self.scheduler.initialize_result_queue(result_handle)
-        else:
-            logger.error("Failed to get result queue handle from workers")
+        # Launch workers and get pipes
+        processes = self._launch_workers()
 
         self._processes = processes
 
         self.resources = BackgroundResources(scheduler=self.scheduler, processes=self._processes)
         self._finalizer = weakref.finalize(self, self.resources)
 
-    def _launch_workers(self, broadcast_handle):
+    def _launch_workers(self):
         od_config = self.od_config
         logger.info("Starting server...")
 
@@ -84,36 +82,57 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         worker_extension_cls = od_config.worker_extension_cls
         custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
 
-        # Launch all worker processes
-        scheduler_pipe_readers = []
+        # Create pipes for worker communication
+        # For each worker:
+        # - request_pipe: scheduler sends requests to worker
+        # - result_pipe: worker sends results to scheduler
+        scheduler_pipe_readers = []  # For initial status messages
         scheduler_pipe_writers = []
+        
+        scheduler_request_pipes = []  # Scheduler side of request pipes (for sending)
+        worker_request_pipes = []     # Worker side of request pipes (for receiving)
+        
+        scheduler_result_pipes = []   # Scheduler side of result pipes (for receiving)
+        worker_result_pipes = []      # Worker side of result pipes (for sending)
 
         for i in range(num_gpus):
+            # Create status pipe for initialization
             reader, writer = mp.Pipe(duplex=False)
+            scheduler_pipe_readers.append(reader)
             scheduler_pipe_writers.append(writer)
+            
+            # Create request pipe (scheduler -> worker)
+            sched_req_conn, worker_req_conn = mp.Pipe(duplex=False)
+            scheduler_request_pipes.append(sched_req_conn)
+            worker_request_pipes.append(worker_req_conn)
+            
+            # Create result pipe (worker -> scheduler)
+            sched_res_conn, worker_res_conn = mp.Pipe(duplex=False)
+            scheduler_result_pipes.append(sched_res_conn)
+            worker_result_pipes.append(worker_res_conn)
+            
             process = mp.Process(
                 target=worker_proc.worker_main,
                 args=(
                     i,  # rank
                     od_config,
-                    writer,
-                    broadcast_handle,
+                    writer,  # status pipe
+                    worker_req_conn,  # request pipe (receive)
+                    worker_res_conn,  # result pipe (send)
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
                 name=f"DiffusionWorker-{i}",
                 daemon=True,
             )
-            scheduler_pipe_readers.append(reader)
             process.start()
             processes.append(process)
 
-        # Wait for all workers to be ready
-        scheduler_infos = []
-        result_handle = None
+        # Close writer ends on scheduler side
         for writer in scheduler_pipe_writers:
             writer.close()
 
+        # Wait for all workers to be ready
         for i, reader in enumerate(scheduler_pipe_readers):
             try:
                 data = reader.recv()
@@ -126,15 +145,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if data["status"] != "ready":
                 raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-            if i == 0:
-                result_handle = data.get("result_handle")
-
-            scheduler_infos.append(data)
             reader.close()
 
         logger.debug("All workers are ready")
+        
+        # Initialize scheduler with pipe connections
+        self.scheduler.initialize_pipes(scheduler_request_pipes, scheduler_result_pipes)
 
-        return processes, result_handle
+        return processes
 
     def add_req(self, requests: list[OmniDiffusionRequest]):
         return self.scheduler.add_req(requests)
@@ -163,20 +181,33 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         }
 
         try:
-            # Broadcast RPC request to all workers via unified message queue
-            self.scheduler.mq.enqueue(rpc_request)
+            # Send RPC request to all workers via request pipes
+            for pipe in self.scheduler.request_pipes:
+                pipe.send(rpc_request)
 
             # Determine which workers we expect responses from
             num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
 
             responses = []
-            for _ in range(num_responses):
-                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
+            for i in range(num_responses):
                 try:
-                    if self.scheduler.result_mq is None:
-                        raise RuntimeError("Result queue not initialized")
-
-                    response = self.scheduler.result_mq.dequeue(timeout=dequeue_timeout)
+                    # Determine which pipe to read from
+                    if unique_reply_rank is not None:
+                        result_pipe = self.scheduler.result_pipes[unique_reply_rank]
+                    else:
+                        result_pipe = self.scheduler.result_pipes[i]
+                    
+                    # Set timeout if deadline is specified
+                    if deadline is not None:
+                        remaining_time = deadline - time.monotonic()
+                        if remaining_time <= 0:
+                            raise TimeoutError(f"RPC call to {method} timed out.")
+                        if result_pipe.poll(remaining_time):
+                            response = result_pipe.recv()
+                        else:
+                            raise TimeoutError(f"RPC call to {method} timed out.")
+                    else:
+                        response = result_pipe.recv()
 
                     # Check if response indicates an error
                     if isinstance(response, dict) and response.get("status") == "error":
