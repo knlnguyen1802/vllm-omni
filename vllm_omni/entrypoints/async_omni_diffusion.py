@@ -311,9 +311,8 @@ class AsyncOmniDiffusion:
             self.engine.collective_rpc,
             "remove_lora",
             None,
-            (adapter_id,),
-            {},
-            None,
+            (),
+            {"adapter_id": adapter_id},
         )
         return all(results) if isinstance(results, list) else results
 
@@ -327,7 +326,6 @@ class AsyncOmniDiffusion:
             None,
             (),
             {"lora_request": lora_request, "lora_scale": lora_scale},
-            None,
         )
         return all(results) if isinstance(results, list) else results
 
@@ -341,7 +339,6 @@ class AsyncOmniDiffusion:
             None,
             (),
             {},
-            None,
         )
         # collective_rpc returns list from workers; flatten unique ids
         if not isinstance(results, list):
@@ -361,6 +358,5 @@ class AsyncOmniDiffusion:
             None,
             (),
             {"adapter_id": lora_id},
-            None,
         )
         return all(results) if isinstance(results, list) else results
