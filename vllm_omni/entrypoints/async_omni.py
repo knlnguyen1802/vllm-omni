@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import time
+import uuid
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import asdict
@@ -108,10 +109,6 @@ class AsyncOmni(OmniBase):
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
-        
-        # RPC results storage: {stage_id: {rpc_id: result}}
-        # Used to avoid race condition between output_handler and collective_rpc
-        self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
 
         super().__init__(*args, **kwargs)
 
@@ -233,19 +230,6 @@ class AsyncOmni(OmniBase):
             self.input_processor = None
             self.io_processor = None
             self.model_config = None
-        
-        # Set up RPC result checkers for all stages to avoid race condition
-        # between output_handler and collective_rpc
-        for stage in self.stage_list:
-            stage_id = stage.stage_id
-            # Create a closure that captures stage_id
-            def make_rpc_checker(sid: int):
-                def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
-                    if sid in self._rpc_results and rpc_id in self._rpc_results[sid]:
-                        return self._rpc_results[sid].pop(rpc_id)
-                    return None
-                return rpc_checker
-            stage._rpc_result_checker = make_rpc_checker(stage_id)
 
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC.
@@ -525,14 +509,14 @@ class AsyncOmni(OmniBase):
                             # so we wait for a short time and try again
                             await asyncio.sleep(0.05)
                             continue
-                        # Handle collective_rpc results separately to avoid race condition
-                        # Store them in shared dictionary for collective_rpc to retrieve
-                        if result.get("type") == "collective_rpc_result":
+                        # Handle RPC results separately
+                        if result.get("type") == "rpc_result":
                             rpc_id = result.get("rpc_id")
                             if rpc_id:
-                                if stage_id not in self._rpc_results:
-                                    self._rpc_results[stage_id] = {}
-                                self._rpc_results[stage_id][rpc_id] = result
+                                # Store in stage's RPC results dict for retrieval
+                                if not hasattr(stage, '_rpc_results'):
+                                    stage._rpc_results = {}
+                                stage._rpc_results[rpc_id] = result
                             continue
                         req_id = result.get("request_id")
                         req_state = request_states.get(req_id)
@@ -556,6 +540,56 @@ class AsyncOmni(OmniBase):
 
         self.output_handler = asyncio.create_task(output_handler())
 
+    async def _submit_rpc_task(
+        self,
+        task_type: OmniStageTaskType,
+        timeout: float | None = None,
+        **task_kwargs: Any,
+    ) -> list[Any]:
+        """Submit an RPC task to all stages and collect results.
+        
+        Args:
+            task_type: Type of RPC task to execute
+            timeout: Optional timeout in seconds
+            **task_kwargs: Additional task parameters (e.g., level, tags, lora_request, etc.)
+            
+        Returns:
+            List of results from each stage
+        """
+        # Ensure output handler is running
+        self._run_output_handler()
+        
+        rpc_id = str(uuid.uuid4())
+        
+        # Submit task to all stages
+        for stage in self.stage_list:
+            task = {"type": task_type, "rpc_id": rpc_id, **task_kwargs}
+            stage.submit(task)
+            # Initialize _rpc_results dict if not exists
+            if not hasattr(stage, '_rpc_results'):
+                stage._rpc_results = {}
+        
+        # Collect results from all stages
+        results = []
+        start_time = time.time()
+        
+        for stage in self.stage_list:
+            while True:
+                if timeout is not None and (time.time() - start_time) > timeout:
+                    raise TimeoutError(f"RPC task {task_type} timed out after {timeout} seconds")
+                
+                # Check if result is available
+                if hasattr(stage, '_rpc_results') and rpc_id in stage._rpc_results:
+                    result = stage._rpc_results.pop(rpc_id)
+                    if "error" in result:
+                        raise RuntimeError(f"RPC task {task_type} failed: {result['error']}")
+                    results.append(result.get("result"))
+                    break
+                
+                await asyncio.sleep(0.001)  # Small sleep to avoid busy waiting
+        
+        return results
+
     async def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -564,6 +598,9 @@ class AsyncOmni(OmniBase):
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         """Execute an RPC call on all stages asynchronously.
+        
+        DEPRECATED: This method is deprecated. Use specific RPC methods instead
+        (sleep, wake_up, add_lora, remove_lora, list_loras, pin_lora).
         
         Args:
             method: Name of the method to execute or callable
@@ -574,22 +611,10 @@ class AsyncOmni(OmniBase):
         Returns:
             List of results from each stage
         """
-        # Run synchronous collective_rpc in thread pool to avoid blocking event loop
-        loop = asyncio.get_event_loop()
-        
-        async def run_stage_rpc(stage: OmniStage) -> _R:
-            return await loop.run_in_executor(
-                None,
-                stage.collective_rpc,
-                method,
-                timeout,
-                args,
-                kwargs,
-            )
-        
-        # Run all stages concurrently
-        results = await asyncio.gather(*[run_stage_rpc(stage) for stage in self.stage_list])
-        return list(results)
+        raise NotImplementedError(
+            "collective_rpc is deprecated. Use specific RPC methods instead: "
+            "sleep, wake_up, add_lora, remove_lora, list_loras, pin_lora"
+        )
 
     @property
     def is_running(self) -> bool:
@@ -667,11 +692,11 @@ class AsyncOmni(OmniBase):
 
     async def sleep(self, level: int = 1) -> None:
         self._is_sleeping = True
-        await self.collective_rpc(method="sleep", args=(level,))
+        await self._submit_rpc_task(OmniStageTaskType.SLEEP, level=level)
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
         self._is_sleeping = False
-        await self.collective_rpc(method="wake_up", args=(tags,))
+        await self._submit_rpc_task(OmniStageTaskType.WAKE_UP, tags=tags)
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""
@@ -679,19 +704,33 @@ class AsyncOmni(OmniBase):
 
     async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
-        return await self.collective_rpc(method="add_lora", args=(lora_request, lora_scale))[0]
+        results = await self._submit_rpc_task(
+            OmniStageTaskType.ADD_LORA,
+            lora_request=lora_request,
+            lora_scale=lora_scale,
+        )
+        return results[0] if results else False
 
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from the engine."""
-        return await self.collective_rpc(method="remove_lora", args=(adapter_id,))[0]
+        results = await self._submit_rpc_task(
+            OmniStageTaskType.REMOVE_LORA,
+            adapter_id=adapter_id,
+        )
+        return results[0] if results else False
 
     async def list_loras(self) -> list[int]:
         """List all LoRA adapters currently loaded in the engine."""
-        return await self.collective_rpc(method="list_loras")[0]
+        results = await self._submit_rpc_task(OmniStageTaskType.LIST_LORAS)
+        return results[0] if results else []
 
     async def pin_lora(self, adapter_id: int) -> bool:
         """Pin a LoRA adapter in memory to avoid eviction."""
-        return await self.collective_rpc(method="pin_lora", args=(adapter_id,))[0]
+        results = await self._submit_rpc_task(
+            OmniStageTaskType.PIN_LORA,
+            adapter_id=adapter_id,
+        )
+        return results[0] if results else False
 
     async def encode(
         self,

@@ -129,9 +129,6 @@ class OmniStage:
         # Support for different stage types: "llm" (default) or "diffusion"
         self.stage_type = getattr(stage_config, "stage_type", "llm")
         
-        # External RPC result checker function to avoid race condition with output_handler
-        # If set, collective_rpc will use this instead of try_collect()
-        self._rpc_result_checker: Callable[[str], dict[str, Any] | None] | None = None
         if hasattr(stage_config, "custom_process_input_func"):
             # Import the module specified in the config (already a full module path)
             module_path, func_name = stage_config.custom_process_input_func.rsplit(".", 1)
@@ -430,73 +427,6 @@ class OmniStage:
                 stage_list, engine_input_source, prompt, self.requires_multimodal_data
             )
 
-    def collective_rpc(
-        self,
-        method: str | Callable[..., _R],
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict[str, Any] | None = None,
-    ) -> list[_R]:
-        """Execute an RPC call on all workers via the stage engine.
-
-        Args:
-            method: Name of the worker method to execute, or a callable that
-                is serialized and sent to all workers to execute.
-
-                If the method is a callable, it should accept an additional
-                `self` argument, in addition to the arguments passed in `args`
-                and `kwargs`. The `self` argument will be the worker object.
-            timeout: Maximum time in seconds to wait for execution. Raises a
-                [`TimeoutError`][] on timeout. `None` means wait indefinitely.
-            args: Positional arguments to pass to the worker method.
-            kwargs: Keyword arguments to pass to the worker method.
-
-        Returns:
-            A list containing the results from each worker.
-
-        Note:
-            It is recommended to use this API to only pass control messages,
-            and set up data-plane communication to pass data.
-        """
-        assert self._in_q is not None and self._out_q is not None, "Queues must be attached before collective_rpc"
-
-        # Submit collective_rpc task to worker
-        rpc_id = str(uuid.uuid4())
-        self._in_q.put(
-            {
-                "type": OmniStageTaskType.COLLECTIVE_RPC,
-                "rpc_id": rpc_id,
-                "method": method,
-                "timeout": timeout,
-                "args": args,
-                "kwargs": kwargs,
-            }
-        )
-
-        start_time = time.time()
-        while True:
-            if timeout is not None and (time.time() - start_time) > timeout:
-                raise TimeoutError(f"collective_rpc timed out after {timeout} seconds")
-
-            # First check if result was already collected by output_handler (stored in shared dict)
-            # If not found, try to collect directly from queue
-            result = None
-            if self._rpc_result_checker is not None:
-                result = self._rpc_result_checker(rpc_id)
-            
-            # If not in shared dict, try collecting from queue directly
-            if result is None:
-                result = self.try_collect()
-                
-            if result is not None:
-                if result.get("type") == "collective_rpc_result":
-                    if result.get("rpc_id") == rpc_id:
-                        if "error" in result:
-                            raise RuntimeError(f"collective_rpc failed: {result['error']}")
-                        return result["result"]
-
-            time.sleep(0.001)  # Small sleep to avoid busy waiting
-
 
 def _stage_worker(
     model: str,
@@ -749,30 +679,71 @@ def _stage_worker(
             logger.info("Received shutdown signal")
             break
 
-        if task_type == OmniStageTaskType.COLLECTIVE_RPC:
+        # Handle RPC operations
+        if task_type == OmniStageTaskType.SLEEP:
             rpc_id = task.get("rpc_id")
-            method = task.get("method")
-            timeout = task.get("timeout")
-            args = task.get("args")
-            kwargs = task.get("kwargs")
+            level = task.get("level", 1)
             try:
-                result = stage_engine.collective_rpc(method, timeout, args, kwargs)
-                out_q.put(
-                    {
-                        "type": "collective_rpc_result",
-                        "rpc_id": rpc_id,
-                        "result": result,
-                    }
-                )
+                stage_engine.sleep(level)
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": None})
                 continue
             except Exception as e:
-                out_q.put(
-                    {
-                        "type": "collective_rpc_result",
-                        "rpc_id": rpc_id,
-                        "error": str(e),
-                    }
-                )
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                continue
+        
+        if task_type == OmniStageTaskType.WAKE_UP:
+            rpc_id = task.get("rpc_id")
+            tags = task.get("tags")
+            try:
+                stage_engine.wake_up(tags)
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": None})
+                continue
+            except Exception as e:
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                continue
+        
+        if task_type == OmniStageTaskType.ADD_LORA:
+            rpc_id = task.get("rpc_id")
+            lora_request = task.get("lora_request")
+            lora_scale = task.get("lora_scale", 1.0)
+            try:
+                result = stage_engine.add_lora(lora_request, lora_scale)
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": result})
+                continue
+            except Exception as e:
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                continue
+        
+        if task_type == OmniStageTaskType.REMOVE_LORA:
+            rpc_id = task.get("rpc_id")
+            adapter_id = task.get("adapter_id")
+            try:
+                result = stage_engine.remove_lora(adapter_id)
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": result})
+                continue
+            except Exception as e:
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                continue
+        
+        if task_type == OmniStageTaskType.LIST_LORAS:
+            rpc_id = task.get("rpc_id")
+            try:
+                result = stage_engine.list_loras()
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": result})
+                continue
+            except Exception as e:
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                continue
+        
+        if task_type == OmniStageTaskType.PIN_LORA:
+            rpc_id = task.get("rpc_id")
+            adapter_id = task.get("adapter_id")
+            try:
+                result = stage_engine.pin_lora(adapter_id)
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": result})
+                continue
+            except Exception as e:
+                out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
                 continue
 
         # Handle profiler control commands
@@ -1375,30 +1346,65 @@ async def _stage_worker_async(
             elif task_type == OmniStageTaskType.ABORT:
                 rid = task["request_id"]
                 asyncio.create_task(stage_engine.abort(rid))
-            elif task_type == OmniStageTaskType.COLLECTIVE_RPC:
+            elif task_type == OmniStageTaskType.SLEEP:
                 rpc_id = task.get("rpc_id")
-                method = task.get("method")
-                timeout = task.get("timeout")
-                args = task.get("args")
-                kwargs = task.get("kwargs")
+                level = task.get("level", 1)
                 try:
-                    result = stage_engine.collective_rpc(method, timeout, args, kwargs)
-                    out_q.put(
-                        {
-                            "type": "collective_rpc_result",
-                            "rpc_id": rpc_id,
-                            "result": result,
-                        }
-                    )
+                    await stage_engine.sleep(level)
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": None})
                     continue
                 except Exception as e:
-                    out_q.put(
-                        {
-                            "type": "collective_rpc_result",
-                            "rpc_id": rpc_id,
-                            "error": str(e),
-                        }
-                    )
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                    continue
+            elif task_type == OmniStageTaskType.WAKE_UP:
+                rpc_id = task.get("rpc_id")
+                tags = task.get("tags")
+                try:
+                    await stage_engine.wake_up(tags)
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": None})
+                    continue
+                except Exception as e:
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                    continue
+            elif task_type == OmniStageTaskType.ADD_LORA:
+                rpc_id = task.get("rpc_id")
+                lora_request = task.get("lora_request")
+                lora_scale = task.get("lora_scale", 1.0)
+                try:
+                    result = await stage_engine.add_lora(lora_request, lora_scale)
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": result})
+                    continue
+                except Exception as e:
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                    continue
+            elif task_type == OmniStageTaskType.REMOVE_LORA:
+                rpc_id = task.get("rpc_id")
+                adapter_id = task.get("adapter_id")
+                try:
+                    result = await stage_engine.remove_lora(adapter_id)
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": result})
+                    continue
+                except Exception as e:
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                    continue
+            elif task_type == OmniStageTaskType.LIST_LORAS:
+                rpc_id = task.get("rpc_id")
+                try:
+                    result = await stage_engine.list_loras()
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": result})
+                    continue
+                except Exception as e:
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
+                    continue
+            elif task_type == OmniStageTaskType.PIN_LORA:
+                rpc_id = task.get("rpc_id")
+                adapter_id = task.get("adapter_id")
+                try:
+                    result = await stage_engine.pin_lora(adapter_id)
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "result": result})
+                    continue
+                except Exception as e:
+                    out_q.put({"type": "rpc_result", "rpc_id": rpc_id, "error": str(e)})
                     continue
             elif is_profiler_task(task_type):
                 await handle_profiler_task_async(task_type)

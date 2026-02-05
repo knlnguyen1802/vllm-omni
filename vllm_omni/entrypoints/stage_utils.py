@@ -14,11 +14,16 @@ logger = logging.getLogger(__name__)
 
 class OmniStageTaskType(enum.Enum):
     GENERATE = "generate"
-    COLLECTIVE_RPC = "collective_rpc"
     ABORT = "abort"
     SHUTDOWN = "shutdown"
     PROFILER_START = "profiler_start"
     PROFILER_STOP = "profiler_stop"
+    SLEEP = "sleep"
+    WAKE_UP = "wake_up"
+    ADD_LORA = "add_lora"
+    REMOVE_LORA = "remove_lora"
+    LIST_LORAS = "list_loras"
+    PIN_LORA = "pin_lora"
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
