@@ -451,11 +451,18 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: DiffusionOutput):
+    def return_result(self, output: DiffusionOutput, request_id: str = None):
         """
         replies to client, only on rank 0
         """
         if self.result_mq is not None:
+            # Wrap output with request_id if provided
+            if request_id:
+                if isinstance(output, dict):
+                    output["request_id"] = request_id
+                else:
+                    # For non-dict outputs, wrap in dict
+                    output = {"result": output, "request_id": request_id}
             self.result_mq.enqueue(output)
 
     def recv_message(self):
@@ -465,7 +472,7 @@ class WorkerProc:
         """
         return self.mq.dequeue(indefinite=True)
 
-    def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
+    def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool, str | None]:
         """Execute an RPC request and indicate whether to reply."""
 
         method = rpc_request["method"]
@@ -473,20 +480,21 @@ class WorkerProc:
         kwargs = rpc_request.get("kwargs", {})
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
+        request_id = rpc_request.get("request_id")
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
         should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
 
         if not should_execute:
-            return None, False
+            return None, False, None
 
         try:
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
-            return result, should_reply
+            return result, should_reply, request_id
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
-            return {"status": "error", "error": str(e)}, should_reply
+            return {"status": "error", "error": str(e)}, should_reply, request_id
 
     # TODO: queueing, cancellation
     def worker_busy_loop(self) -> None:
@@ -513,13 +521,14 @@ class WorkerProc:
             if isinstance(msg, dict) and msg.get("type") == "rpc":
                 # Handle RPC request
                 try:
-                    result, should_reply = self.execute_rpc(msg)
+                    result, should_reply, request_id = self.execute_rpc(msg)
                     if should_reply:
-                        self.return_result(result)
+                        self.return_result(result, request_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result({"status": "error", "error": str(e)})
+                        error_response = {"status": "error", "error": str(e)}
+                        self.return_result(error_response, msg.get("request_id"))
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 # Handle shutdown message
