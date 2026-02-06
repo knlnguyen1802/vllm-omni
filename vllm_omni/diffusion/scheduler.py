@@ -78,18 +78,9 @@ class Scheduler:
                 if request_id:
                     with self._result_lock:
                         if request_id in self._pending_results:
-                            req_info = self._pending_results[request_id]
-                            
-                            # For collective RPC, we may get multiple responses
-                            if "responses" in req_info:
-                                req_info["responses"].append(result)
-                                # Check if we have all expected responses
-                                if len(req_info["responses"]) >= req_info["num_expected"]:
-                                    req_info["event"].set()
-                            else:
-                                # Single response (add_req)
-                                req_info["result"] = result
-                                req_info["event"].set()
+                            # Store result and signal waiting thread
+                            self._pending_results[request_id]["result"] = result
+                            self._pending_results[request_id]["event"].set()
                         else:
                             logger.warning(f"Received result for unknown request_id: {request_id}")
                 else:
@@ -160,20 +151,24 @@ class Scheduler:
         unique_reply_rank: int | None = None,
         num_workers: int = None,
     ) -> Any:
-        """Execute RPC across workers and collect results."""
+        """Execute RPC across workers and collect results.
+        
+        Note: Currently only rank 0 has result_mq, so we always expect 1 response
+        regardless of how many workers execute the RPC.
+        """
         request_id = str(uuid.uuid4())
         kwargs = kwargs or {}
         
-        # Determine how many responses we expect
-        num_expected = 1 if unique_reply_rank is not None else (num_workers or self.num_workers)
+        # Always expect 1 response since only rank 0 has result_mq
+        # Even if all workers execute (exec_all_ranks=True), only rank 0 replies
+        num_expected = 1
         
-        # Create tracking structure for multiple responses
+        # Use single response tracking (same as add_req)
         event = threading.Event()
         with self._result_lock:
             self._pending_results[request_id] = {
                 "event": event,
-                "responses": [],
-                "num_expected": num_expected
+                "result": None
             }
         
         try:
@@ -190,23 +185,22 @@ class Scheduler:
             # Enqueue request (non-blocking)
             self.mq.enqueue(rpc_request)
             
-            # Wait for all expected responses
+            # Wait for response (always 1 response from rank 0)
             if not event.wait(timeout=timeout):
                 raise TimeoutError(f"RPC call to {method} timed out.")
             
-            # Retrieve responses
+            # Retrieve result (single response like add_req)
             with self._result_lock:
-                responses = self._pending_results[request_id]["responses"]
+                result = self._pending_results[request_id]["result"]
             
-            # Check for errors in responses
-            for response in responses:
-                if isinstance(response, dict) and response.get("status") == "error":
-                    raise RuntimeError(
-                        f"Worker failed with error '{response.get('error')}', "
-                        "please check the stack trace above for the root cause"
-                    )
+            # Check for errors
+            if isinstance(result, dict) and result.get("status") == "error":
+                raise RuntimeError(
+                    f"Worker failed with error '{result.get('error')}', "
+                    "please check the stack trace above for the root cause"
+                )
             
-            return responses[0] if unique_reply_rank is not None else responses
+            return result
             
         except Exception as e:
             logger.error(f"RPC call failed: {e}")
