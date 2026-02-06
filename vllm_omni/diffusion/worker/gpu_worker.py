@@ -451,12 +451,24 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: DiffusionOutput):
+    def return_result(self, output: DiffusionOutput | dict, call_id: str | None = None):
         """
         replies to client, only on rank 0
         """
         if self.result_mq is not None:
-            self.result_mq.enqueue(output)
+            # Wrap result with call_id if provided
+            if call_id is not None:
+                wrapped_result = {
+                    "call_id": call_id,
+                    "result": output,
+                }
+                # If output is an error dict, merge the status
+                if isinstance(output, dict) and output.get("status") == "error":
+                    wrapped_result["status"] = "error"
+                    wrapped_result["error"] = output.get("error")
+                self.result_mq.enqueue(wrapped_result)
+            else:
+                self.result_mq.enqueue(output)
 
     def recv_message(self):
         """
@@ -512,14 +524,15 @@ class WorkerProc:
             # Route message based on type
             if isinstance(msg, dict) and msg.get("type") == "rpc":
                 # Handle RPC request
+                call_id = msg.get("call_id")
                 try:
                     result, should_reply = self.execute_rpc(msg)
                     if should_reply:
-                        self.return_result(result)
+                        self.return_result(result, call_id=call_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result({"status": "error", "error": str(e)})
+                        self.return_result({"status": "error", "error": str(e)}, call_id=call_id)
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 # Handle shutdown message
@@ -529,8 +542,15 @@ class WorkerProc:
 
             else:
                 # Handle generation request (OmniDiffusionRequest list)
+                # Extract call_id if this is a dict with call_id (for compatibility)
+                call_id = None
+                requests = msg
+                if isinstance(msg, dict) and "call_id" in msg:
+                    call_id = msg.get("call_id")
+                    requests = msg.get("requests", msg)
+                
                 try:
-                    output = self.worker.execute_model(msg, self.od_config)
+                    output = self.worker.execute_model(requests, self.od_config)
                 except Exception as e:
                     logger.error(
                         f"Error executing forward in event loop: {e}",
@@ -539,7 +559,7 @@ class WorkerProc:
                     output = DiffusionOutput(error=str(e))
 
                 try:
-                    self.return_result(output)
+                    self.return_result(output, call_id=call_id)
                 except zmq.ZMQError as e:
                     # Reply failed; log and keep loop alive to accept future requests
                     logger.error(f"ZMQ error sending reply: {e}")
