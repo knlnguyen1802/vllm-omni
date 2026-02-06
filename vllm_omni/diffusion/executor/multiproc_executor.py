@@ -3,7 +3,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from typing import Any
-
+import threading
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE
@@ -50,7 +50,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
         self._closed = False
-
+        self._queue_lock = threading.Lock()
         # Initialize scheduler
         self.scheduler = Scheduler()
         self.scheduler.initialize(self.od_config)
@@ -137,7 +137,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         return processes, result_handle
 
     def add_req(self, requests: list[OmniDiffusionRequest]):
-        return self.scheduler.add_req(requests)
+        with self._queue_lock:
+            return self.scheduler.add_req(requests)
 
     def collective_rpc(
         self,
@@ -150,50 +151,51 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if self._closed:
             raise RuntimeError("DiffusionExecutor is closed.")
 
-        deadline = None if timeout is None else time.monotonic() + timeout
-        kwargs = kwargs or {}
+        with self._queue_lock:
+            deadline = None if timeout is None else time.monotonic() + timeout
+            kwargs = kwargs or {}
 
-        # Prepare RPC request message
-        rpc_request = {
-            "type": "rpc",
-            "method": method,
-            "args": args,
-            "kwargs": kwargs,
-            "output_rank": unique_reply_rank,
-        }
+            # Prepare RPC request message
+            rpc_request = {
+                "type": "rpc",
+                "method": method,
+                "args": args,
+                "kwargs": kwargs,
+                "output_rank": unique_reply_rank,
+            }
 
-        try:
-            # Broadcast RPC request to all workers via unified message queue
-            self.scheduler.mq.enqueue(rpc_request)
+            try:
+                # Broadcast RPC request to all workers via unified message queue
+                self.scheduler.mq.enqueue(rpc_request)
 
-            # Determine which workers we expect responses from
-            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
+                # Determine which workers we expect responses from
+                num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
 
-            responses = []
-            for _ in range(num_responses):
-                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
-                try:
-                    if self.scheduler.result_mq is None:
-                        raise RuntimeError("Result queue not initialized")
+                responses = []
+                for _ in range(num_responses):
+                    dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
+                    try:
+                        if self.scheduler.result_mq is None:
+                            raise RuntimeError("Result queue not initialized")
 
-                    response = self.scheduler.result_mq.dequeue(timeout=dequeue_timeout)
+                        response = self.scheduler.result_mq.dequeue(timeout=dequeue_timeout)
 
-                    # Check if response indicates an error
-                    if isinstance(response, dict) and response.get("status") == "error":
-                        raise RuntimeError(
-                            f"Worker failed with error '{response.get('error')}', "
-                            "please check the stack trace above for the root cause"
-                        )
+                        # Check if response indicates an error
+                        if isinstance(response, dict) and response.get("status") == "error":
+                            raise RuntimeError(
+                                f"Worker failed with error '{response.get('error')}', "
+                                "please check the stack trace above for the root cause"
+                            )
 
-                    responses.append(response)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
+                        responses.append(response)
+                    except TimeoutError as e:
+                        raise TimeoutError(f"RPC call to {method} timed out.") from e
 
-            return responses[0] if unique_reply_rank is not None else responses
+                return responses[0] if unique_reply_rank is not None else responses
 
-        except Exception as e:
-            logger.error(f"RPC call failed: {e}")
-            raise
+            except Exception as e:
+                logger.error(f"RPC call failed: {e}")
+                raise
 
     def check_health(self) -> None:
         # Simple check if processes are alive

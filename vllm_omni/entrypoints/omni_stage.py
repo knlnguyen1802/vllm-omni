@@ -485,8 +485,8 @@ class OmniStage:
                 result = self._rpc_result_checker(rpc_id)
             
             # If not in shared dict, try collecting from queue directly
-            if result is None:
-                result = self.try_collect()
+            # if result is None:
+            #     result = self.try_collect()
                 
             if result is not None:
                 if result.get("type") == "collective_rpc_result":
