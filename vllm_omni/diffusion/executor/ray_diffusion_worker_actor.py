@@ -152,7 +152,6 @@ class DiffusionWorkerActor:
         """Execute model inference on workers."""
         from vllm_omni.diffusion.request import OmniDiffusionRequest
 
-        logger.info(f"Request is ======================================================== {requests}")
         # Convert dict representations back to OmniDiffusionRequest objects
         # because gpu_worker.execute_model expects OmniDiffusionRequest objects
         omni_requests = []

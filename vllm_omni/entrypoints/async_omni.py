@@ -532,6 +532,7 @@ class AsyncOmni(OmniBase):
                             if rpc_id:
                                 if stage_id not in self._rpc_results:
                                     self._rpc_results[stage_id] = {}
+                                print(f"================== at async omni rpc id is {rpc_id} and result is {result}")
                                 self._rpc_results[stage_id][rpc_id] = result
                             continue
                         req_id = result.get("request_id")
@@ -574,10 +575,11 @@ class AsyncOmni(OmniBase):
         Returns:
             List of results from each stage
         """
+        self._run_output_handler()
         # Run synchronous collective_rpc in thread pool to avoid blocking event loop
         loop = asyncio.get_event_loop()
         
-        async def run_stage_rpc(stage: OmniStage) -> _R:
+        async def run_stage_rpc(stage: OmniStage, method: str) -> _R:
             return await loop.run_in_executor(
                 None,
                 stage.collective_rpc,
@@ -588,7 +590,7 @@ class AsyncOmni(OmniBase):
             )
         
         # Run all stages concurrently
-        results = await asyncio.gather(*[run_stage_rpc(stage) for stage in self.stage_list])
+        results = await asyncio.gather(*[run_stage_rpc(stage, method) for stage in self.stage_list])
         return list(results)
 
     @property
@@ -679,7 +681,8 @@ class AsyncOmni(OmniBase):
 
     async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
-        return await self.collective_rpc(method="add_lora", args=(lora_request, lora_scale))[0]
+        result = await self.collective_rpc(method="add_lora", args=(lora_request, lora_scale))
+        return result[0][0]
 
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from the engine."""
@@ -687,11 +690,13 @@ class AsyncOmni(OmniBase):
 
     async def list_loras(self) -> list[int]:
         """List all LoRA adapters currently loaded in the engine."""
-        return await self.collective_rpc(method="list_loras")[0]
+        result = await self.collective_rpc(method="list_loras")
+        return result[0][0]
 
     async def pin_lora(self, adapter_id: int) -> bool:
         """Pin a LoRA adapter in memory to avoid eviction."""
-        return await self.collective_rpc(method="pin_lora", args=(adapter_id,))[0]
+        result = await self.collective_rpc(method="pin_lora", args=(adapter_id,))
+        return result[0][0]
 
     async def encode(
         self,

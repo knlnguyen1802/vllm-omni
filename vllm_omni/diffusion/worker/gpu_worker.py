@@ -227,7 +227,8 @@ class GPUWorker:
         return self.lora_manager.add_adapter(lora_request, lora_scale)
 
     def list_loras(self) -> list[int]:
-        return self.lora_manager.list_adapters()
+        result = self.lora_manager.list_adapters()
+        return result
 
     def pin_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.pin_adapter(adapter_id)
