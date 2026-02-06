@@ -49,6 +49,8 @@ class OmniDiffusionRequest:
     prompt_mask: torch.Tensor | None = None
     negative_prompt_mask: torch.Tensor | None = None
 
+    # Extra args
+    extra_args: dict[str, Any] | None = None
     prompt_path: str | None = None
     output_path: str = "outputs/"
     # without extension

@@ -686,7 +686,8 @@ class AsyncOmni(OmniBase):
 
     async def remove_lora(self, adapter_id: int) -> bool:
         """Remove a LoRA adapter from the engine."""
-        return await self.collective_rpc(method="remove_lora", args=(adapter_id,))[0]
+        result = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
+        return result[0][0]
 
     async def list_loras(self) -> list[int]:
         """List all LoRA adapters currently loaded in the engine."""
