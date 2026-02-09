@@ -130,9 +130,9 @@ class TestSchedulerRaceCondition:
     def setup_executor(self, monkeypatch):
         """Setup executor with real classes but mocked message queues."""
         
-        # Mock MessageQueue class
+        # Mock MessageQueue class where it's used (in scheduler module)
         monkeypatch.setattr(
-            'vllm.distributed.device_communicators.shm_broadcast.MessageQueue',
+            'vllm_omni.diffusion.scheduler.MessageQueue',
             MockMessageQueue
         )
         
