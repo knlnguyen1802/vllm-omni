@@ -325,23 +325,26 @@ class TestSchedulerRaceCondition:
     def test_response_mismatch_demonstration(self, setup_executor):
         """
         Demonstrate how responses can go to the wrong caller.
+        This test shows the race condition where responses don't match their intended callers.
         """
         executor, scheduler = setup_executor
         
-        # Setup specific responses
-        responses_sent = [
-            {'id': 'response_A', 'data': 'for_add_req_0'},
-            {'id': 'response_B', 'data': 'for_rpc_0'},
-            {'id': 'response_C', 'data': 'for_add_req_1'},
-            {'id': 'response_D', 'data': 'for_rpc_1'},
-        ]
+        # Setup specific responses with clear intended recipients
+        expected_mapping = {
+            'add_req_0': {'id': 'response_A', 'data': 'for_add_req_0'},
+            'collective_rpc_0': {'id': 'response_B', 'data': 'for_rpc_0'},
+            'add_req_1': {'id': 'response_C', 'data': 'for_add_req_1'},
+            'collective_rpc_1': {'id': 'response_D', 'data': 'for_rpc_1'},
+        }
         
-        scheduler.result_mq.responses = responses_sent.copy()
+        # Put responses in queue (order matters - they'll be dequeued FIFO)
+        scheduler.result_mq.responses = list(expected_mapping.values())
         
         received_responses = []
         lock = threading.Lock()
         
         def worker(call_type, call_id):
+            caller_name = f"{call_type}_{call_id}"
             if call_type == 'add_req':
                 request = MagicMock(spec=OmniDiffusionRequest)
                 result = executor.add_req(request)
@@ -350,32 +353,73 @@ class TestSchedulerRaceCondition:
             
             with lock:
                 received_responses.append({
-                    'caller': f"{call_type}_{call_id}",
+                    'caller': caller_name,
+                    'expected': expected_mapping[caller_name],
+                    'received': result,
                     'thread': threading.current_thread().name,
-                    'response': result,
                 })
         
         # Launch concurrent calls
         with ThreadPoolExecutor(max_workers=4) as pool:
-            pool.submit(worker, 'add_req', 0)
-            pool.submit(worker, 'collective_rpc', 0)
-            pool.submit(worker, 'add_req', 1)
-            pool.submit(worker, 'collective_rpc', 1)
+            futures = []
+            futures.append(pool.submit(worker, 'add_req', 0))
+            futures.append(pool.submit(worker, 'collective_rpc', 0))
+            futures.append(pool.submit(worker, 'add_req', 1))
+            futures.append(pool.submit(worker, 'collective_rpc', 1))
+            
+            # Wait for all to complete
+            for f in futures:
+                f.result()
         
         print(f"\n{'='*60}")
         print("Response Mismatch Analysis")
         print(f"{'='*60}")
-        print(f"\nSent {len(responses_sent)} responses:")
-        for r in responses_sent:
-            print(f"  - {r['id']}: {r['data']}")
         
-        print(f"\nReceived by callers:")
+        # Analyze mismatches
+        mismatches = []
         for r in received_responses:
-            response_id = r['response'].get('id', 'unknown')
-            print(f"  - {r['caller']:20s} got: {response_id}")
+            expected_id = r['expected']['id']
+            received_id = r['received'].get('id', 'unknown')
+            is_mismatch = expected_id != received_id
+            
+            if is_mismatch:
+                mismatches.append(r)
+            
+            status = "❌ MISMATCH" if is_mismatch else "✓ Match"
+            print(f"\n{r['caller']:20s} (Thread: {r['thread']})")
+            print(f"  Expected: {expected_id}")
+            print(f"  Received: {received_id}")
+            print(f"  Status:   {status}")
         
-        print("\nWithout proper synchronization, responses can be received")
-        print("by the wrong caller, causing incorrect results or timeouts!")
+        print(f"\n{'='*60}")
+        print(f"Total calls: {len(received_responses)}")
+        print(f"Mismatches:  {len(mismatches)}")
+        print(f"{'='*60}")
+        
+        if mismatches:
+            print("\nMismatch Details:")
+            for m in mismatches:
+                print(f"  - {m['caller']} expected {m['expected']['id']} "
+                      f"but got {m['received'].get('id', 'unknown')}")
+        
+        # Assert that mismatches occurred (proving the race condition)
+        assert len(mismatches) > 0, (
+            "Expected response mismatches due to race condition! "
+            "When multiple threads call add_req() and collective_rpc() concurrently, "
+            "they all dequeue from the same result_mq without coordination, "
+            "causing responses to go to the wrong caller. "
+            "If no mismatches occurred, the threads may have executed sequentially by chance."
+        )
+        
+        print("\n🐛 Race Condition Confirmed!")
+        print("Responses were delivered to wrong callers because:")
+        print("  1. Both add_req() and collective_rpc() dequeue from scheduler.result_mq")
+        print("  2. No synchronization exists between these calls")
+        print("  3. Whichever thread calls dequeue() first gets the next response,")
+        print("     regardless of which thread it was intended for")
+        print(f"\nThis demonstrates the bug in:")
+        print("  - vllm_omni/diffusion/scheduler.py:62 (add_req dequeues)")
+        print("  - vllm_omni/diffusion/executor/multiproc_executor.py:170 (collective_rpc dequeues)")
 
 
 if __name__ == "__main__":
