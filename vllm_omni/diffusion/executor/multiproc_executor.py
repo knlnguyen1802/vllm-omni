@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 import threading
 import uuid
-from collections import deque
 from concurrent.futures import Future
 from contextlib import suppress
 from concurrent.futures import InvalidStateError
@@ -21,29 +20,33 @@ logger = init_logger(__name__)
 
 
 class FutureWrapper(Future):
+    """Wrapper around Future that triggers async request on first result() call."""
     def __init__(
         self,
-        futures_queue: deque[tuple["FutureWrapper", Callable]],
+        trigger_request: Callable,
         aggregate: Callable = lambda x: x,
     ):
-        self.futures_queue = futures_queue
+        self.trigger_request = trigger_request
         self.aggregate = aggregate
+        self.triggered = False
+        self.trigger_lock = threading.Lock()
         super().__init__()
 
     def result(self, timeout=None):
-        if timeout is not None:
-            raise RuntimeError("timeout not implemented")
-        # Drain any futures ahead of us in the queue.
-        while not self.done():
-            future, get_response = self.futures_queue.pop()
-            future.wait_for_response(get_response)
-        return super().result()
-
-    def wait_for_response(self, get_response: Callable):
+        # Ensure the request is triggered exactly once
+        with self.trigger_lock:
+            if not self.triggered:
+                self.trigger_request()
+                self.triggered = True
+        # Wait for result from async handler thread
+        return super().result(timeout=timeout)
+    
+    def set_result_with_aggregate(self, result):
+        """Set result with aggregation function applied."""
         try:
-            response = self.aggregate(get_response())
+            aggregated = self.aggregate(result)
             with suppress(InvalidStateError):
-                self.set_result(response)
+                self.set_result(aggregated)
         except Exception as e:
             with suppress(InvalidStateError):
                 self.set_exception(e)
@@ -102,8 +105,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._closed = False
         self._queue_lock = threading.Lock()
         
-        # Initialize future queue and call tracking
-        self.futures_queue: deque[tuple[FutureWrapper, Callable]] = deque()
+        # Initialize call tracking (no futures_queue needed anymore)
         self.pending_futures: dict[str, FutureWrapper] = {}  # call_id -> future
         self.futures_lock = threading.Lock()
         self.shutdown_event = threading.Event()
@@ -240,7 +242,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             error_msg = result.get("error", "Unknown error")
                             future.set_exception(RuntimeError(error_msg))
                         else:
-                            future.set_result(actual_result)
+                            # Use set_result_with_aggregate to apply aggregation function
+                            future.set_result_with_aggregate(actual_result)
                     else:
                         logger.warning(f"Received result for unknown call_id: {call_id}")
                 else:
@@ -257,14 +260,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # Generate unique call_id
         call_id = str(uuid.uuid4())
         
-        # Create future for this request
-        future = FutureWrapper(self.futures_queue)
-        
-        with self.futures_lock:
-            self.pending_futures[call_id] = future
-        
-        # Create get_response callable
-        def get_response():
+        # Create trigger function that sends the request
+        def trigger_request():
             with self._queue_lock:
                 # Prepare RPC request for generation
                 rpc_request = {
@@ -278,12 +275,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 }
                 # Broadcast RPC request to all workers
                 self.scheduler.mq.enqueue(rpc_request)
-            return None  # Result will be set by handler thread
         
-        # Add to futures queue
-        self.futures_queue.appendleft((future, get_response))
+        # Create future for this request
+        future = FutureWrapper(trigger_request)
         
-        return future
+        with self.futures_lock:
+            self.pending_futures[call_id] = future
+        
+        # Wait for and return the result
+        try:
+            result = future.result()
+            return result
+        except Exception as e:
+            # Clean up pending future if it fails
+            with self.futures_lock:
+                self.pending_futures.pop(call_id, None)
+            raise
 
     def collective_rpc(
         self,
@@ -307,14 +314,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # Multiple responses - collect them into a list
             aggregate = lambda x: x if isinstance(x, list) else [x]
         
-        # Create future for this request
-        future = FutureWrapper(self.futures_queue, aggregate=aggregate)
-        
-        with self.futures_lock:
-            self.pending_futures[call_id] = future
-        
-        # Create get_response callable
-        def get_response():
+        # Create trigger function that sends the request
+        def trigger_request():
             with self._queue_lock:
                 # Prepare RPC request message
                 rpc_request = {
@@ -332,11 +333,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 except Exception as e:
                     logger.error(f"RPC call failed: {e}")
                     raise
-            
-            return None  # Result will be set by handler thread
         
-        # Add to futures queue
-        self.futures_queue.appendleft((future, get_response))
+        # Create future for this request
+        future = FutureWrapper(trigger_request, aggregate=aggregate)
+        
+        with self.futures_lock:
+            self.pending_futures[call_id] = future
         
         # Wait for result with timeout
         try:
