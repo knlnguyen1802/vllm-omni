@@ -90,6 +90,7 @@ def run_tts_generation(args) -> None:
     if args.x_vector_only:
         payload["x_vector_only_mode"] = True
 
+    print(f"Model: {args.model}")
     print(f"Task type: {args.task_type or 'CustomVoice'}")
     print(f"Text: {args.text}")
     print(f"Voice: {args.voice}")
@@ -109,6 +110,15 @@ def run_tts_generation(args) -> None:
         print(f"Error: {response.status_code}")
         print(response.text)
         return
+
+    # Check for JSON error response (only if content is valid UTF-8 text)
+    try:
+        text = response.content.decode("utf-8")
+        if text.startswith('{"error"'):
+            print(f"Error: {text}")
+            return
+    except UnicodeDecodeError:
+        pass  # Binary audio data, not an error
 
     # Save audio response
     output_path = args.output or "tts_output.wav"
