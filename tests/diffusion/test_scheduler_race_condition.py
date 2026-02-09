@@ -33,12 +33,17 @@ class MockMessageQueue:
     Mock MessageQueue that tracks concurrent access to demonstrate race condition.
     """
     
-    def __init__(self):
+    def __init__(self, n_reader=None, n_local_reader=None, local_reader_ranks=None, **kwargs):
+        """Accept the same arguments as real MessageQueue but ignore them for testing."""
         self.messages = []
         self.responses = []
         self.access_log = []
         self.currently_accessing = {}  # Track which threads are currently in enqueue/dequeue
         self._log_lock = threading.Lock()
+        # Store for reference (not used in mock)
+        self.n_reader = n_reader
+        self.n_local_reader = n_local_reader
+        self.local_reader_ranks = local_reader_ranks
         
     def enqueue(self, msg):
         """Enqueue without synchronization - this is the bug!"""
