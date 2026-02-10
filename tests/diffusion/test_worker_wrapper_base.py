@@ -137,9 +137,7 @@ class TestWorkerWrapperBaseExtension:
             assert TestExtension in wrapper.worker.__class__.__bases__
 
     @patch("vllm.utils.import_utils.resolve_obj_by_qualname")
-    def test_prepare_worker_class_with_extension_string(
-        self, mock_resolve, mock_od_config
-    ):
+    def test_prepare_worker_class_with_extension_string(self, mock_resolve, mock_od_config):
         """Test _prepare_worker_class with worker extension as string."""
 
         class TestExtension:
@@ -457,9 +455,6 @@ class TestWorkerWrapperBaseEdgeCases:
                 base_worker_class=DiffusionWorker,
                 worker_extension_cls=TestExtension,
             )
-
-            # Get the extended class
-            extended_class = wrapper1.worker.__class__
 
             # Create second wrapper with the same extension
             wrapper2 = WorkerWrapperBase(
