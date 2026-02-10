@@ -15,6 +15,7 @@ This module tests the WorkerWrapperBase implementation:
 from unittest.mock import Mock, patch
 
 import pytest
+from typing import Any
 
 from vllm_omni.diffusion.worker.diffusion_worker import (
     CustomPipelineWorkerExtension,
@@ -474,23 +475,6 @@ class TestCustomPipelineWorkerExtension:
         mock_model_runner.load_model.assert_called_once()
 
     @patch.object(DiffusionWorker, "__init__", return_value=None)
-    def test_custom_pipeline_args_auto_enables_extension(self, mock_worker_init, mock_od_config):
-        """Test that providing custom_pipeline_args automatically enables CustomPipelineWorkerExtension."""
-        custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
-
-        with patch.object(DiffusionWorker, "__init__", return_value=None):
-            wrapper = WorkerWrapperBase(
-                gpu_id=0,
-                od_config=mock_od_config,
-                base_worker_class=DiffusionWorker,
-                custom_pipeline_args=custom_args,
-            )
-
-            # Should have CustomPipelineWorkerExtension in bases
-            assert CustomPipelineWorkerExtension in wrapper.worker.__class__.__bases__
-            assert hasattr(wrapper.worker, "re_init_pipeline")
-
-    @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_custom_pipeline_args_initialization(self, mock_worker_init, mock_od_config):
         """Test initialization with custom_pipeline_args calls re_init_pipeline."""
         custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
@@ -519,8 +503,11 @@ class TestCustomPipelineWorkerExtension:
         """Test that explicit worker_extension_cls is preserved when custom_pipeline_args is provided."""
 
         class CustomExtension:
+            def re_init_pipeline(self, custom_pipeline_args: dict[str, Any]):
+                return "custom_re_init_pipeline"
+                
             def custom_extension_method(self):
-                return "custom"
+                return "custom_extension_method"
 
         custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
 

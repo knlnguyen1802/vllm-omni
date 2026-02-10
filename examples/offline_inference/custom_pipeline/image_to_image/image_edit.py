@@ -209,17 +209,26 @@ async def main():
     first_out = outputs[0].request_output[0]
     req_out: OmniRequestOutput = first_out
 
-    # ---- Metrics ----
-    print(f"\n{'='*60}")
-    print("TRAJECTORY VERIFICATION")
-    tr_steps = req_out.metrics["trajectory_timesteps"]
-    print(f"Timesteps shape: {tr_steps.shape}, dtype: {tr_steps.dtype}")
-    print(f"First 5 timesteps: {tr_steps[:5].tolist()}")
-    assert tr_steps.shape[0] == args.num_inference_steps
-    tr_lat = req_out.latents
-    print(f"Latents shape: {tr_lat.shape}, mean={tr_lat.mean().item():.6f}, std={tr_lat.std().item():.6f}")
-    assert tr_lat.shape[0] == args.num_inference_steps
-    print(f"{'='*60}\n")
+    # Verify trajectory data (from custom pipeline)
+    print(f"\n{'=' * 60}")
+    print("TRAJECTORY VERIFICATION:")
+    assert hasattr(req_out, "metrics") and req_out.metrics is not None
+    print(f"  ✓ trajectory_timesteps shape: {req_out.metrics['trajectory_timesteps'].shape}")
+    print(f"  ✓ trajectory_timesteps dtype: {req_out.metrics['trajectory_timesteps'].dtype}")
+    print(f"  ✓ trajectory_timesteps values (first 5): {req_out.metrics['trajectory_timesteps'][:5].tolist()}")
+    assert (
+        req_out.metrics['trajectory_timesteps'].shape[0] == args.num_inference_steps
+    ), f"Expected {args.num_inference_steps} timesteps, got {req_out.metrics['trajectory_timesteps'].shape[0]}"
+
+    assert hasattr(req_out, "latents") and req_out.latents is not None
+    print(f"  ✓ trajectory_latents shape: {req_out.latents.shape}")
+    print(f"  ✓ trajectory_latents dtype: {req_out.latents.dtype}")
+    print(f"  ✓ trajectory_latents mean: {req_out.latents.mean().item():.6f}")
+    print(f"  ✓ trajectory_latents std: {req_out.latents.std().item():.6f}")
+    assert (
+        req_out.latents.shape[0] == args.num_inference_steps
+    ), f"Expected {args.num_inference_steps} latent snapshots, got {req_out.latents.shape[0]}"
+    print(f"{'=' * 60}\n")
 
     # ---- Save images ----
     output_path = Path(args.output)
