@@ -172,6 +172,7 @@ class AsyncOmni(OmniBase):
                     "cache_config": cache_config,
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
                     "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
+                    "enforce_eager": kwargs.get("enforce_eager", False),
                     "enable_dummy_pipeline": kwargs.get("enable_dummy_pipeline", False),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                     "worker_extension_cls": kwargs.get("worker_extension_cls", None),
