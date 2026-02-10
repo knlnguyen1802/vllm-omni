@@ -471,7 +471,7 @@ class TestCustomPipelineWorkerExtension:
                 mock_worker_class.return_value = mock_worker_instance
                 mock_prepare.return_value = mock_worker_class
 
-                wrapper = WorkerWrapperBase(
+                _ = WorkerWrapperBase(
                     gpu_id=0,
                     od_config=mock_od_config,
                     base_worker_class=DiffusionWorker,
