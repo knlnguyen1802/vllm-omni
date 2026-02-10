@@ -619,17 +619,15 @@ class WorkerWrapperBase:
         """Shutdown the worker and cleanup resources."""
         return self.worker.shutdown()
 
-    def execute_method(self, method: str | bytes, *args, **kwargs):
+    def execute_method(self, method: str | bytes, *args, **kwargs) -> Any:
         """
         Execute a method on the worker.
 
         Args:
             method: Method name (str) or serialized callable (bytes)
-            *args: Positional arguments to pass to the method
-            **kwargs: Keyword arguments to pass to the method
 
         Returns:
-            Result of the method execution
+            Result of the method execution (type depends on the method)
 
         Raises:
             Exception: If method execution fails
