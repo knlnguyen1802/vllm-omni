@@ -446,6 +446,31 @@ async def main():
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 
+    # Verify trajectory data (from custom pipeline)
+    print(f"\n{'=' * 60}")
+    print("TRAJECTORY VERIFICATION:")
+    if hasattr(req_out, "trajectory_timesteps") and req_out.trajectory_timesteps is not None:
+        print(f"  ✓ trajectory_timesteps shape: {req_out.trajectory_timesteps.shape}")
+        print(f"  ✓ trajectory_timesteps dtype: {req_out.trajectory_timesteps.dtype}")
+        print(f"  ✓ trajectory_timesteps values (first 5): {req_out.trajectory_timesteps[:5].tolist()}")
+        assert (
+            req_out.trajectory_timesteps.shape[0] == args.num_inference_steps
+        ), f"Expected {args.num_inference_steps} timesteps, got {req_out.trajectory_timesteps.shape[0]}"
+    else:
+        print("  ✗ trajectory_timesteps not found or is None")
+
+    if hasattr(req_out, "trajectory_latents") and req_out.trajectory_latents is not None:
+        print(f"  ✓ trajectory_latents shape: {req_out.trajectory_latents.shape}")
+        print(f"  ✓ trajectory_latents dtype: {req_out.trajectory_latents.dtype}")
+        print(f"  ✓ trajectory_latents mean: {req_out.trajectory_latents.mean().item():.6f}")
+        print(f"  ✓ trajectory_latents std: {req_out.trajectory_latents.std().item():.6f}")
+        assert (
+            req_out.trajectory_latents.shape[0] == args.num_inference_steps
+        ), f"Expected {args.num_inference_steps} latent snapshots, got {req_out.trajectory_latents.shape[0]}"
+    else:
+        print("  ✗ trajectory_latents not found or is None")
+    print(f"{'=' * 60}\n")
+
     images = req_out.images
     if not images:
         raise ValueError("No images found in request_output")
