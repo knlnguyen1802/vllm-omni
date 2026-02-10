@@ -12,10 +12,10 @@ This module tests the WorkerWrapperBase implementation:
 - Dynamic worker class extension
 """
 
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
-from typing import Any
 
 from vllm_omni.diffusion.worker.diffusion_worker import (
     CustomPipelineWorkerExtension,
@@ -23,10 +23,10 @@ from vllm_omni.diffusion.worker.diffusion_worker import (
     WorkerWrapperBase,
 )
 
-
 # -------------------------------------------------------------------------
 # Fixtures
 # -------------------------------------------------------------------------
+
 
 @pytest.fixture
 def mock_od_config():
@@ -48,12 +48,14 @@ def mock_od_config():
 
 class TestExtension:
     """Simple test extension adding one custom method."""
+
     def custom_method(self):
         return "extension_method"
 
 
 class MockCustomPipeline:
     """Mock custom pipeline for testing."""
+
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
@@ -65,6 +67,7 @@ class MockCustomPipeline:
 # -------------------------------------------------------------------------
 # Tests: Initialization
 # -------------------------------------------------------------------------
+
 
 class TestWorkerWrapperBaseInitialization:
     """Test WorkerWrapperBase initialization behavior."""
@@ -95,6 +98,7 @@ class TestWorkerWrapperBaseInitialization:
 # -------------------------------------------------------------------------
 # Tests: Worker Extension Functionality
 # -------------------------------------------------------------------------
+
 
 class TestWorkerWrapperBaseExtension:
     """Test WorkerWrapperBase worker extension functionality."""
@@ -148,15 +152,14 @@ class TestWorkerWrapperBaseExtension:
 # Tests: Method Delegation
 # -------------------------------------------------------------------------
 
+
 class TestWorkerWrapperBaseDelegation:
     """Test WorkerWrapperBase delegation to wrapped worker."""
 
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_generate_delegation(self, mock_worker_init, mock_od_config):
         """Test that generate() delegates to worker.generate()."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         mock_output = Mock()
         wrapper.worker.generate = Mock(return_value=mock_output)
 
@@ -169,9 +172,7 @@ class TestWorkerWrapperBaseDelegation:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_execute_model_delegation(self, mock_worker_init, mock_od_config):
         """Test that execute_model() delegates to worker.execute_model()."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         mock_output = Mock()
         wrapper.worker.execute_model = Mock(return_value=mock_output)
 
@@ -184,9 +185,7 @@ class TestWorkerWrapperBaseDelegation:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_load_weights_delegation(self, mock_worker_init, mock_od_config):
         """Test that load_weights() delegates to worker.load_weights()."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         expected_result = {"weight1", "weight2"}
         wrapper.worker.load_weights = Mock(return_value=expected_result)
 
@@ -199,9 +198,7 @@ class TestWorkerWrapperBaseDelegation:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_sleep_delegation(self, mock_worker_init, mock_od_config):
         """Test that sleep() delegates to worker.sleep()."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         wrapper.worker.sleep = Mock(return_value=True)
         result = wrapper.sleep(level=1)
 
@@ -211,9 +208,7 @@ class TestWorkerWrapperBaseDelegation:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_wake_up_delegation(self, mock_worker_init, mock_od_config):
         """Test that wake_up() delegates to worker.wake_up()."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         wrapper.worker.wake_up = Mock(return_value=True)
 
         result = wrapper.wake_up(tags=["weights"])
@@ -223,9 +218,7 @@ class TestWorkerWrapperBaseDelegation:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_shutdown_delegation(self, mock_worker_init, mock_od_config):
         """Test that shutdown() delegates to worker.shutdown()."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         wrapper.worker.shutdown = Mock(return_value=None)
 
         result = wrapper.shutdown()
@@ -237,15 +230,14 @@ class TestWorkerWrapperBaseDelegation:
 # Tests: execute_method
 # -------------------------------------------------------------------------
 
+
 class TestWorkerWrapperBaseExecuteMethod:
     """Test WorkerWrapperBase.execute_method functionality."""
 
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_execute_method_success(self, mock_worker_init, mock_od_config):
         """Test execute_method successfully calls worker method."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         wrapper.worker.test_method = Mock(return_value="method_result")
 
         result = wrapper.execute_method("test_method", "arg1", kwarg1="value1")
@@ -256,9 +248,7 @@ class TestWorkerWrapperBaseExecuteMethod:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_execute_method_with_no_args(self, mock_worker_init, mock_od_config):
         """Test execute_method with no arguments."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         wrapper.worker.no_args_method = Mock(return_value="no_args_result")
 
         result = wrapper.execute_method("no_args_method")
@@ -268,9 +258,7 @@ class TestWorkerWrapperBaseExecuteMethod:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_execute_method_error(self, mock_worker_init, mock_od_config):
         """Test execute_method raises exception on error."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         wrapper.worker.error_method = Mock(side_effect=RuntimeError("Test error"))
 
         with pytest.raises(RuntimeError, match="Test error"):
@@ -279,9 +267,7 @@ class TestWorkerWrapperBaseExecuteMethod:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_execute_method_invalid_type(self, mock_worker_init, mock_od_config):
         """Test execute_method with invalid method type."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
 
         with pytest.raises(AssertionError, match="Method must be str"):
             wrapper.execute_method(b"bytes_method")
@@ -291,24 +277,21 @@ class TestWorkerWrapperBaseExecuteMethod:
 # Tests: __getattr__ delegation
 # -------------------------------------------------------------------------
 
+
 class TestWorkerWrapperBaseGetAttr:
     """Test WorkerWrapperBase.__getattr__ delegation."""
 
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_getattr_delegation(self, mock_worker_init, mock_od_config):
         """Test __getattr__ delegates to worker attributes."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         wrapper.worker.custom_attribute = "test_value"
         assert wrapper.custom_attribute == "test_value"
 
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_getattr_method_access(self, mock_worker_init, mock_od_config):
         """Test __getattr__ delegates to worker methods."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         wrapper.worker.custom_method = Mock(return_value="method_result")
 
         result = wrapper.custom_method()
@@ -318,9 +301,7 @@ class TestWorkerWrapperBaseGetAttr:
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_getattr_missing_attribute(self, mock_worker_init, mock_od_config):
         """Test __getattr__ raises AttributeError for missing attributes."""
-        wrapper = WorkerWrapperBase(
-            gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker
-        )
+        wrapper = WorkerWrapperBase(gpu_id=0, od_config=mock_od_config, base_worker_class=DiffusionWorker)
         with pytest.raises(AttributeError):
             _ = wrapper.nonexistent_attribute
 
@@ -328,6 +309,7 @@ class TestWorkerWrapperBaseGetAttr:
 # -------------------------------------------------------------------------
 # Tests: Edge Cases
 # -------------------------------------------------------------------------
+
 
 class TestWorkerWrapperBaseEdgeCases:
     """Test WorkerWrapperBase edge cases and special scenarios."""
@@ -378,6 +360,7 @@ class TestWorkerWrapperBaseEdgeCases:
 # -------------------------------------------------------------------------
 # Tests: CustomPipelineWorkerExtension
 # -------------------------------------------------------------------------
+
 
 class TestCustomPipelineWorkerExtension:
     """Test CustomPipelineWorkerExtension functionality."""
@@ -505,7 +488,7 @@ class TestCustomPipelineWorkerExtension:
         class CustomExtension:
             def re_init_pipeline(self, custom_pipeline_args: dict[str, Any]):
                 return "custom_re_init_pipeline"
-                
+
             def custom_extension_method(self):
                 return "custom_extension_method"
 

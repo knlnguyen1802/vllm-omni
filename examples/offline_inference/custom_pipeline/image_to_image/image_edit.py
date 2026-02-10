@@ -47,12 +47,11 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import List, Union
 
 import torch
 from PIL import Image
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -90,7 +89,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_dit_max_continuous_cached_steps", type=int, default=3)
     parser.add_argument("--cache_dit_enable_taylorseer", action="store_true", default=False)
     parser.add_argument("--cache_dit_taylorseer_order", type=int, default=1)
-    parser.add_argument("--cache_dit_scm_steps_mask_policy", type=str, default=None, choices=[None, "slow", "medium", "fast", "ultra"])
+    parser.add_argument(
+        "--cache_dit_scm_steps_mask_policy", type=str, default=None, choices=[None, "slow", "medium", "fast", "ultra"]
+    )
     parser.add_argument("--cache_dit_scm_steps_policy", type=str, default="dynamic", choices=["dynamic", "static"])
     parser.add_argument("--tea_cache_rel_l1_thresh", type=float, default=0.2)
     parser.add_argument("--cfg_parallel_size", type=int, default=1, choices=[1, 2])
@@ -109,14 +110,14 @@ async def main():
     args = parse_args()
 
     # ---- Load input images ----
-    input_images: List[Image.Image] = []
+    input_images: list[Image.Image] = []
     for image_path in args.image:
         if not os.path.exists(image_path):
             raise FileNotFoundError(f"Input image not found: {image_path}")
         input_images.append(Image.open(image_path).convert(args.color_format))
 
     # Single or multi-image input
-    input_image: Union[Image.Image, List[Image.Image]] = input_images[0] if len(input_images) == 1 else input_images
+    input_image: Image.Image | list[Image.Image] = input_images[0] if len(input_images) == 1 else input_images
 
     # ---- Torch setup ----
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
@@ -163,17 +164,19 @@ async def main():
 
     # ---- Profiling + Info ----
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Generation Configuration")
     print(f"Model: {args.model}")
     print(f"Inference steps: {args.num_inference_steps}")
     print(f"Cache: {args.cache_backend or 'None'}")
     print(f"Input(s): {len(input_images)} image(s)")
     for idx, img in enumerate(input_images):
-        print(f"  • Image {idx+1}: size={img.size}")
-    print(f"Parallel config: Ulysses={args.ulysses_degree}, Ring={args.ring_degree}, "
-          f"CFG Parallel={args.cfg_parallel_size}, Tensor Parallel={args.tensor_parallel_size}")
-    print(f"{'='*60}\n")
+        print(f"  • Image {idx + 1}: size={img.size}")
+    print(
+        f"Parallel config: Ulysses={args.ulysses_degree}, Ring={args.ring_degree}, "
+        f"CFG Parallel={args.cfg_parallel_size}, Tensor Parallel={args.tensor_parallel_size}"
+    )
+    print(f"{'=' * 60}\n")
 
     if profiler_enabled:
         omni.start_profile()
@@ -216,18 +219,18 @@ async def main():
     print(f"  ✓ trajectory_timesteps shape: {req_out.metrics['trajectory_timesteps'].shape}")
     print(f"  ✓ trajectory_timesteps dtype: {req_out.metrics['trajectory_timesteps'].dtype}")
     print(f"  ✓ trajectory_timesteps values (first 5): {req_out.metrics['trajectory_timesteps'][:5].tolist()}")
-    assert (
-        req_out.metrics['trajectory_timesteps'].shape[0] == args.num_inference_steps
-    ), f"Expected {args.num_inference_steps} timesteps, got {req_out.metrics['trajectory_timesteps'].shape[0]}"
+    assert req_out.metrics["trajectory_timesteps"].shape[0] == args.num_inference_steps, (
+        f"Expected {args.num_inference_steps} timesteps, got {req_out.metrics['trajectory_timesteps'].shape[0]}"
+    )
 
     assert hasattr(req_out, "latents") and req_out.latents is not None
     print(f"  ✓ trajectory_latents shape: {req_out.latents.shape}")
     print(f"  ✓ trajectory_latents dtype: {req_out.latents.dtype}")
     print(f"  ✓ trajectory_latents mean: {req_out.latents.mean().item():.6f}")
     print(f"  ✓ trajectory_latents std: {req_out.latents.std().item():.6f}")
-    assert (
-        req_out.latents.shape[0] == args.num_inference_steps
-    ), f"Expected {args.num_inference_steps} latent snapshots, got {req_out.latents.shape[0]}"
+    assert req_out.latents.shape[0] == args.num_inference_steps, (
+        f"Expected {args.num_inference_steps} latent snapshots, got {req_out.latents.shape[0]}"
+    )
     print(f"{'=' * 60}\n")
 
     # ---- Save images ----
