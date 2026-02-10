@@ -65,12 +65,12 @@ class CustomPipeline(QwenImageEditPipeline):
     def forward(self, req, prompt=None, negative_prompt=None, **kwargs):
         # Call parent's forward to get normal output
         output = super().forward(req=req, prompt=prompt, negative_prompt=negative_prompt, **kwargs)
-        
+
         # Add custom trajectory data
         actual_num_steps = req.sampling_params.num_inference_steps or kwargs.get('num_inference_steps', 50)
         output.trajectory_timesteps = torch.linspace(1000, 0, actual_num_steps, dtype=torch.float32)
         output.trajectory_latents = torch.randn(actual_num_steps, 1, 16, 64, 64, dtype=torch.float32)
-        
+
         return output
 ```
 
@@ -132,7 +132,7 @@ class MyCustomExtension(CustomPipelineWorkerExtension):
     def custom_method(self):
         """Your custom worker method."""
         return "custom_result"
-    
+
     def another_method(self, data: Any):
         """Another custom method."""
         # Access worker internals via self
