@@ -245,9 +245,11 @@ class TestSchedulerRaceCondition:
                 
                 with lock:
                     results.append(('add_req', i, result))
+                    print(f"✓ add_req({i}) completed: {result}")
             except Exception as e:
                 with lock:
                     errors.append(('add_req', i, str(e)))
+                    print(f"✗ add_req({i}) failed: {e}")
         
         def call_collective_rpc(i):
             """Call collective_rpc - directly calls mq.enqueue()"""
@@ -262,9 +264,11 @@ class TestSchedulerRaceCondition:
                 
                 with lock:
                     results.append(('collective_rpc', i, result))
+                    print(f"✓ collective_rpc({i}) completed: {result}")
             except Exception as e:
                 with lock:
                     errors.append(('collective_rpc', i, str(e)))
+                    print(f"✗ collective_rpc({i}) failed: {e}")
         
         print("\n" + "="*60)
         print("Testing concurrent add_req and collective_rpc calls")
@@ -415,6 +419,7 @@ class TestSchedulerRaceCondition:
                         'received': result,
                         'thread': threading.current_thread().name,
                     })
+                    print(f"✓ {caller_name} completed: {result}")
             except Exception as e:
                 with lock:
                     received_responses.append({
@@ -423,6 +428,7 @@ class TestSchedulerRaceCondition:
                         'received': {'error': str(e)},
                         'thread': threading.current_thread().name,
                     })
+                    print(f"✗ {caller_name} failed: {e}")
         
         # Launch concurrent calls
         with ThreadPoolExecutor(max_workers=4) as pool:

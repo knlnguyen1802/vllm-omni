@@ -213,10 +213,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             future.set_exception(RuntimeError(error_msg))
                         else:
                             future.set_response(actual_response)
-                    else:
-                        logger.warning(f"Received result for unknown request_id: {request_id}")
-                else:
-                    logger.warning(f"Received result without request_id: {result}")
+                    # Ignore results for unknown request_id (already completed/cleaned up)
+                # Ignore results without request_id (legacy format)
 
             except Exception as e:
                 if not self._shutdown_event.is_set():
