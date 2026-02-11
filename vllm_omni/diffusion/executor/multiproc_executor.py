@@ -174,7 +174,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return processes, result_handle
 
-    def _get_next_request_id(self) -> str:
+    @staticmethod
+    def _get_next_request_id() -> str:
         """Generate unique request ID using UUID."""
         return str(uuid.uuid4())
 
