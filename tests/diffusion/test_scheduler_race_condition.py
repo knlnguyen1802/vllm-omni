@@ -232,7 +232,6 @@ class TestSchedulerRaceCondition:
         num_iterations = 10
         results = []
         errors = []
-        lock = threading.Lock()
         
         def call_add_req(i):
             """Call add_req - uses scheduler.add_req() which calls mq.enqueue()"""
@@ -243,13 +242,11 @@ class TestSchedulerRaceCondition:
                 # Call blocking - the mock output handler will auto-complete the future
                 result = executor.add_req(request, non_block=False)
                 
-                with lock:
-                    results.append(('add_req', i, result))
-                    print(f"✓ add_req({i}) completed: {result}")
+                results.append(('add_req', i, result))
+                print(f"✓ add_req({i}) completed: {result}")
             except Exception as e:
-                with lock:
-                    errors.append(('add_req', i, str(e)))
-                    print(f"✗ add_req({i}) failed: {e}")
+                errors.append(('add_req', i, str(e)))
+                print(f"✗ add_req({i}) failed: {e}")
         
         def call_collective_rpc(i):
             """Call collective_rpc - directly calls mq.enqueue()"""
@@ -262,13 +259,11 @@ class TestSchedulerRaceCondition:
                     non_block=False,
                 )
                 
-                with lock:
-                    results.append(('collective_rpc', i, result))
-                    print(f"✓ collective_rpc({i}) completed: {result}")
+                results.append(('collective_rpc', i, result))
+                print(f"✓ collective_rpc({i}) completed: {result}")
             except Exception as e:
-                with lock:
-                    errors.append(('collective_rpc', i, str(e)))
-                    print(f"✗ collective_rpc({i}) failed: {e}")
+                errors.append(('collective_rpc', i, str(e)))
+                print(f"✗ collective_rpc({i}) failed: {e}")
         
         print("\n" + "="*60)
         print("Testing concurrent add_req and collective_rpc calls")
@@ -397,7 +392,6 @@ class TestSchedulerRaceCondition:
         # Instead, we'll manually set them in the worker function
         
         received_responses = []
-        lock = threading.Lock()
         
         def worker(call_type, call_id):
             caller_name = f"{call_type}_{call_id}"
@@ -412,23 +406,21 @@ class TestSchedulerRaceCondition:
                         non_block=False
                     )
                 
-                with lock:
-                    received_responses.append({
-                        'caller': caller_name,
-                        'expected': expected_mapping[caller_name],
-                        'received': result,
-                        'thread': threading.current_thread().name,
-                    })
-                    print(f"✓ {caller_name} completed: {result}")
+                received_responses.append({
+                    'caller': caller_name,
+                    'expected': expected_mapping[caller_name],
+                    'received': result,
+                    'thread': threading.current_thread().name,
+                })
+                print(f"✓ {caller_name} completed: {result}")
             except Exception as e:
-                with lock:
-                    received_responses.append({
-                        'caller': caller_name,
-                        'expected': expected_mapping[caller_name],
-                        'received': {'error': str(e)},
-                        'thread': threading.current_thread().name,
-                    })
-                    print(f"✗ {caller_name} failed: {e}")
+                received_responses.append({
+                    'caller': caller_name,
+                    'expected': expected_mapping[caller_name],
+                    'received': {'error': str(e)},
+                    'thread': threading.current_thread().name,
+                })
+                print(f"✗ {caller_name} failed: {e}")
         
         # Launch concurrent calls
         with ThreadPoolExecutor(max_workers=4) as pool:
