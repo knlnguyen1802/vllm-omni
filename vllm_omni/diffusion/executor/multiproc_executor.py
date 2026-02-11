@@ -1,8 +1,13 @@
 import multiprocessing as mp
+import threading
 import time
+import uuid
 import weakref
+from collections import deque
+from concurrent.futures import Future, InvalidStateError
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from vllm.logger import init_logger
 
@@ -13,6 +18,38 @@ from vllm_omni.diffusion.scheduler import Scheduler
 from vllm_omni.diffusion.worker import WorkerProc
 
 logger = init_logger(__name__)
+
+
+class FutureWrapper(Future):
+    """Wrapper for Future that supports request ID tracking and aggregation."""
+
+    def __init__(
+        self,
+        request_id: str,
+        pending_futures: dict[str, "FutureWrapper"],
+        aggregate: Callable = lambda x: x,
+    ):
+        self.request_id = request_id
+        self.pending_futures = pending_futures
+        self.aggregate = aggregate
+        super().__init__()
+
+    def result(self, timeout=None):
+        """Get the result of the future."""
+        return super().result(timeout=timeout)
+
+    def set_response(self, response: Any):
+        """Set the response for this future."""
+        try:
+            aggregated_response = self.aggregate(response)
+            with suppress(InvalidStateError):
+                self.set_result(aggregated_response)
+        except Exception as e:
+            with suppress(InvalidStateError):
+                self.set_exception(e)
+        finally:
+            # Remove from pending futures once completed
+            self.pending_futures.pop(self.request_id, None)
 
 
 @dataclass
@@ -50,6 +87,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def _init_executor(self) -> None:
         self._processes: list[mp.Process] = []
         self._closed = False
+        self._pending_futures: dict[str, FutureWrapper] = {}
+        self._shutdown_event = threading.Event()
 
         # Initialize scheduler
         self.scheduler = Scheduler()
@@ -65,6 +104,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             logger.error("Failed to get result queue handle from workers")
 
         self._processes = processes
+
+        # Start output handler thread
+        self._output_handler_thread = threading.Thread(
+            target=self._output_handler_loop,
+            daemon=True,
+            name="DiffusionOutputHandler"
+        )
+        self._output_handler_thread.start()
 
         self.resources = BackgroundResources(scheduler=self.scheduler, processes=self._processes)
         self._finalizer = weakref.finalize(self, self.resources)
@@ -127,8 +174,95 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return processes, result_handle
 
-    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
-        return self.scheduler.add_req(request)
+    def _get_next_request_id(self) -> str:
+        """Generate unique request ID using UUID."""
+        return str(uuid.uuid4())
+
+    def _output_handler_loop(self) -> None:
+        """Background thread that collects results from scheduler and sets futures."""
+        logger.info("Output handler loop started")
+        
+        while not self._shutdown_event.is_set():
+            try:
+                if self.scheduler.result_mq is None:
+                    logger.warning("Result queue not initialized, waiting...")
+                    time.sleep(0.1)
+                    continue
+
+                # Dequeue result with timeout to allow checking shutdown event
+                try:
+                    result = self.scheduler.result_mq.dequeue(timeout=0.1)
+                except Exception:
+                    # Timeout or other dequeue error, continue loop
+                    continue
+
+                # Extract request_id from result
+                if isinstance(result, dict) and "request_id" in result:
+                    request_id = result["request_id"]
+                    
+                    # Find the corresponding future
+                    future = self._pending_futures.get(request_id)
+                    if future is not None:
+                        # Extract actual response (remove request_id wrapper)
+                        actual_response = result.get("response")
+                        
+                        # Check for errors
+                        if result.get("status") == "error":
+                            error_msg = result.get("error", "Unknown error")
+                            future.set_exception(RuntimeError(error_msg))
+                        else:
+                            future.set_response(actual_response)
+                    else:
+                        logger.warning(f"Received result for unknown request_id: {request_id}")
+                else:
+                    logger.warning(f"Received result without request_id: {result}")
+
+            except Exception as e:
+                if not self._shutdown_event.is_set():
+                    logger.error(f"Error in output handler loop: {e}", exc_info=True)
+                    time.sleep(0.1)  # Avoid tight loop on persistent errors
+        
+        logger.info("Output handler loop stopped")
+
+    def add_req(self, request: OmniDiffusionRequest, non_block: bool = False) -> DiffusionOutput | Future[DiffusionOutput]:
+        """Add a diffusion request.
+        
+        Args:
+            request: The diffusion request to process
+            non_block: If True, returns a Future immediately; if False, blocks until result is ready
+            
+        Returns:
+            DiffusionOutput if non_block=False, Future[DiffusionOutput] if non_block=True
+        """
+        if self._closed:
+            raise RuntimeError("DiffusionExecutor is closed.")
+        
+        # Generate unique request ID
+        request_id = self._get_next_request_id()
+        
+        # Create future for this request
+        future = FutureWrapper(
+            request_id=request_id,
+            pending_futures=self._pending_futures,
+            aggregate=lambda x: x
+        )
+        self._pending_futures[request_id] = future
+        
+        # Wrap request with ID for tracking
+        request_with_id = {
+            "type": "add_req",
+            "request_id": request_id,
+            "request": request,
+        }
+        
+        # Send to scheduler
+        self.scheduler.mq.enqueue(request_with_id)
+        
+        if non_block:
+            return future
+        else:
+            # Block and wait for result
+            return future.result()
 
     def collective_rpc(
         self,
@@ -136,17 +270,49 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict | None = None,
+        non_block: bool = False,
         unique_reply_rank: int | None = None,
-    ) -> Any:
+    ) -> Any | Future[Any]:
+        """Execute RPC call across workers.
+        
+        Args:
+            method: Method name to call on workers
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+            non_block: If True, returns a Future immediately; if False, blocks until result is ready
+            unique_reply_rank: If specified, only this rank returns a response
+            
+        Returns:
+            Result or Future depending on non_block parameter
+        """
         if self._closed:
             raise RuntimeError("DiffusionExecutor is closed.")
 
-        deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
-
-        # Prepare RPC request message
+        
+        # Generate unique request ID
+        request_id = self._get_next_request_id()
+        
+        # Determine aggregation function
+        if unique_reply_rank is not None:
+            aggregate = lambda x: x  # Single response, no aggregation needed
+        else:
+            # Multiple responses - return as list
+            aggregate = lambda x: x if isinstance(x, list) else [x]
+        
+        # Create future for this request
+        future = FutureWrapper(
+            request_id=request_id,
+            pending_futures=self._pending_futures,
+            aggregate=aggregate
+        )
+        self._pending_futures[request_id] = future
+        
+        # Prepare RPC request message with request ID
         rpc_request = {
             "type": "rpc",
+            "request_id": request_id,
             "method": method,
             "args": args,
             "kwargs": kwargs,
@@ -156,33 +322,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         try:
             # Broadcast RPC request to all workers via unified message queue
             self.scheduler.mq.enqueue(rpc_request)
-
-            # Determine which workers we expect responses from
-            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
-
-            responses = []
-            for _ in range(num_responses):
-                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
-                try:
-                    if self.scheduler.result_mq is None:
-                        raise RuntimeError("Result queue not initialized")
-
-                    response = self.scheduler.result_mq.dequeue(timeout=dequeue_timeout)
-
-                    # Check if response indicates an error
-                    if isinstance(response, dict) and response.get("status") == "error":
-                        raise RuntimeError(
-                            f"Worker failed with error '{response.get('error')}', "
-                            "please check the stack trace above for the root cause"
-                        )
-
-                    responses.append(response)
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-
-            return responses[0] if unique_reply_rank is not None else responses
+            
+            if non_block:
+                return future
+            else:
+                # Block and wait for result with optional timeout
+                return future.result(timeout=timeout)
 
         except Exception as e:
+            # Clean up future on error
+            self._pending_futures.pop(request_id, None)
             logger.error(f"RPC call failed: {e}")
             raise
 
@@ -193,5 +342,26 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 raise RuntimeError(f"Worker process {p.name} is dead")
 
     def shutdown(self) -> None:
+        """Shutdown executor and clean up resources."""
+        if self._closed:
+            return
+            
         self._closed = True
+        
+        # Signal output handler to stop
+        self._shutdown_event.set()
+        
+        # Cancel all pending futures
+        for future in list(self._pending_futures.values()):
+            if not future.done():
+                with suppress(InvalidStateError):
+                    future.set_exception(RuntimeError("Executor shutdown"))
+        
+        self._pending_futures.clear()
+        
+        # Wait for output handler thread to finish
+        if hasattr(self, '_output_handler_thread') and self._output_handler_thread.is_alive():
+            self._output_handler_thread.join(timeout=5)
+        
+        # Clean up resources
         self._finalizer()
