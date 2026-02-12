@@ -100,6 +100,8 @@ class DiffusionModelRunner:
                 self.pipeline = model_loader.load_model(
                     od_config=self.od_config,
                     load_device=load_device,
+                    load_format=load_format,
+                    custom_pipeline_name=custom_pipeline_name,
                 )
         time_after_load = time.perf_counter()
 

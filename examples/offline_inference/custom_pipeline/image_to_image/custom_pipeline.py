@@ -72,11 +72,9 @@ class CustomPipeline(QwenImageEditPipeline):
         actual_num_steps = req.sampling_params.num_inference_steps or num_inference_steps
 
         # Create dummy trajectory data
-        dummy_trajectory_timesteps = torch.linspace(1000, 0, actual_num_steps, dtype=torch.float32)
         dummy_trajectory_latents = torch.randn(actual_num_steps, 1, 16, 64, 64, dtype=torch.float32)
 
         # Inject dummy trajectory data into output
-        output.trajectory_timesteps = dummy_trajectory_timesteps
         output.trajectory_latents = dummy_trajectory_latents
 
         return output

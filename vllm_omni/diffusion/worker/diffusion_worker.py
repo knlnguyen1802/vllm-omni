@@ -124,12 +124,17 @@ class DiffusionWorker:
             )
             init_workspace_manager(self.device)
 
-    def load_model(self, load_format: str | None = None) -> None:
+    def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
-        self.model_runner.load_model(
-            memory_pool_context_fn=self._maybe_get_memory_pool_context,
-            load_format=load_format,
-        )
+        with (
+            set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
+            set_current_vllm_config(self.vllm_config),
+        ):
+            self.model_runner.load_model(
+                memory_pool_context_fn=self._maybe_get_memory_pool_context,
+                load_format=load_format,
+                custom_pipeline_name=custom_pipeline_name,
+            )
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -278,7 +283,7 @@ class CustomPipelineWorkerExtension:
 
         # Get custom pipeline class name
         custom_pipeline_name = custom_pipeline_args["pipeline_class"]
-        self.model_runner.load_model(
+        self.load_model(
             load_format="custom_pipeline",
             memory_pool_context_fn=self._maybe_get_memory_pool_context,
             custom_pipeline_name=custom_pipeline_name,

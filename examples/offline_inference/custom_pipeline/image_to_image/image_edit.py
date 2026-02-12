@@ -215,14 +215,6 @@ async def main():
     # Verify trajectory data (from custom pipeline)
     print(f"\n{'=' * 60}")
     print("TRAJECTORY VERIFICATION:")
-    assert hasattr(req_out, "metrics") and req_out.metrics is not None
-    print(f"  ✓ trajectory_timesteps shape: {req_out.metrics['trajectory_timesteps'].shape}")
-    print(f"  ✓ trajectory_timesteps dtype: {req_out.metrics['trajectory_timesteps'].dtype}")
-    print(f"  ✓ trajectory_timesteps values (first 5): {req_out.metrics['trajectory_timesteps'][:5].tolist()}")
-    assert req_out.metrics["trajectory_timesteps"].shape[0] == args.num_inference_steps, (
-        f"Expected {args.num_inference_steps} timesteps, got {req_out.metrics['trajectory_timesteps'].shape[0]}"
-    )
-
     assert hasattr(req_out, "latents") and req_out.latents is not None
     print(f"  ✓ trajectory_latents shape: {req_out.latents.shape}")
     print(f"  ✓ trajectory_latents dtype: {req_out.latents.dtype}")
