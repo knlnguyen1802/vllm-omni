@@ -283,7 +283,7 @@ class CustomPipelineWorkerExtension:
 
         # Get custom pipeline class name
         custom_pipeline_name = custom_pipeline_args["pipeline_class"]
-        
+
         # Use the DiffusionWorker's load_model method which handles the forward context
         self.load_model(
             load_format="custom_pipeline",
