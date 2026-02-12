@@ -79,7 +79,7 @@ class DiffusionModelRunner:
             memory_pool_context_fn: Optional function that returns a context manager
                 for memory pool allocation (used for sleep mode).
             load_format: Format for loading model weights. Supported formats:
-                - "default" (default): Automatically detect and use the default format based on the model and configuration
+                - "default" (default): Automatically detect and use the default format based on configuration
                 - "custom_pipeline": Init model from a custom pipeline class specified by `custom_pipeline_name`
                 - "dummy": Skip actual weight loading, useful for testing and custom pipelines that
                     don't require default weights.
