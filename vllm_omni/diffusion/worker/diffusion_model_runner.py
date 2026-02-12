@@ -89,7 +89,9 @@ class DiffusionModelRunner:
         if load_format == "dummy":
             return
 
-        load_device = "cpu" if self.od_config.enable_cpu_offload else str(self.device)
+        load_device = (
+            "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
+        )
 
         def get_memory_context():
             if memory_pool_context_fn is not None:
