@@ -381,10 +381,9 @@ class TestCustomPipelineWorkerExtension:
         mock_model_runner = Mock()
         mock_pipeline = Mock()
         mock_model_runner.pipeline = mock_pipeline
-        mock_model_runner.load_model = Mock()
         wrapper.worker.model_runner = mock_model_runner
         wrapper.worker.init_lora_manager = Mock()
-        wrapper.worker._maybe_get_memory_pool_context = Mock()
+        wrapper.worker.load_model = Mock()
 
         custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
 
@@ -392,9 +391,8 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.re_init_pipeline(custom_args)
 
         # Verify load_model was called with correct arguments
-        mock_model_runner.load_model.assert_called_once_with(
+        wrapper.worker.load_model.assert_called_once_with(
             load_format="custom_pipeline",
-            memory_pool_context_fn=wrapper.worker._maybe_get_memory_pool_context,
             custom_pipeline_name="tests.diffusion.test_worker_wrapper_base.MockCustomPipeline",
         )
         wrapper.worker.init_lora_manager.assert_called_once()
@@ -415,10 +413,9 @@ class TestCustomPipelineWorkerExtension:
         mock_model_runner = Mock()
         mock_pipeline = Mock()
         mock_model_runner.pipeline = mock_pipeline
-        mock_model_runner.load_model = Mock()
         wrapper.worker.model_runner = mock_model_runner
         wrapper.worker.init_lora_manager = Mock()
-        wrapper.worker._maybe_get_memory_pool_context = Mock()
+        wrapper.worker.load_model = Mock()
 
         custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
 
@@ -444,10 +441,9 @@ class TestCustomPipelineWorkerExtension:
         # Setup mock model_runner with None pipeline
         mock_model_runner = Mock()
         mock_model_runner.pipeline = None
-        mock_model_runner.load_model = Mock()
         wrapper.worker.model_runner = mock_model_runner
         wrapper.worker.init_lora_manager = Mock()
-        wrapper.worker._maybe_get_memory_pool_context = Mock()
+        wrapper.worker.load_model = Mock()
 
         custom_args = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
 
@@ -455,7 +451,7 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.re_init_pipeline(custom_args)
 
         # Verify load_model was still called
-        mock_model_runner.load_model.assert_called_once()
+        wrapper.worker.load_model.assert_called_once()
 
     @patch.object(DiffusionWorker, "__init__", return_value=None)
     def test_custom_pipeline_args_initialization(self, mock_worker_init, mock_od_config):
@@ -524,10 +520,9 @@ class TestCustomPipelineWorkerExtension:
         mock_pipeline1 = Mock()
         mock_pipeline2 = Mock()
         mock_model_runner.pipeline = mock_pipeline1
-        mock_model_runner.load_model = Mock()
         wrapper.worker.model_runner = mock_model_runner
         wrapper.worker.init_lora_manager = Mock()
-        wrapper.worker._maybe_get_memory_pool_context = Mock()
+        wrapper.worker.load_model = Mock()
 
         # First call
         custom_args1 = {"pipeline_class": "tests.diffusion.test_worker_wrapper_base.MockCustomPipeline"}
@@ -541,5 +536,5 @@ class TestCustomPipelineWorkerExtension:
         wrapper.worker.re_init_pipeline(custom_args2)
 
         # Verify load_model was called twice with different pipelines
-        assert mock_model_runner.load_model.call_count == 2
+        assert wrapper.worker.load_model.call_count == 2
         assert wrapper.worker.init_lora_manager.call_count == 2
