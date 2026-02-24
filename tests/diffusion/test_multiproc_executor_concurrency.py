@@ -63,6 +63,7 @@ def _make_scheduler():
     """
     sched = Scheduler()
     sched.num_workers = 1
+    sched._lock = threading.Lock()
 
     req_q: queue.Queue = queue.Queue()
     res_q: queue.Queue = queue.Queue()
@@ -145,14 +146,6 @@ def _inject_interleave(scheduler):
 class TestConcurrentAddReqBug:
     """Two concurrent ``Scheduler.add_req()`` calls swap results."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Known concurrency bug: Scheduler.add_req() performs "
-            "enqueue + dequeue without a lock, so concurrent calls "
-            "can receive each other's results."
-        ),
-    )
     def test_results_are_correctly_routed(self):
         sched, req_q, res_q = _make_scheduler()
         a_enqueued, b_complete = _inject_interleave(sched)
@@ -188,13 +181,6 @@ class TestConcurrentAddReqBug:
 class TestConcurrentCollectiveRpcBug:
     """Two concurrent ``collective_rpc()`` calls swap results."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Known concurrency bug: collective_rpc() performs "
-            "enqueue + dequeue on shared scheduler queues without a lock."
-        ),
-    )
     def test_results_are_correctly_routed(self):
         sched, req_q, res_q = _make_scheduler()
         executor = _make_executor(sched)
@@ -233,13 +219,6 @@ class TestConcurrentCollectiveRpcBug:
 class TestConcurrentAddReqVsCollectiveRpcBug:
     """``add_req`` and ``collective_rpc`` running concurrently swap results."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Known concurrency bug: add_req and collective_rpc share the "
-            "same mq / result_mq without synchronisation."
-        ),
-    )
     def test_results_are_correctly_routed(self):
         sched, req_q, res_q = _make_scheduler()
         executor = _make_executor(sched)
