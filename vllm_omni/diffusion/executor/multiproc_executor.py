@@ -160,7 +160,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         }
 
         try:
-            with self.scheduler._lock:
+            # Acquire lock with timeout awareness so that a stalled add_req
+            # (holding the lock while blocked on dequeue) does not prevent
+            # this RPC from honouring its own timeout.
+            lock_timeout = None if deadline is None else max(0, deadline - time.monotonic())
+            acquired = self.scheduler._lock.acquire(
+                timeout=lock_timeout if lock_timeout is not None else -1
+            )
+            if not acquired:
+                raise TimeoutError(
+                    f"RPC call to {method} timed out waiting for scheduler lock."
+                )
+            try:
                 # Broadcast RPC request to all workers via unified message queue
                 self.scheduler.mq.enqueue(rpc_request)
 
@@ -169,7 +180,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
                 responses = []
                 for _ in range(num_responses):
-                    dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
+                    dequeue_timeout = None if deadline is None else max(0, deadline - time.monotonic())
                     try:
                         if self.scheduler.result_mq is None:
                             raise RuntimeError("Result queue not initialized")
@@ -188,6 +199,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         raise TimeoutError(f"RPC call to {method} timed out.") from e
 
                 return responses[0] if unique_reply_rank is not None else responses
+            finally:
+                self.scheduler._lock.release()
 
         except Exception as e:
             logger.error(f"RPC call failed: {e}")

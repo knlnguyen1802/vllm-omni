@@ -349,3 +349,108 @@ class TestSerialOperations:
 
         with pytest.raises(RuntimeError, match="closed"):
             executor.collective_rpc("anything")
+
+
+# ─────────── timeout regression: RPC must not block on a stalled lock ─────
+
+
+class TestCollectiveRpcTimeoutWhileLockHeld:
+    """``collective_rpc(timeout=...)`` must honour its timeout even when
+    another thread holds ``scheduler._lock`` indefinitely (e.g. a stalled
+    ``add_req`` waiting on an unresponsive worker).
+    """
+
+    def test_rpc_times_out_when_lock_held_directly(self):
+        """Simplest case: lock is manually held by another thread."""
+        sched, req_q, res_q = _make_scheduler()
+        executor = _make_executor(sched)
+
+        stall_started = threading.Event()
+
+        def _hold_lock():
+            sched._lock.acquire()
+            stall_started.set()
+            # Hold the lock far longer than the RPC timeout.
+            threading.Event().wait(30)
+            sched._lock.release()
+
+        stall_thread = threading.Thread(target=_hold_lock, daemon=True)
+        stall_thread.start()
+        stall_started.wait(5)
+
+        # collective_rpc should raise TimeoutError, NOT block forever.
+        with pytest.raises(TimeoutError):
+            executor.collective_rpc("health", timeout=0.5)
+
+    def test_rpc_times_out_when_add_req_stalled_on_worker(self):
+        """Real-world scenario the bot flagged:
+
+        ``add_req`` holds ``_lock`` while blocked on ``result_mq.dequeue()``
+        because the worker never replies.  A concurrent
+        ``collective_rpc(timeout=...)`` must still time out instead of
+        hanging forever waiting for the lock.
+        """
+        sched, req_q, res_q = _make_scheduler()
+        executor = _make_executor(sched)
+
+        add_req_blocked = threading.Event()
+
+        # Patch dequeue: signal once entered, then block indefinitely
+        # (simulates a worker that never sends a result).
+        orig_dequeue = sched.result_mq.dequeue
+
+        def _hanging_dequeue(timeout=None):
+            add_req_blocked.set()
+            # Block forever — the worker is "hung".
+            threading.Event().wait(30)
+            return orig_dequeue(timeout=timeout)
+
+        sched.result_mq.dequeue = _hanging_dequeue
+
+        # Thread running add_req — acquires the lock, enqueues, then
+        # blocks on dequeue forever (worker hang).
+        def _stalled_add_req():
+            try:
+                sched.add_req(_mock_request("stalled"))
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_stalled_add_req, daemon=True)
+        t.start()
+
+        # Wait until add_req is truly inside the lock and blocking.
+        add_req_blocked.wait(5)
+
+        # collective_rpc should time out at lock acquisition, not hang.
+        with pytest.raises(TimeoutError):
+            executor.collective_rpc("health_check", timeout=0.5)
+
+    def test_rpc_without_timeout_still_waits_for_lock(self):
+        """When no timeout is given, ``collective_rpc`` should still wait
+        for the lock (blocking) — existing behaviour preserved.
+        """
+        sched, req_q, res_q = _make_scheduler()
+        executor = _make_executor(sched)
+
+        lock_released = threading.Event()
+
+        def _hold_and_release():
+            sched._lock.acquire()
+            # Hold for a short time then release.
+            threading.Event().wait(0.3)
+            sched._lock.release()
+            lock_released.set()
+
+        # Pre-populate a result so collective_rpc succeeds after lock.
+        res_q.put(_tagged_output("ok"))
+
+        t = threading.Thread(target=_hold_and_release, daemon=True)
+        t.start()
+
+        # No timeout → should block until lock is released, then succeed.
+        result = executor.collective_rpc(
+            "ping", args=("wait",), unique_reply_rank=0,
+        )
+        t.join(5)
+
+        assert result.error == "ok"
