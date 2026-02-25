@@ -1,31 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Reproduce the concurrency bug in MultiprocDiffusionExecutor / Scheduler.
-
-Bug
----
-Both ``Scheduler.add_req`` and ``MultiprocDiffusionExecutor.collective_rpc``
-perform a **non-atomic** pair of operations on shared message queues::
-
-    mq.enqueue(request)            # step 1 – broadcast to workers
-    result = result_mq.dequeue()   # step 2 – collect the answer
-
-When two threads interleave between steps 1 and 2, one thread can dequeue
-the **other** thread's result.
-
-Deterministic interleaving (forced via ``threading.Event``)
------------------------------------------------------------
-1. Thread A  : ``mq.enqueue(request_A)``  →  **blocks** inside enqueue
-2. Thread B  : ``mq.enqueue(request_B)``  →  returns immediately
-3. Worker    : processes request_A → ``result_for_A`` into result_q
-4. Worker    : processes request_B → ``result_for_B`` into result_q
-5. Thread B  : ``result_mq.dequeue()``    → gets **result_for_A** (WRONG)
-6. Thread B finishes → unblocks Thread A
-7. Thread A  : ``result_mq.dequeue()``    → gets **result_for_B** (WRONG)
-"""
-
 import queue
 import threading
 from unittest.mock import Mock, patch
