@@ -72,9 +72,7 @@ def _make_scheduler():
     mock_mq.enqueue = req_q.put
 
     mock_rmq = Mock()
-    mock_rmq.dequeue = lambda timeout=None: res_q.get(
-        timeout=timeout if timeout else 10
-    )
+    mock_rmq.dequeue = lambda timeout=None: res_q.get(timeout=timeout if timeout else 10)
 
     sched.mq = mock_mq
     sched.result_mq = mock_rmq
@@ -99,6 +97,7 @@ def _start_worker(req_q, res_q, count=2):
     """Simulate workers: read *count* requests from *req_q* and put
     tagged ``DiffusionOutput``s on *res_q* (FIFO order).
     """
+
     def _run():
         for _ in range(count):
             req = req_q.get(timeout=10)
@@ -133,8 +132,8 @@ def _inject_interleave(scheduler):
     def _controlled(item):
         orig_enqueue(item)
         if threading.current_thread().name == "thread_a":
-            a_enqueued.set()       # tell B: "A has enqueued"
-            b_complete.wait(5)     # block A until B finishes
+            a_enqueued.set()  # tell B: "A has enqueued"
+            b_complete.wait(5)  # block A until B finishes
 
     scheduler.mq.enqueue = _controlled
     return a_enqueued, b_complete
@@ -157,9 +156,9 @@ class TestConcurrentAddReqBug:
             results["A"] = sched.add_req(_mock_request("A"))
 
         def _b():
-            a_enqueued.wait(5)                         # wait for A to enqueue
+            a_enqueued.wait(5)  # wait for A to enqueue
             results["B"] = sched.add_req(_mock_request("B"))
-            b_complete.set()                           # release A
+            b_complete.set()  # release A
 
         ta = threading.Thread(target=_a, name="thread_a")
         tb = threading.Thread(target=_b, name="thread_b")
@@ -191,13 +190,17 @@ class TestConcurrentCollectiveRpcBug:
 
         def _a():
             results["A"] = executor.collective_rpc(
-                "ping", args=("call_A",), unique_reply_rank=0,
+                "ping",
+                args=("call_A",),
+                unique_reply_rank=0,
             )
 
         def _b():
             a_enqueued.wait(5)
             results["B"] = executor.collective_rpc(
-                "ping", args=("call_B",), unique_reply_rank=0,
+                "ping",
+                args=("call_B",),
+                unique_reply_rank=0,
             )
             b_complete.set()
 
@@ -233,7 +236,9 @@ class TestConcurrentAddReqVsCollectiveRpcBug:
         def _b():  # collective_rpc path
             a_enqueued.wait(5)
             results["B"] = executor.collective_rpc(
-                "ping", args=("call_B",), unique_reply_rank=0,
+                "ping",
+                args=("call_B",),
+                unique_reply_rank=0,
             )
             b_complete.set()
 
@@ -286,7 +291,9 @@ class TestSerialOperations:
         wt = _start_worker(req_q, res_q, count=1)
 
         result = executor.collective_rpc(
-            "ping", args=("Y",), unique_reply_rank=0,
+            "ping",
+            args=("Y",),
+            unique_reply_rank=0,
         )
         wt.join(5)
 
@@ -317,7 +324,9 @@ class TestSerialOperations:
 
         gen_out = sched.add_req(_mock_request("gen"))
         rpc_out = executor.collective_rpc(
-            "ping", args=("rpc",), unique_reply_rank=0,
+            "ping",
+            args=("rpc",),
+            unique_reply_rank=0,
         )
         wt.join(5)
 
@@ -449,7 +458,9 @@ class TestCollectiveRpcTimeoutWhileLockHeld:
 
         # No timeout → should block until lock is released, then succeed.
         result = executor.collective_rpc(
-            "ping", args=("wait",), unique_reply_rank=0,
+            "ping",
+            args=("wait",),
+            unique_reply_rank=0,
         )
         t.join(5)
 

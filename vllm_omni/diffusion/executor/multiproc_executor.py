@@ -164,13 +164,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # (holding the lock while blocked on dequeue) does not prevent
             # this RPC from honouring its own timeout.
             lock_timeout = None if deadline is None else max(0, deadline - time.monotonic())
-            acquired = self.scheduler._lock.acquire(
-                timeout=lock_timeout if lock_timeout is not None else -1
-            )
+            acquired = self.scheduler._lock.acquire(timeout=lock_timeout if lock_timeout is not None else -1)
             if not acquired:
-                raise TimeoutError(
-                    f"RPC call to {method} timed out waiting for scheduler lock."
-                )
+                raise TimeoutError(f"RPC call to {method} timed out waiting for scheduler lock.")
             try:
                 # Broadcast RPC request to all workers via unified message queue
                 self.scheduler.mq.enqueue(rpc_request)
