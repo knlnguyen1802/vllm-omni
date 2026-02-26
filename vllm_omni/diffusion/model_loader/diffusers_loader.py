@@ -4,7 +4,8 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -215,23 +216,61 @@ class DiffusersPipelineLoader:
         load_device: str,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
+        memory_pool_context_fn: Callable[..., object] | None = None,
     ) -> nn.Module:
-        """Load a model with the given configurations."""
+        """Load a model with the given configurations.
+
+        Args:
+            od_config: OmniDiffusion configuration.
+            load_device: Device string to load the model onto.
+            load_format: Format for loading model weights.
+            custom_pipeline_name: Optional custom pipeline class name.
+            memory_pool_context_fn: Optional callable that returns a context
+                manager for memory pool allocation (used for sleep mode).
+                When provided, the model is first initialized on CPU to avoid
+                CuMemAllocator conflicts with ``from_pretrained()`` CUDA
+                allocations, then moved to the target device within the
+                allocator context so all GPU memory is managed for sleep mode.
+        """
         target_device = torch.device(load_device)
+        sleep_mode = memory_pool_context_fn is not None
+
+        # When sleep mode is active, initialize the model on CPU to avoid
+        # CuMemAllocator conflicts with from_pretrained() CUDA allocations
+        # (the pluggable allocator's cuMemCreate can fail with
+        # "invalid argument" for allocations triggered by from_pretrained).
+        # The model will be moved to the target device afterwards within the
+        # CuMemAllocator context so all GPU memory is tracked by the allocator.
+        init_device = torch.device("cpu") if sleep_mode else target_device
+
         with set_default_torch_dtype(od_config.dtype):
-            with target_device:
+            with init_device:
                 if load_format == "default":
                     model = initialize_model(od_config)
                 elif load_format == "custom_pipeline":
                     model_cls = resolve_obj_by_qualname(custom_pipeline_name)
                     model = model_cls(od_config=od_config)
-            logger.debug("Loading weights on %s ...", load_device)
-            # Quantization does not happen in `load_weights` but after it
-            self.load_weights(model)
 
-            # Process weights after loading for quantization (e.g., FP8 online quantization)
-            # This is needed for vLLM's quantization methods that need to transform weights
-            self._process_weights_after_loading(model, target_device)
+            if sleep_mode:
+                # Ensure all parameters/buffers are on CPU before entering
+                # the CuMemAllocator context.  Some pipeline __init__ methods
+                # explicitly move components to CUDA via .to(device); move
+                # them back so every GPU allocation goes through the allocator.
+                model.to("cpu")
+                memory_pool_ctx = memory_pool_context_fn(tag="weights")
+            else:
+                memory_pool_ctx = nullcontext()
+
+            with memory_pool_ctx:
+                if sleep_mode:
+                    model.to(target_device)
+                logger.debug("Loading weights on %s ...", load_device)
+                # Quantization does not happen in `load_weights` but after it
+                self.load_weights(model)
+
+                # Process weights after loading for quantization (e.g., FP8 online quantization)
+                # This is needed for vLLM's quantization methods that need to transform weights
+                self._process_weights_after_loading(model, target_device)
 
         return model.eval()
 

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
-from contextlib import nullcontext
 
 import torch
 from torch.profiler import record_function
@@ -94,24 +93,19 @@ class DiffusionModelRunner:
             "cpu" if self.od_config.enable_cpu_offload or self.od_config.enable_layerwise_offload else str(self.device)
         )
 
-        def get_memory_context():
-            if memory_pool_context_fn is not None:
-                return memory_pool_context_fn(tag="weights")
-            return nullcontext()
-
         # Load model within forward context
         load_config = LoadConfig()
         model_loader = DiffusersPipelineLoader(load_config)
         time_before_load = time.perf_counter()
 
-        with get_memory_context():
-            with DeviceMemoryProfiler() as m:
-                self.pipeline = model_loader.load_model(
-                    od_config=self.od_config,
-                    load_device=load_device,
-                    load_format=load_format,
-                    custom_pipeline_name=custom_pipeline_name,
-                )
+        with DeviceMemoryProfiler() as m:
+            self.pipeline = model_loader.load_model(
+                od_config=self.od_config,
+                load_device=load_device,
+                load_format=load_format,
+                custom_pipeline_name=custom_pipeline_name,
+                memory_pool_context_fn=memory_pool_context_fn,
+            )
         time_after_load = time.perf_counter()
 
         logger.info(
