@@ -298,13 +298,11 @@ class TestSyncQueueDrainingChecker:
         item = out_q.get_nowait()
         assert item["request_id"] == "req-1"
 
-    def test_rpc_behind_gen_result_not_found_on_first_poll(self):
+    def test_rpc_behind_gen_result_found_after_reorder(self):
         """If a generation result sits in front of an RPC result, the drainer
-        stops after putting the gen result back.  The RPC result behind it is
-        NOT found on that poll — it stays on the queue for a later attempt.
-
-        This is a known limitation of the current drain strategy
-        (stops at first non-RPC item)."""
+        stops after putting the gen result back at the *end* of the queue.
+        This moves the RPC result to the front, so it IS found on the next
+        poll."""
         rpc_results: dict = {}
         out_q = FakeQueue()
         checker = self._make_checker(rpc_results, 0, out_q)
@@ -313,18 +311,19 @@ class TestSyncQueueDrainingChecker:
         out_q.put(_make_gen_result("req-1"))  # blocks further draining
         out_q.put(_make_rpc_result(rpc_id))   # behind the gen result
 
-        # First poll: gen result is put back, RPC not found
+        # First poll: gen result is encountered, put back at end → break
+        # Queue becomes: [rpc_result, gen_result]
         assert checker(rpc_id) is None
-        # Queue now has gen_result (re-put) at front + rpc_result behind
         assert out_q.qsize() == 2
 
-        # Second poll: same thing — gen result blocks again
-        assert checker(rpc_id) is None
+        # Second poll: rpc_result is now at front → found
+        result = checker(rpc_id)
+        assert result is not None
+        assert result["rpc_id"] == rpc_id
 
-        # Simulate the generation loop consuming the gen result
-        out_q.get_nowait()  # consume gen result
-        # Now the rpc result is at the front
-        assert checker(rpc_id) is not None
+        # The gen result is still on the queue
+        gen = out_q.get_nowait()
+        assert gen["request_id"] == "req-1"
 
     def test_multiple_rpc_results_stashed(self):
         """When draining finds other RPC results (not the one we want),
@@ -550,25 +549,25 @@ class TestOmniStageCollectiveRpc:
 
         rpc_id = str(uuid.uuid4())
         # Put gen result, then rpc result, then another gen result
+        # Queue: [gen("req-1"), rpc, gen("req-2")]
         stage._out_q.put(_make_gen_result("req-1"))
         stage._out_q.put(_make_rpc_result(rpc_id, result="rpc_ok"))
         stage._out_q.put(_make_gen_result("req-2"))
 
-        # First poll: gen result blocks — rpc not found
+        # First poll: gen("req-1") is encountered, put back at end, break.
+        # Queue becomes: [rpc, gen("req-2"), gen("req-1")]
         assert stage._rpc_result_checker(rpc_id) is None
 
-        # Consume the gen result (simulating generation loop)
-        gen1 = stage._out_q.get_nowait()
-        assert gen1["request_id"] == "req-1"
-
-        # Now rpc result is at the front
+        # Second poll: rpc is now at the front → found
         result = stage._rpc_result_checker(rpc_id)
         assert result is not None
         assert result["result"] == "rpc_ok"
 
-        # The second gen result should still be there
-        gen2 = stage._out_q.get_nowait()
-        assert gen2["request_id"] == "req-2"
+        # Both gen results should still be on the queue
+        remaining = {stage._out_q.get_nowait()["request_id"],
+                     stage._out_q.get_nowait()["request_id"]}
+        assert remaining == {"req-1", "req-2"}
+        assert stage._out_q.empty()
 
 
 # ---------------------------------------------------------------------------
