@@ -10,14 +10,13 @@ Validates that:
 """
 
 import asyncio
-import multiprocessing as mp
 import queue
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -581,62 +580,58 @@ class TestAsyncOutputHandlerSeparation:
     """Tests that the async output handler correctly routes RPC results
     to _rpc_results and generation results to request state queues."""
 
-    @pytest.fixture
-    def event_loop(self):
-        loop = asyncio.new_event_loop()
-        yield loop
-        loop.close()
-
-    @pytest.mark.asyncio
-    async def test_output_handler_routes_rpc_and_gen(self):
+    def test_output_handler_routes_rpc_and_gen(self):
         """Simulate the output handler loop and verify routing."""
-        rpc_results: dict[int, dict[str, dict]] = {}
-        request_states: dict[str, Any] = {}
 
-        # Create a fake request state
-        from vllm_omni.entrypoints.client_request_state import ClientRequestState
-        req_state = ClientRequestState("req-1")
-        request_states["req-1"] = req_state
+        async def _run():
+            rpc_results: dict[int, dict[str, dict]] = {}
+            request_states: dict[str, Any] = {}
 
-        stage = FakeOmniStage(stage_id=0)
+            # Create a fake request state
+            from vllm_omni.entrypoints.client_request_state import ClientRequestState
+            req_state = ClientRequestState("req-1")
+            request_states["req-1"] = req_state
 
-        rpc_id = str(uuid.uuid4())
-        # Put both an RPC result and a gen result on the queue
-        stage._out_q.put(_make_rpc_result(rpc_id, result="rpc_data"))
-        stage._out_q.put(_make_gen_result("req-1"))
+            stage = FakeOmniStage(stage_id=0)
 
-        # Run one iteration of the output handler logic
-        stage_list = [stage]
-        for stage_id, s in enumerate(stage_list):
-            result = s.try_collect()
-            while result is not None:
-                if result.get("type") == "collective_rpc_result":
-                    rid = result.get("rpc_id")
-                    if rid:
-                        if stage_id not in rpc_results:
-                            rpc_results[stage_id] = {}
-                        rpc_results[stage_id][rid] = result
-                elif result.get("type") == "stage_ready":
-                    pass
-                else:
-                    req_id = result.get("request_id")
-                    rs = request_states.get(req_id)
-                    if rs is not None:
-                        await rs.queue.put(result)
-                        rs.stage_id = stage_id
+            rpc_id = str(uuid.uuid4())
+            # Put both an RPC result and a gen result on the queue
+            stage._out_q.put(_make_rpc_result(rpc_id, result="rpc_data"))
+            stage._out_q.put(_make_gen_result("req-1"))
+
+            # Run one iteration of the output handler logic
+            stage_list = [stage]
+            for stage_id, s in enumerate(stage_list):
                 result = s.try_collect()
+                while result is not None:
+                    if result.get("type") == "collective_rpc_result":
+                        rid = result.get("rpc_id")
+                        if rid:
+                            if stage_id not in rpc_results:
+                                rpc_results[stage_id] = {}
+                            rpc_results[stage_id][rid] = result
+                    elif result.get("type") == "stage_ready":
+                        pass
+                    else:
+                        req_id = result.get("request_id")
+                        rs = request_states.get(req_id)
+                        if rs is not None:
+                            await rs.queue.put(result)
+                            rs.stage_id = stage_id
+                    result = s.try_collect()
 
-        # RPC result should be in _rpc_results
-        assert 0 in rpc_results
-        assert rpc_id in rpc_results[0]
-        assert rpc_results[0][rpc_id]["result"] == "rpc_data"
+            # RPC result should be in _rpc_results
+            assert 0 in rpc_results
+            assert rpc_id in rpc_results[0]
+            assert rpc_results[0][rpc_id]["result"] == "rpc_data"
 
-        # Gen result should be in request state queue
-        gen = await asyncio.wait_for(req_state.queue.get(), timeout=1)
-        assert gen["request_id"] == "req-1"
+            # Gen result should be in request state queue
+            gen = await asyncio.wait_for(req_state.queue.get(), timeout=1)
+            assert gen["request_id"] == "req-1"
 
-    @pytest.mark.asyncio
-    async def test_many_rpc_results_routed_correctly(self):
+        asyncio.run(_run())
+
+    def test_many_rpc_results_routed_correctly(self):
         """Many RPC results should all land in _rpc_results with correct ids."""
         rpc_results: dict[int, dict[str, dict]] = {}
         stage = FakeOmniStage(stage_id=0)
@@ -661,58 +656,61 @@ class TestAsyncOutputHandlerSeparation:
         for rid in ids:
             assert rpc_results[0][rid]["result"] == f"data-{rid}"
 
-    @pytest.mark.asyncio
-    async def test_interleaved_rpc_gen_many(self):
+    def test_interleaved_rpc_gen_many(self):
         """Interleave many RPC and gen results; verify correct routing."""
-        rpc_results: dict[int, dict[str, dict]] = {}
-        request_states: dict[str, Any] = {}
 
-        from vllm_omni.entrypoints.client_request_state import ClientRequestState
+        async def _run():
+            rpc_results: dict[int, dict[str, dict]] = {}
+            request_states: dict[str, Any] = {}
 
-        num_gen = 30
-        num_rpc = 30
-        for i in range(num_gen):
-            req_id = f"req-{i}"
-            request_states[req_id] = ClientRequestState(req_id)
+            from vllm_omni.entrypoints.client_request_state import ClientRequestState
 
-        stage = FakeOmniStage(stage_id=0)
+            num_gen = 30
+            num_rpc = 30
+            for i in range(num_gen):
+                req_id = f"req-{i}"
+                request_states[req_id] = ClientRequestState(req_id)
 
-        # Interleave: gen, rpc, gen, rpc, ...
-        rpc_ids = []
-        for i in range(max(num_gen, num_rpc)):
-            if i < num_gen:
-                stage._out_q.put(_make_gen_result(f"req-{i}"))
-            if i < num_rpc:
-                rid = str(uuid.uuid4())
-                rpc_ids.append(rid)
-                stage._out_q.put(_make_rpc_result(rid, result=f"rpc-{i}"))
+            stage = FakeOmniStage(stage_id=0)
 
-        # Run handler
-        result = stage.try_collect()
-        while result is not None:
-            if result.get("type") == "collective_rpc_result":
-                rid = result.get("rpc_id")
-                if rid:
-                    if 0 not in rpc_results:
-                        rpc_results[0] = {}
-                    rpc_results[0][rid] = result
-            else:
-                req_id = result.get("request_id")
-                rs = request_states.get(req_id)
-                if rs is not None:
-                    await rs.queue.put(result)
-                    rs.stage_id = 0
+            # Interleave: gen, rpc, gen, rpc, ...
+            rpc_ids = []
+            for i in range(max(num_gen, num_rpc)):
+                if i < num_gen:
+                    stage._out_q.put(_make_gen_result(f"req-{i}"))
+                if i < num_rpc:
+                    rid = str(uuid.uuid4())
+                    rpc_ids.append(rid)
+                    stage._out_q.put(_make_rpc_result(rid, result=f"rpc-{i}"))
+
+            # Run handler
             result = stage.try_collect()
+            while result is not None:
+                if result.get("type") == "collective_rpc_result":
+                    rid = result.get("rpc_id")
+                    if rid:
+                        if 0 not in rpc_results:
+                            rpc_results[0] = {}
+                        rpc_results[0][rid] = result
+                else:
+                    req_id = result.get("request_id")
+                    rs = request_states.get(req_id)
+                    if rs is not None:
+                        await rs.queue.put(result)
+                        rs.stage_id = 0
+                result = stage.try_collect()
 
-        # All RPC results routed
-        assert len(rpc_results.get(0, {})) == num_rpc
-        # All gen results routed
-        for i in range(num_gen):
-            req_id = f"req-{i}"
-            gen = await asyncio.wait_for(
-                request_states[req_id].queue.get(), timeout=1
-            )
-            assert gen["request_id"] == req_id
+            # All RPC results routed
+            assert len(rpc_results.get(0, {})) == num_rpc
+            # All gen results routed
+            for i in range(num_gen):
+                req_id = f"req-{i}"
+                gen = await asyncio.wait_for(
+                    request_states[req_id].queue.get(), timeout=1
+                )
+                assert gen["request_id"] == req_id
+
+        asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -724,98 +722,101 @@ class TestAsyncCollectiveRpcConcurrent:
     """Test that multiple async collective_rpc calls execute concurrently
     and each gets the right result."""
 
-    @pytest.mark.asyncio
-    async def test_concurrent_async_rpcs(self):
+    def test_concurrent_async_rpcs(self):
         """Fire N async collective_rpc calls concurrently, each should get
         its own result."""
-        rpc_results: dict[int, dict[str, dict]] = {}
 
-        stage = FakeOmniStage(stage_id=0)
+        async def _run():
+            rpc_results: dict[int, dict[str, dict]] = {}
 
-        def async_checker(rpc_id: str) -> dict | None:
-            if 0 in rpc_results and rpc_id in rpc_results[0]:
-                return rpc_results[0].pop(rpc_id)
-            return None
+            stage = FakeOmniStage(stage_id=0)
 
-        stage._rpc_result_checker = async_checker
+            def async_checker(rpc_id: str) -> dict | None:
+                if 0 in rpc_results and rpc_id in rpc_results[0]:
+                    return rpc_results[0].pop(rpc_id)
+                return None
 
-        # Simulate an output handler that routes RPC results
-        handler_stop = asyncio.Event()
+            stage._rpc_result_checker = async_checker
 
-        async def fake_output_handler():
-            while not handler_stop.is_set():
-                result = stage.try_collect()
-                if result is not None:
-                    if result.get("type") == "collective_rpc_result":
-                        rid = result.get("rpc_id")
-                        if rid:
-                            if 0 not in rpc_results:
-                                rpc_results[0] = {}
-                            rpc_results[0][rid] = result
-                else:
+            # Simulate an output handler that routes RPC results
+            handler_stop = asyncio.Event()
+
+            async def fake_output_handler():
+                while not handler_stop.is_set():
+                    result = stage.try_collect()
+                    if result is not None:
+                        if result.get("type") == "collective_rpc_result":
+                            rid = result.get("rpc_id")
+                            if rid:
+                                if 0 not in rpc_results:
+                                    rpc_results[0] = {}
+                                rpc_results[0][rid] = result
+                    else:
+                        await asyncio.sleep(0.001)
+
+            handler_task = asyncio.create_task(fake_output_handler())
+
+            # Simulate a fake echo worker
+            worker_stop = threading.Event()
+
+            def echo_worker():
+                while not worker_stop.is_set():
+                    try:
+                        task = stage._in_q.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if task.get("type") == OmniStageTaskType.COLLECTIVE_RPC:
+                        time.sleep(0.005)  # simulate work
+                        stage._out_q.put(_make_rpc_result(
+                            task["rpc_id"],
+                            result=[f"echo-{task['method']}"],
+                        ))
+
+            worker_t = threading.Thread(target=echo_worker, daemon=True)
+            worker_t.start()
+
+            num_rpcs = 15
+            methods = [f"method_{i}" for i in range(num_rpcs)]
+
+            async def do_rpc(method: str) -> Any:
+                """Mimics OmniStage.collective_rpc but async-friendly."""
+                rpc_id = str(uuid.uuid4())
+                stage._in_q.put({
+                    "type": OmniStageTaskType.COLLECTIVE_RPC,
+                    "rpc_id": rpc_id,
+                    "method": method,
+                    "timeout": None,
+                    "args": (),
+                    "kwargs": None,
+                })
+
+                start = time.time()
+                while time.time() - start < 10:
+                    r = stage._rpc_result_checker(rpc_id)
+                    if r is not None:
+                        return r["result"]
                     await asyncio.sleep(0.001)
+                raise TimeoutError(f"RPC {method} timed out")
 
-        handler_task = asyncio.create_task(fake_output_handler())
-
-        # Simulate a fake echo worker
-        worker_stop = threading.Event()
-
-        def echo_worker():
-            while not worker_stop.is_set():
-                try:
-                    task = stage._in_q.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                if task.get("type") == OmniStageTaskType.COLLECTIVE_RPC:
-                    time.sleep(0.005)  # simulate work
-                    stage._out_q.put(_make_rpc_result(
-                        task["rpc_id"],
-                        result=[f"echo-{task['method']}"],
-                    ))
-
-        worker_t = threading.Thread(target=echo_worker, daemon=True)
-        worker_t.start()
-
-        num_rpcs = 15
-        methods = [f"method_{i}" for i in range(num_rpcs)]
-
-        async def do_rpc(method: str) -> Any:
-            """Mimics OmniStage.collective_rpc but async-friendly."""
-            rpc_id = str(uuid.uuid4())
-            stage._in_q.put({
-                "type": OmniStageTaskType.COLLECTIVE_RPC,
-                "rpc_id": rpc_id,
-                "method": method,
-                "timeout": None,
-                "args": (),
-                "kwargs": None,
-            })
-
-            start = time.time()
-            while time.time() - start < 10:
-                r = stage._rpc_result_checker(rpc_id)
-                if r is not None:
-                    return r["result"]
-                await asyncio.sleep(0.001)
-            raise TimeoutError(f"RPC {method} timed out")
-
-        results = await asyncio.gather(
-            *[do_rpc(m) for m in methods]
-        )
-
-        handler_stop.set()
-        worker_stop.set()
-        handler_task.cancel()
-        try:
-            await handler_task
-        except asyncio.CancelledError:
-            pass
-        worker_t.join(timeout=2)
-
-        for i, (method, result) in enumerate(zip(methods, results)):
-            assert result == [f"echo-{method}"], (
-                f"RPC {i} ({method}): expected echo-{method}, got {result}"
+            results = await asyncio.gather(
+                *[do_rpc(m) for m in methods]
             )
+
+            handler_stop.set()
+            worker_stop.set()
+            handler_task.cancel()
+            try:
+                await handler_task
+            except asyncio.CancelledError:
+                pass
+            worker_t.join(timeout=2)
+
+            for i, (method, result) in enumerate(zip(methods, results)):
+                assert result == [f"echo-{method}"], (
+                    f"RPC {i} ({method}): expected echo-{method}, got {result}"
+                )
+
+        asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
