@@ -8,7 +8,9 @@ import uuid
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Literal, overload
+from typing import Any, Literal, TypeVar, overload
+
+_R = TypeVar("_R")
 
 import huggingface_hub
 from omegaconf import OmegaConf
@@ -131,6 +133,10 @@ class OmniBase:
         self._ray_pg = None
         self._queue_cls = None
         self._ctx = None
+
+        # RPC results storage: {stage_id: {rpc_id: result}}
+        # Used by collective_rpc to retrieve results collected from the output queue
+        self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
 
         # Initialize stages - each stage will create appropriate instance based on stage_type
         # Stage workers will automatically create OmniLLM or OmniDiffusion instances
@@ -294,6 +300,8 @@ class OmniBase:
         self._start_stages(model)
         # Wait for all stages to report readiness before seeding
         self._wait_for_stages_ready(timeout=init_timeout)
+        # Set up RPC result checkers so that collective_rpc works
+        self._setup_rpc_result_checkers()
 
     def _is_async_chunk_enable(self, stage_args: list) -> bool:
         """get async chunk flag"""
@@ -394,6 +402,80 @@ class OmniBase:
         formatted_suggestions = "\n".join(f"  {i + 1}) {msg}" for i, msg in enumerate(suggestions))
 
         logger.warning(f"[{self._name}] Stage initialization timeout. Troubleshooting Steps:\n{formatted_suggestions}")
+
+    def _setup_rpc_result_checkers(self) -> None:
+        """Set up RPC result checkers for all stages.
+
+        Each checker reads from the shared ``_rpc_results`` dict so that
+        ``OmniStage.collective_rpc`` can retrieve results that were
+        collected by the orchestrator (or, in the sync path, by the
+        stage-level checker that drains the output queue).
+        """
+        for stage in self.stage_list:
+            sid = stage.stage_id
+
+            def make_rpc_checker(stage_id: int):
+                def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
+                    # First check the shared dict
+                    if stage_id in self._rpc_results and rpc_id in self._rpc_results[stage_id]:
+                        return self._rpc_results[stage_id].pop(rpc_id)
+                    # In the sync path there is no background output handler,
+                    # so drain the output queue ourselves and stash any
+                    # non-RPC results back.
+                    out_q = self._stage_out_queues[stage_id] if stage_id < len(self._stage_out_queues) else None
+                    if out_q is not None:
+                        import queue as _queue
+                        try:
+                            while True:
+                                item = out_q.get_nowait()
+                                if isinstance(item, dict) and item.get("type") == "collective_rpc_result":
+                                    item_rpc_id = item.get("rpc_id")
+                                    if item_rpc_id == rpc_id:
+                                        return item
+                                    # Stash for another caller
+                                    if stage_id not in self._rpc_results:
+                                        self._rpc_results[stage_id] = {}
+                                    self._rpc_results[stage_id][item_rpc_id] = item
+                                else:
+                                    # Non-RPC item — put it back
+                                    out_q.put(item)
+                                    break
+                        except _queue.Empty:
+                            pass
+                    return None
+                return rpc_checker
+
+            stage._rpc_result_checker = make_rpc_checker(sid)
+
+    def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        """Execute an RPC call on all stage workers.
+
+        Args:
+            method: Name of the worker method to execute, or a callable.
+            timeout: Maximum time in seconds to wait for execution.
+            args: Positional arguments to pass to the worker method.
+            kwargs: Keyword arguments to pass to the worker method.
+
+        Returns:
+            A list containing the results from each stage.
+        """
+        results: list[_R] = []
+        for stage in self.stage_list:
+            results.append(
+                stage.collective_rpc(
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
+                )
+            )
+        return results
 
     def start_profile(self, stages: list[int] | None = None) -> None:
         """Start profiling for specified stages.

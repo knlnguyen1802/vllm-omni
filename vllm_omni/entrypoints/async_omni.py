@@ -4,8 +4,10 @@ import asyncio
 import copy
 import time
 import weakref
-from collections.abc import AsyncGenerator, Iterable, Sequence
-from typing import Any
+from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from typing import Any, TypeVar
+
+_R = TypeVar("_R")
 
 from vllm.config import VllmConfig
 from vllm.inputs.preprocess import InputPreprocessor
@@ -96,9 +98,16 @@ class AsyncOmni(OmniBase):
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
 
+        # Sleep mode tracking
+        self._is_sleeping: bool = False
+
         # Request state tracking
         self.request_states: dict[str, ClientRequestState] = {}
         self.output_handler: asyncio.Task | None = None
+
+        # RPC results storage: {stage_id: {rpc_id: result}}
+        # Used to avoid race condition between output_handler and collective_rpc
+        self._rpc_results: dict[int, dict[str, dict[str, Any]]] = {}
 
         super().__init__(model, **kwargs)
 
@@ -222,6 +231,25 @@ class AsyncOmni(OmniBase):
             self.input_processor = None
             self.io_processor = None
             self.model_config = None
+
+    def _setup_rpc_result_checkers(self) -> None:
+        """Override base class to use async-friendly RPC result checkers.
+
+        In the async path the output_handler task drains the output queues
+        and stashes collective_rpc results into ``_rpc_results``.  The
+        checker therefore only needs to look there (no queue draining).
+        """
+        for stage in self.stage_list:
+            sid = stage.stage_id
+
+            def make_rpc_checker(stage_id: int):
+                def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
+                    if stage_id in self._rpc_results and rpc_id in self._rpc_results[stage_id]:
+                        return self._rpc_results[stage_id].pop(rpc_id)
+                    return None
+                return rpc_checker
+
+            stage._rpc_result_checker = make_rpc_checker(sid)
 
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC.
@@ -565,6 +593,15 @@ class AsyncOmni(OmniBase):
                             # so we wait for a short time and try again
                             await asyncio.sleep(0.05)
                             continue
+                        # Handle collective_rpc results separately to avoid
+                        # race condition with the polling in collective_rpc
+                        if result.get("type") == "collective_rpc_result":
+                            rpc_id = result.get("rpc_id")
+                            if rpc_id:
+                                if stage_id not in self._rpc_results:
+                                    self._rpc_results[stage_id] = {}
+                                self._rpc_results[stage_id][rpc_id] = result
+                            continue
                         req_id = result.get("request_id")
                         req_state = request_states.get(req_id)
                         if req_state is None:
@@ -681,19 +718,60 @@ class AsyncOmni(OmniBase):
     async def reset_prefix_cache(self, reset_running_requests: bool = False) -> bool:
         pass
 
+    async def collective_rpc(
+        self,
+        method: str | Callable[..., _R],
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[_R]:
+        """Execute an RPC call on all stages asynchronously.
+
+        Args:
+            method: Name of the method to execute or callable
+            timeout: Optional timeout in seconds
+            args: Positional arguments for the method
+            kwargs: Keyword arguments for the method
+
+        Returns:
+            List of results from each stage
+        """
+        self._run_output_handler()
+        # Run synchronous collective_rpc in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+
+        async def run_stage_rpc(stage: OmniStage) -> _R:
+            return await loop.run_in_executor(
+                None,
+                stage.collective_rpc,
+                method,
+                timeout,
+                args,
+                kwargs,
+            )
+
+        # Run all stages concurrently
+        results = await asyncio.gather(
+            *[run_stage_rpc(stage) for stage in self.stage_list]
+        )
+        return list(results)
+
     async def sleep(self, level: int = 1) -> None:
-        pass
+        self._is_sleeping = True
+        await self.collective_rpc(method="sleep", args=(level,))
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
-        pass
+        self._is_sleeping = False
+        await self.collective_rpc(method="wake_up", args=(tags,))
 
     async def is_sleeping(self) -> bool:
         """Check whether the engine is sleeping"""
-        return False
+        return getattr(self, "_is_sleeping", False)
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
-        return False
+        result = await self.collective_rpc(method="add_lora", args=(lora_request,))
+        return result[0][0]
 
     async def encode(
         self,
