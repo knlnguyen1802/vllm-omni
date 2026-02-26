@@ -168,6 +168,80 @@ class AsyncOmniDiffusion:
             result.request_id = request_id
         return result
 
+    async def generate_batch(
+        self,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        request_ids: list[str] | None = None,
+        lora_request: LoRARequest | None = None,
+    ) -> list[OmniRequestOutput]:
+        """Generate outputs for a batch of prompts asynchronously.
+
+        This batches multiple prompts into a single DiffusionEngine.step() call,
+        which is more efficient than calling generate() per-prompt (especially
+        for models that support native batch inference like CFG-parallel).
+
+        Args:
+            prompts: List of prompts (text or multimodal dicts)
+            sampling_params: Sampling parameters (shared across all prompts)
+            request_ids: Optional list of unique IDs; auto-generated if absent
+            lora_request: Optional LoRA adapter request
+
+        Returns:
+            List of OmniRequestOutput, one per prompt
+
+        Raises:
+            RuntimeError: If generation fails
+        """
+        if request_ids is None:
+            request_ids = [f"diff-{uuid.uuid4().hex[:16]}" for _ in prompts]
+        elif len(request_ids) < len(prompts):
+            request_ids = list(request_ids)
+            request_ids.extend(
+                f"diff-{uuid.uuid4().hex[:16]}"
+                for _ in range(len(prompts) - len(request_ids))
+            )
+
+        if sampling_params.guidance_scale:
+            sampling_params.guidance_scale_provided = True
+
+        if lora_request is not None:
+            sampling_params.lora_request = lora_request
+
+        request = OmniDiffusionRequest(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            request_ids=request_ids,
+        )
+
+        logger.debug(
+            "Starting batch generation for %d requests: %s",
+            len(prompts),
+            request_ids,
+        )
+
+        loop = asyncio.get_event_loop()
+        try:
+            results = await loop.run_in_executor(
+                self._executor,
+                self.engine.step,
+                request,
+            )
+        except Exception as e:
+            logger.error(
+                "Batch generation failed for requests %s: %s",
+                request_ids,
+                e,
+            )
+            raise RuntimeError(f"Diffusion batch generation failed: {e}") from e
+
+        # Ensure every result has a request_id
+        for idx, result in enumerate(results):
+            if not result.request_id and idx < len(request_ids):
+                result.request_id = request_ids[idx]
+
+        return results
+
     async def generate_stream(
         self,
         prompt: str,

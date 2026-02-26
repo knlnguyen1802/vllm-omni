@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import time
+import uuid
 import weakref
 from collections.abc import AsyncGenerator, Iterable, Sequence
 from typing import Any
@@ -359,6 +360,67 @@ class AsyncOmni(OmniBase):
             await self.abort(request_id)
             logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
+
+    async def generate_batch(
+        self,
+        prompts: Sequence[OmniPromptType],
+        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
+        *,
+        output_modalities: list[str] | None = None,
+    ) -> list[OmniRequestOutput]:
+        """Generate outputs for a batch of prompts asynchronously.
+
+        Submits all prompts to the pipeline with individual request IDs.
+        The stage workers will automatically batch them together for
+        efficient inference (e.g. a single DiffusionEngine.step() call).
+
+        This mirrors the synchronous ``Omni.generate()`` which already
+        accepts a list of prompts.
+
+        Args:
+            prompts: List of prompts to process.
+            sampling_params_list: List of SamplingParams, one per stage.
+                If None, uses default sampling params for each stage.
+            output_modalities: Optional list of output modalities.
+
+        Returns:
+            List of OmniRequestOutput, one per input prompt, in the
+            same order as the input prompts.
+
+        Raises:
+            ValueError: If sampling_params_list has incorrect length.
+        """
+        if not prompts:
+            return []
+
+        # Generate unique request IDs for each prompt
+        batch_id = uuid.uuid4().hex[:8]
+        request_ids = [f"batch-{batch_id}-{i}" for i in range(len(prompts))]
+
+        # Launch all requests concurrently
+        results: dict[str, OmniRequestOutput] = {}
+
+        async def _collect_single(prompt: OmniPromptType, request_id: str) -> None:
+            """Collect the final output for a single prompt."""
+            last_output: OmniRequestOutput | None = None
+            async for output in self.generate(
+                prompt,
+                request_id,
+                sampling_params_list,
+                output_modalities=output_modalities,
+            ):
+                last_output = output
+            if last_output is not None:
+                results[request_id] = last_output
+
+        tasks = [
+            asyncio.create_task(_collect_single(prompt, rid))
+            for prompt, rid in zip(prompts, request_ids)
+        ]
+        await asyncio.gather(*tasks)
+
+        # Return results in the original prompt order
+        return [results[rid] for rid in request_ids if rid in results]
 
     async def _process_async_results(
         self,
