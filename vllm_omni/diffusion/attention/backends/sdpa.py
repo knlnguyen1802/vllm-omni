@@ -83,6 +83,11 @@ class SDPAImpl(AttentionImpl):
         # not integer. Cast if needed to avoid dtype mismatch errors in batched mode.
         if attention_mask is not None and not attention_mask.dtype.is_floating_point and attention_mask.dtype != torch.bool:
             attention_mask = attention_mask.to(torch.bool)
+        # Reshape 2D mask (B, Sk) -> (B, 1, 1, Sk) so it broadcasts correctly
+        # to (B, H, Sq, Sk). SDPA treats a bare 2D tensor as (Sq, Sk) with no
+        # batch dimension, which causes a shape error when batch_size != seq_len.
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
             key,

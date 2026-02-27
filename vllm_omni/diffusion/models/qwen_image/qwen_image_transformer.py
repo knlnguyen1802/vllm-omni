@@ -647,6 +647,13 @@ class QwenImageCrossAttention(nn.Module):
                         )
                     )
                 joint_mask = torch.cat(mask_list, dim=1) if len(mask_list) > 1 else mask_list[0]
+                # Anchor joint_mask's sequence dim to joint_key's sequence dim.
+                # encoder_hidden_states_mask and txt_key originate from different
+                # graph paths so torch.compile assigns them different symbolic
+                # variables (s70 vs s31) even though they equal txt_seq at runtime.
+                # Slicing with joint_key.shape[1] forces both to share the same
+                # symbolic expression, preventing an expand error in SDPA.
+                joint_mask = joint_mask[:, : joint_key.shape[1]]
                 attn_metadata = AttentionMetadata(attn_mask=joint_mask)
 
             joint_hidden_states = self.attn(joint_query, joint_key, joint_value, attn_metadata)
