@@ -79,6 +79,10 @@ class SDPAImpl(AttentionImpl):
     ) -> torch.Tensor:
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        # scaled_dot_product_attention requires attn_mask to be bool or float,
+        # not integer. Cast if needed to avoid dtype mismatch errors in batched mode.
+        if attention_mask is not None and not attention_mask.dtype.is_floating_point and attention_mask.dtype != torch.bool:
+            attention_mask = attention_mask.to(torch.bool)
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
             key,
