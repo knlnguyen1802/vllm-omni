@@ -16,9 +16,7 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import torch
-import zmq
 from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
-from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes
@@ -320,27 +318,17 @@ class WorkerProc:
         self,
         od_config: OmniDiffusionConfig,
         gpu_id: int,
-        broadcast_handle,
+        broadcast_queue: mp.Queue,
+        result_queue: mp.Queue,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ):
         self.od_config = od_config
         self.gpu_id = gpu_id
 
-        # Inter-process Communication
-        self.context = zmq.Context(io_threads=2)
-
-        # Initialize MessageQueue reader from handle
-        self.mq = MessageQueue.create_from_handle(broadcast_handle, gpu_id)
-
-        self.result_mq = None
-        self.result_mq_handle = None
-
-        # Setup result sender (only for rank 0)
-        if gpu_id == 0:
-            self.result_mq = MessageQueue(n_reader=1, n_local_reader=1, local_reader_ranks=[0])
-            self.result_mq_handle = self.result_mq.export_handle()
-            logger.info(f"Worker {gpu_id} created result MessageQueue")
+        # Inter-process Communication via mp.Queue
+        self.broadcast_queue = broadcast_queue  # per-worker queue for receiving commands
+        self.result_queue = result_queue if gpu_id == 0 else None  # only rank-0 sends results
 
         assert od_config.master_port is not None
 
@@ -366,12 +354,12 @@ class WorkerProc:
 
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
-        if self.result_mq is not None:
-            self.result_mq.enqueue(output)
+        if self.result_queue is not None:
+            self.result_queue.put(output)
 
     def recv_message(self):
         """Receive messages from broadcast queue."""
-        return self.mq.dequeue(indefinite=True)
+        return self.broadcast_queue.get()  # blocks until a message is available
 
     def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
@@ -382,7 +370,7 @@ class WorkerProc:
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
-        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
+        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_queue is not None
 
         if not should_execute:
             return None, False
@@ -422,7 +410,7 @@ class WorkerProc:
                         self.return_result(result)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
-                    if self.result_mq is not None:
+                    if self.result_queue is not None:
                         self.return_result(DiffusionOutput(error=str(e)))
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
@@ -441,25 +429,21 @@ class WorkerProc:
                     )
                     output = DiffusionOutput(error=str(e))
 
-                try:
-                    self.return_result(output)
-                except zmq.ZMQError as e:
-                    logger.error(f"ZMQ error sending reply: {e}")
-                    continue
+                self.return_result(output)
 
         logger.info("event loop terminated.")
         try:
             self.worker.shutdown()
         except Exception as exc:
             logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
-        self.context.term()
 
     @staticmethod
     def worker_main(
         rank: int,
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
-        broadcast_handle,
+        broadcast_queue: mp.Queue,
+        result_queue: mp.Queue,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
@@ -470,17 +454,13 @@ class WorkerProc:
         worker_proc = WorkerProc(
             od_config,
             gpu_id=rank,
-            broadcast_handle=broadcast_handle,
+            broadcast_queue=broadcast_queue,
+            result_queue=result_queue,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
-            }
-        )
+        pipe_writer.send({"status": "ready"})
         worker_proc.worker_busy_loop()
         logger.info(f"Worker {rank}: Shutdown complete.")
 

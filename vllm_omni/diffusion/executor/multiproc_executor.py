@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import queue
 import time
 import weakref
 from dataclasses import dataclass
@@ -28,8 +29,7 @@ class BackgroundResources:
         """Clean up background resources."""
         if self.scheduler is not None:
             try:
-                for _ in range(self.scheduler.num_workers):
-                    self.scheduler.mq.enqueue(SHUTDOWN_MESSAGE)
+                self.scheduler.broadcast(SHUTDOWN_MESSAGE)
                 self.scheduler.close()
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
@@ -51,31 +51,32 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._processes: list[mp.Process] = []
         self._closed = False
 
-        # Initialize scheduler
+        # Initialize scheduler (creates broadcast_queues and result_queue)
         self.scheduler = Scheduler()
         self.scheduler.initialize(self.od_config)
-        broadcast_handle = self.scheduler.get_broadcast_handle()
 
-        # Launch workers
-        processes, result_handle = self._launch_workers(broadcast_handle)
-
-        if result_handle is not None:
-            self.scheduler.initialize_result_queue(result_handle)
-        else:
-            logger.error("Failed to get result queue handle from workers")
+        # Launch workers, passing queues directly
+        processes = self._launch_workers(
+            self.scheduler.get_broadcast_queues(),
+            self.scheduler.get_result_queue(),
+        )
 
         self._processes = processes
 
         self.resources = BackgroundResources(scheduler=self.scheduler, processes=self._processes)
         self._finalizer = weakref.finalize(self, self.resources)
 
-    def _launch_workers(self, broadcast_handle):
+    def _launch_workers(
+        self,
+        broadcast_queues: list[mp.Queue],
+        result_queue: mp.Queue,
+    ) -> list[mp.Process]:
         od_config = self.od_config
         logger.info("Starting server...")
 
         num_gpus = od_config.num_gpus
         mp.set_start_method("spawn", force=True)
-        processes = []
+        processes: list[mp.Process] = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
         worker_extension_cls = od_config.worker_extension_cls
@@ -94,7 +95,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     i,  # rank
                     od_config,
                     writer,
-                    broadcast_handle,
+                    broadcast_queues[i],  # per-worker broadcast queue
+                    result_queue,          # shared result queue
                     worker_extension_cls,
                     custom_pipeline_args,
                 ),
@@ -106,8 +108,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             processes.append(process)
 
         # Wait for all workers to be ready
-        scheduler_infos = []
-        result_handle = None
         for writer in scheduler_pipe_writers:
             writer.close()
 
@@ -123,15 +123,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if data["status"] != "ready":
                 raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-            if i == 0:
-                result_handle = data.get("result_handle")
-
-            scheduler_infos.append(data)
             reader.close()
 
         logger.debug("All workers are ready")
 
-        return processes, result_handle
+        return processes
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         return self.scheduler.add_req(request)
@@ -160,20 +156,18 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         }
 
         try:
-            # Broadcast RPC request to all workers via unified message queue
-            self.scheduler.mq.enqueue(rpc_request)
+            # Broadcast RPC request to all workers
+            self.scheduler.broadcast(rpc_request)
 
             # Determine which workers we expect responses from
             num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
 
             responses = []
             for _ in range(num_responses):
-                dequeue_timeout = None if deadline is None else (deadline - time.monotonic())
                 try:
-                    if self.scheduler.result_mq is None:
-                        raise RuntimeError("Result queue not initialized")
-
-                    response = self.scheduler.result_mq.dequeue(timeout=dequeue_timeout)
+                    response = self.scheduler.result_queue.get(
+                        timeout=None if deadline is None else max(0, deadline - time.monotonic()),
+                    )
 
                     # Check if response indicates an error
                     if isinstance(response, dict) and response.get("status") == "error":
@@ -183,7 +177,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         )
 
                     responses.append(response)
-                except TimeoutError as e:
+                except queue.Empty as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
 
             return responses[0] if unique_reply_rank is not None else responses
