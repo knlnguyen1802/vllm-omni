@@ -103,6 +103,16 @@ class AsyncOmni(OmniBase):
 
         super().__init__(model, **kwargs)
 
+        # Derive orchestrator-level max_batch_size from stage configs.
+        # Use the maximum across all stages so the API layer can route
+        # through generate_batch when batching is enabled.
+        self._max_batch_size: int = self._resolve_max_batch_size()
+        if self._max_batch_size > 1:
+            logger.info(
+                f"[{self._name}] API-level batching enabled: "
+                f"max_batch_size={self._max_batch_size}"
+            )
+
         # Register weak reference cleanup (called on garbage collection)
         self._weak_finalizer = weakref.finalize(
             self,
@@ -233,6 +243,20 @@ class AsyncOmni(OmniBase):
         if hasattr(self, "_weak_finalizer"):
             self._weak_finalizer()
 
+    def _resolve_max_batch_size(self) -> int:
+        """Derive the orchestrator-level max_batch_size from stage configs.
+
+        Returns the maximum ``runtime.max_batch_size`` found across all stages.
+        If no stage specifies it, defaults to 1 (no API-level batching).
+        """
+        max_bs = 1
+        for cfg in self.stage_configs:
+            runtime = getattr(cfg, "runtime", None)
+            if runtime is not None:
+                stage_bs = int(getattr(runtime, "max_batch_size", 1) or 1)
+                max_bs = max(max_bs, stage_bs)
+        return max_bs
+
     async def generate(
         self,
         prompt: OmniPromptType,
@@ -243,11 +267,11 @@ class AsyncOmni(OmniBase):
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt asynchronously.
 
-        Coordinates multi-stage pipeline through YAML configuration.
-        Each stage will use AsyncOmniLLM or AsyncOmniDiffusion based on stage_type.
-        Processes the prompt through all stages in the pipeline and yields
-        outputs as they become available. Each stage uses its corresponding
-        sampling parameters from the sampling_params_list.
+        When ``max_batch_size > 1`` (derived from stage configs), the request
+        is routed through :meth:`generate_batch` so that the stage workers
+        can batch it together with other concurrent requests for more
+        efficient inference.  Otherwise the request is processed individually
+        through the multi-stage pipeline.
 
         Args:
             prompt: Prompt to process. Can be a text string, token IDs,
@@ -271,6 +295,34 @@ class AsyncOmni(OmniBase):
             await self._pause_cond.wait_for(lambda: not self._paused)
 
         logger.debug(f"[{self._name}] generate() called")
+
+        # ---- Batched path: route through generate_batch ----
+        if self._max_batch_size > 1:
+            results = await self.generate_batch(
+                prompts=[prompt],
+                sampling_params_list=sampling_params_list,
+                output_modalities=output_modalities,
+            )
+            for result in results:
+                yield result
+            return
+
+        # ---- Single-request path ----
+        async for output in self._generate_single(
+            prompt, request_id, sampling_params_list, output_modalities=output_modalities
+        ):
+            yield output
+
+    async def _generate_single(
+        self,
+        prompt: OmniPromptType,
+        request_id: str,
+        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
+        *,
+        output_modalities: list[str] | None = None,
+    ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Internal single-request pipeline. Called directly by
+        :meth:`generate_batch` for each prompt in the batch."""
         try:
             # Start output handler on the first call to generate()
             self._run_output_handler()
@@ -403,7 +455,7 @@ class AsyncOmni(OmniBase):
         async def _collect_single(prompt: OmniPromptType, request_id: str) -> None:
             """Collect the final output for a single prompt."""
             last_output: OmniRequestOutput | None = None
-            async for output in self.generate(
+            async for output in self._generate_single(
                 prompt,
                 request_id,
                 sampling_params_list,
