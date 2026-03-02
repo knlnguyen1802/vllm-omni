@@ -274,17 +274,15 @@ def _build_collect_diffusion_batch(in_q, max_batch_size, batch_timeout=0.05):
 class TestCollectDiffusionBatch:
     """Tests for the _collect_diffusion_batch closure logic."""
 
-    @pytest.mark.asyncio
-    async def test_max_batch_size_1_returns_single_task(self):
+    def test_max_batch_size_1_returns_single_task(self):
         q = _queue_module.Queue()
         fn = _build_collect_diffusion_batch(q, max_batch_size=1)
         first = _make_task("r0")
-        batch, shutdown = await fn(first)
+        batch, shutdown = asyncio.run(fn(first))
         assert batch == [first]
         assert shutdown is False
 
-    @pytest.mark.asyncio
-    async def test_collects_up_to_max_batch_size(self):
+    def test_collects_up_to_max_batch_size(self):
         q = _queue_module.Queue()
         sp = OmniDiffusionSamplingParams(num_inference_steps=1)
         tasks = [_make_task(f"r{i}", sampling_params=sp) for i in range(3)]
@@ -293,23 +291,21 @@ class TestCollectDiffusionBatch:
             q.put(t)
 
         fn = _build_collect_diffusion_batch(q, max_batch_size=3)
-        batch, shutdown = await fn(tasks[0])
+        batch, shutdown = asyncio.run(fn(tasks[0]))
 
         assert len(batch) == 3
         assert shutdown is False
 
-    @pytest.mark.asyncio
-    async def test_stops_early_on_empty_queue(self):
+    def test_stops_early_on_empty_queue(self):
         q = _queue_module.Queue()  # empty
         fn = _build_collect_diffusion_batch(q, max_batch_size=5, batch_timeout=0.01)
         first = _make_task("r0")
-        batch, shutdown = await fn(first)
+        batch, shutdown = asyncio.run(fn(first))
         # Only the first task — queue was empty
         assert len(batch) == 1
         assert shutdown is False
 
-    @pytest.mark.asyncio
-    async def test_defers_mismatched_sampling_params(self):
+    def test_defers_mismatched_sampling_params(self):
         q = _queue_module.Queue()
         sp_a = OmniDiffusionSamplingParams(num_inference_steps=1)
         sp_b = OmniDiffusionSamplingParams(num_inference_steps=50)
@@ -318,7 +314,7 @@ class TestCollectDiffusionBatch:
         q.put(mismatched)
 
         fn = _build_collect_diffusion_batch(q, max_batch_size=2, batch_timeout=0.01)
-        batch, shutdown = await fn(first)
+        batch, shutdown = asyncio.run(fn(first))
 
         # batch should only contain the first task
         assert len(batch) == 1
@@ -329,22 +325,20 @@ class TestCollectDiffusionBatch:
         assert requeued["request_id"] == "r1"
         assert shutdown is False
 
-    @pytest.mark.asyncio
-    async def test_detects_shutdown_task_string(self):
+    def test_detects_shutdown_task_string(self):
         q = _queue_module.Queue()
         q.put(SHUTDOWN_TASK)
         fn = _build_collect_diffusion_batch(q, max_batch_size=3)
-        batch, shutdown = await fn(_make_task("r0"))
+        batch, shutdown = asyncio.run(fn(_make_task("r0")))
         assert shutdown is True
         # SHUTDOWN_TASK should have been re-queued
         assert q.get_nowait() == SHUTDOWN_TASK
 
-    @pytest.mark.asyncio
-    async def test_detects_shutdown_dict_type(self):
+    def test_detects_shutdown_dict_type(self):
         q = _queue_module.Queue()
         q.put({"type": OmniStageTaskType.SHUTDOWN})
         fn = _build_collect_diffusion_batch(q, max_batch_size=3)
-        batch, shutdown = await fn(_make_task("r0"))
+        batch, shutdown = asyncio.run(fn(_make_task("r0")))
         assert shutdown is True
 
 
@@ -444,44 +438,41 @@ async def _run_generation_batch_diffusion(
 class TestGenerationBatchDiffusion:
     """Tests for the generation_batch_diffusion closure logic."""
 
-    @pytest.mark.asyncio
-    async def test_calls_generate_batch_with_inputs(self):
+    def test_calls_generate_batch_with_inputs(self):
         sp = OmniDiffusionSamplingParams(num_inference_steps=1)
         tasks = [_make_task("r0", "cat", sp), _make_task("r1", "dog", sp)]
         r0 = _make_result("r0")
         r1 = _make_result("r1")
 
-        gen_items, out_items = await _run_generation_batch_diffusion(
+        gen_items, out_items = asyncio.run(_run_generation_batch_diffusion(
             tasks, mock_generate_batch_result=[r0, r1]
-        )
+        ))
 
         assert len(gen_items) == 2
         assert out_items == []
 
-    @pytest.mark.asyncio
-    async def test_results_mapped_to_request_ids(self):
+    def test_results_mapped_to_request_ids(self):
         sp = OmniDiffusionSamplingParams(num_inference_steps=1)
         tasks = [_make_task("r0", sampling_params=sp), _make_task("r1", sampling_params=sp)]
         r0 = _make_result("r0")
         r1 = _make_result("r1")
 
-        gen_items, _ = await _run_generation_batch_diffusion(
+        gen_items, _ = asyncio.run(_run_generation_batch_diffusion(
             tasks, mock_generate_batch_result=[r0, r1]
-        )
+        ))
 
         rids_in_queue = {item[0] for item in gen_items}
         assert rids_in_queue == {"r0", "r1"}
 
-    @pytest.mark.asyncio
-    async def test_unmapped_results_cycled_to_rids(self):
+    def test_unmapped_results_cycled_to_rids(self):
         """Results with unknown request_ids must be assigned to known rids."""
         sp = OmniDiffusionSamplingParams(num_inference_steps=1)
         tasks = [_make_task("r0", sampling_params=sp)]
         mystery_result = _make_result(request_id="unknown-rid")
 
-        gen_items, out_items = await _run_generation_batch_diffusion(
+        gen_items, out_items = asyncio.run(_run_generation_batch_diffusion(
             tasks, mock_generate_batch_result=[mystery_result]
-        )
+        ))
 
         # Should have been remapped to r0
         assert len(gen_items) == 1
@@ -489,15 +480,14 @@ class TestGenerationBatchDiffusion:
         assert item_rid == "r0"
         assert item_output.request_id == "r0"
 
-    @pytest.mark.asyncio
-    async def test_generate_batch_exception_emits_error_payloads(self):
+    def test_generate_batch_exception_emits_error_payloads(self):
         sp = OmniDiffusionSamplingParams(num_inference_steps=1)
         tasks = [_make_task("r0", sampling_params=sp), _make_task("r1", sampling_params=sp)]
 
-        gen_items, out_items = await _run_generation_batch_diffusion(
+        gen_items, out_items = asyncio.run(_run_generation_batch_diffusion(
             tasks,
             mock_generate_batch_raises=RuntimeError("gpu OOM"),
-        )
+        ))
 
         assert gen_items == []
         assert len(out_items) == 2
@@ -507,16 +497,15 @@ class TestGenerationBatchDiffusion:
             assert "error" in o
             assert "gpu OOM" in o["error"]
 
-    @pytest.mark.asyncio
-    async def test_gen_ms_is_non_negative(self):
+    def test_gen_ms_is_non_negative(self):
         """Generation timing should never be negative."""
         sp = OmniDiffusionSamplingParams(num_inference_steps=1)
         tasks = [_make_task("r0", sampling_params=sp)]
         result = _make_result("r0")
 
-        gen_items, _ = await _run_generation_batch_diffusion(
+        gen_items, _ = asyncio.run(_run_generation_batch_diffusion(
             tasks, mock_generate_batch_result=[result]
-        )
+        ))
 
         assert len(gen_items) == 1
         _, _, gen_ms = gen_items[0]
