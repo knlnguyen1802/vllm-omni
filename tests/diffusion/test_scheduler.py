@@ -48,6 +48,18 @@ def _make_od_config(num_gpus: int = 2):
     return cfg
 
 
+class _FakeRequest:
+    """
+    Minimal picklable request stub.
+
+    ``mp.Queue`` serialises every item via ``pickle`` in a background feeder
+    thread.  ``MagicMock`` is **not** picklable, so the feeder thread silently
+    crashes and the queue stays empty.  This plain module-level class IS
+    picklable and is therefore safe to send through ``mp.Queue``.
+    """
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -149,11 +161,10 @@ class TestSchedulerAddReq:
         return s
 
     def _make_request(self):
-        from unittest.mock import MagicMock
-        from vllm_omni.diffusion.request import OmniDiffusionRequest
-
-        req = MagicMock(spec=OmniDiffusionRequest)
-        return req
+        # Must be picklable: mp.Queue serialises objects through a pipe via
+        # a background feeder thread.  MagicMock is not picklable, which would
+        # cause the feeder thread to crash silently, leaving the queue empty.
+        return _FakeRequest()
 
     def test_add_req_returns_worker_result(self):
         from vllm_omni.diffusion.data import DiffusionOutput
@@ -185,7 +196,7 @@ class TestSchedulerAddReq:
             assert msg["type"] == "rpc"
             assert msg["method"] == "generate"
             assert msg["exec_all_ranks"] is True
-            assert msg["args"][0] is req
+            assert isinstance(msg["args"][0], _FakeRequest)
 
     def test_add_req_raises_on_worker_error_signal(self):
         error_payload = {"status": "error", "error": "something went wrong"}
