@@ -152,7 +152,7 @@ class AsyncOmni(OmniBase):
                 "runtime": {
                     "process": True,
                     "devices": devices,
-                    "max_batch_size": 1,
+                    "max_batch_size": kwargs.get("max_batch_size", 1),
                 },
                 "engine_args": {
                     "parallel_config": parallel_config,
