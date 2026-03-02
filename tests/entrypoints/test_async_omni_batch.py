@@ -26,7 +26,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -78,20 +78,18 @@ class TestAsyncOmniBatchGenerate:
     # 1. Empty prompt list
     # ------------------------------------------------------------------
 
-    @pytest.mark.asyncio
-    async def test_empty_prompts_returns_empty_list(self):
+    def test_empty_prompts_returns_empty_list(self):
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         engine = self._make_engine()
-        result = await AsyncOmni.generate_batch(engine, prompts=[])
+        result = asyncio.run(AsyncOmni.generate_batch(engine, prompts=[]))
         assert result == []
 
     # ------------------------------------------------------------------
     # 2. Single prompt – forwards to generate() and captures last output
     # ------------------------------------------------------------------
 
-    @pytest.mark.asyncio
-    async def test_single_prompt_returns_last_output(self):
+    def test_single_prompt_returns_last_output(self):
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         engine = self._make_engine()
@@ -111,7 +109,7 @@ class TestAsyncOmniBatchGenerate:
                 yield o
 
         with patch.object(AsyncOmni, "generate", side_effect=_fake_generate):
-            results = await AsyncOmni.generate_batch(engine, prompts=[prompt])
+            results = asyncio.run(AsyncOmni.generate_batch(engine, prompts=[prompt]))
 
         assert len(results) == 1
         assert results[0].text == "Paris!"
@@ -120,8 +118,7 @@ class TestAsyncOmniBatchGenerate:
     # 3. Multiple prompts – order preserved
     # ------------------------------------------------------------------
 
-    @pytest.mark.asyncio
-    async def test_multiple_prompts_order_preserved(self):
+    def test_multiple_prompts_order_preserved(self):
         """
         Simulate tasks completing in reverse order.  generate_batch must
         still return results in the original prompt order.
@@ -142,7 +139,7 @@ class TestAsyncOmniBatchGenerate:
             yield out
 
         with patch.object(AsyncOmni, "generate", side_effect=_fake_generate):
-            results = await AsyncOmni.generate_batch(engine, prompts=prompts)
+            results = asyncio.run(AsyncOmni.generate_batch(engine, prompts=prompts))
 
         assert len(results) == 3
         # Results must correspond to prompts in order
@@ -155,8 +152,7 @@ class TestAsyncOmniBatchGenerate:
     # 4. Unique, stable request IDs per batch
     # ------------------------------------------------------------------
 
-    @pytest.mark.asyncio
-    async def test_unique_request_ids_per_batch(self):
+    def test_unique_request_ids_per_batch(self):
         """Each call to generate_batch must create new request IDs."""
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
@@ -173,10 +169,13 @@ class TestAsyncOmniBatchGenerate:
             out.request_id = request_id
             yield out
 
-        with patch.object(AsyncOmni, "generate", side_effect=_fake_generate):
+        async def _run_twice():
             await AsyncOmni.generate_batch(engine, prompts=prompts)
             captured_ids.append([])  # start fresh for second call
             await AsyncOmni.generate_batch(engine, prompts=prompts)
+
+        with patch.object(AsyncOmni, "generate", side_effect=_fake_generate):
+            asyncio.run(_run_twice())
 
         # IDs from the two calls must not share the same batch prefix
         batch1_ids = [r for r in captured_ids[0] if r.startswith("batch-")]
@@ -197,8 +196,7 @@ class TestAsyncOmniBatchGenerate:
     # 5. Error propagation – exception inside generate() bubbles up
     # ------------------------------------------------------------------
 
-    @pytest.mark.asyncio
-    async def test_error_in_generate_propagates(self):
+    def test_error_in_generate_propagates(self):
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         engine = self._make_engine()
@@ -209,14 +207,13 @@ class TestAsyncOmniBatchGenerate:
 
         with patch.object(AsyncOmni, "generate", side_effect=_failing_generate):
             with pytest.raises(RuntimeError, match="engine exploded"):
-                await AsyncOmni.generate_batch(engine, prompts=["bad prompt"])
+                asyncio.run(AsyncOmni.generate_batch(engine, prompts=["bad prompt"]))
 
     # ------------------------------------------------------------------
     # 6. output_modalities and sampling_params_list are forwarded
     # ------------------------------------------------------------------
 
-    @pytest.mark.asyncio
-    async def test_kwargs_forwarded_to_generate(self):
+    def test_kwargs_forwarded_to_generate(self):
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         engine = self._make_engine()
@@ -234,12 +231,12 @@ class TestAsyncOmniBatchGenerate:
             yield out
 
         with patch.object(AsyncOmni, "generate", side_effect=_capturing_generate):
-            await AsyncOmni.generate_batch(
+            asyncio.run(AsyncOmni.generate_batch(
                 engine,
                 prompts=[prompt],
                 sampling_params_list=expected_sp,
                 output_modalities=expected_modalities,
-            )
+            ))
 
         assert received_kwargs["output_modalities"] == expected_modalities
         assert received_kwargs["sampling_params_list"] == expected_sp
@@ -248,8 +245,7 @@ class TestAsyncOmniBatchGenerate:
     # 7. No output from a generate() call → excluded from result list
     # ------------------------------------------------------------------
 
-    @pytest.mark.asyncio
-    async def test_prompt_with_no_output_excluded(self):
+    def test_prompt_with_no_output_excluded(self):
         """
         A generate() that yields nothing should not appear in the results.
         """
@@ -266,7 +262,7 @@ class TestAsyncOmniBatchGenerate:
             yield out
 
         with patch.object(AsyncOmni, "generate", side_effect=_selective_generate):
-            results = await AsyncOmni.generate_batch(engine, prompts=prompts)
+            results = asyncio.run(AsyncOmni.generate_batch(engine, prompts=prompts))
 
         # Only the first prompt produced an output
         assert len(results) == 1
