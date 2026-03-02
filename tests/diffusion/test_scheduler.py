@@ -131,8 +131,9 @@ class TestSchedulerBroadcast:
 
         received = []
         q = s.broadcast_queues[0]
-        while not q.empty():
-            received.append(q.get_nowait())
+        # mp.Queue.empty() is unreliable (feeder thread lag); use get(timeout) instead.
+        for _ in range(5):
+            received.append(q.get(timeout=2))
         assert received == list(range(5))
 
 
@@ -163,7 +164,10 @@ class TestSchedulerAddReq:
 
         result = s.add_req(req)
 
-        assert result is expected
+        # mp.Queue serialises objects via pickle, so identity (is) cannot be
+        # used across the queue boundary. DiffusionOutput is a dataclass with
+        # auto-generated __eq__, so value equality is the correct assertion.
+        assert result == expected
 
     def test_add_req_broadcasts_rpc_envelope(self):
         from vllm_omni.diffusion.data import DiffusionOutput
@@ -172,9 +176,11 @@ class TestSchedulerAddReq:
         req = self._make_request()
         s.add_req(req)
 
-        # All broadcast queues should have received exactly one RPC envelope
+        # All broadcast queues should have received exactly one RPC envelope.
+        # Use get(timeout) instead of get_nowait(): mp.Queue uses a background
+        # feeder thread, so the item may not be readable immediately after put().
         for i, q in enumerate(s.broadcast_queues):
-            msg = q.get_nowait()
+            msg = q.get(timeout=2)
             assert isinstance(msg, dict), f"Worker {i} did not get a dict"
             assert msg["type"] == "rpc"
             assert msg["method"] == "generate"
