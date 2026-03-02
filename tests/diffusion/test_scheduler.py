@@ -115,7 +115,7 @@ class TestSchedulerBroadcast:
         s.broadcast(msg)
 
         for i, q in enumerate(s.broadcast_queues):
-            received = q.get_nowait()
+            received = q.get(timeout=2)
             assert received == msg, f"Worker {i} did not receive the message"
 
     def test_broadcast_delivers_independent_copies(self):
@@ -129,10 +129,12 @@ class TestSchedulerBroadcast:
         msg = "hello"
         s.broadcast(msg)
 
+        # mp.Queue uses a background feeder thread; use get(timeout) instead of
+        # get_nowait() to avoid racing before the item reaches the pipe.
         # Worker 0 consumes
-        assert s.broadcast_queues[0].get_nowait() == msg
+        assert s.broadcast_queues[0].get(timeout=2) == msg
         # Worker 1's queue is still full
-        assert s.broadcast_queues[1].get_nowait() == msg
+        assert s.broadcast_queues[1].get(timeout=2) == msg
 
     def test_broadcast_multiple_messages_ordered(self):
         s = Scheduler()
