@@ -199,6 +199,7 @@ class AsyncOmni(OmniBase):
                     "enforce_eager": kwargs.get("enforce_eager", False),
                     "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+                    "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
                 },
