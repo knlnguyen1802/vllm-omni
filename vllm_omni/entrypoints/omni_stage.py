@@ -1723,10 +1723,16 @@ def output_strip(r_output: RequestOutput | OmniRequestOutput, final_output: bool
     if mm_output is not None:
         r_output.multimodal_output = {}
 
+    custom_out = getattr(r_output, "_custom_output", None)
+    if custom_out is not None:
+        r_output._custom_output = {}
+
     outputs = getattr(r_output, "outputs", None)
     if outputs is not None:
         for out in outputs:
             if getattr(out, "multimodal_output", None):
                 out.multimodal_output = {}
+            if getattr(out, "_custom_output", None):
+                out._custom_output = {}
 
     return r_output

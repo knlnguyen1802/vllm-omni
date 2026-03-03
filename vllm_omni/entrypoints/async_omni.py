@@ -568,12 +568,17 @@ class AsyncOmni(OmniBase):
                     images = engine_outputs.images
 
             if stage.final_output_type == "image":
+                # Propagate custom_output from inner diffusion output
+                custom_output = {}
+                if isinstance(engine_outputs, OmniRequestOutput):
+                    custom_output = engine_outputs.custom_output or {}
                 output_to_yield = OmniRequestOutput(
                     stage_id=stage_id,
                     final_output_type=stage.final_output_type,
                     request_output=engine_outputs,
                     images=images,
                     finished=finished,
+                    _custom_output=custom_output,
                 )
             else:
                 output_to_yield = OmniRequestOutput(

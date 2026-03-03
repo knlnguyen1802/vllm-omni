@@ -137,6 +137,7 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        custom_output=output.custom_output or {},
                     ),
                 ]
         else:
@@ -174,6 +175,7 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
+                            custom_output=output.custom_output or {},
                         )
                     )
 
