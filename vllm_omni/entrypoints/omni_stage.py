@@ -620,14 +620,24 @@ class OmniStage:
             try:
                 self._in_q.put_nowait(SHUTDOWN_TASK)
             except Exception as e:
-                logger.warning("Failed to send shutdown to in_q: %s", e)
+                # Queue may already be closed by the weak-ref cleanup
+                # (e.g. ZmqQueue socket closed) — this is expected.
+                logger.debug("Failed to send shutdown to in_q: %s", e)
             close_fn = getattr(self._in_q, "close", None)
             if callable(close_fn):
-                close_fn()
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._in_q = None
         if self._out_q is not None:
             close_fn = getattr(self._out_q, "close", None)
             if callable(close_fn):
-                close_fn()
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._out_q = None
 
         if hasattr(self, "_ray_actor") and self._ray_actor:
             kill_ray_actor(self._ray_actor)
