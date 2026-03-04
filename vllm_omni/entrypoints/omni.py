@@ -11,8 +11,6 @@ from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal, TypeVar, overload
 
-_R = TypeVar("_R")
-
 import huggingface_hub
 import msgspec.msgpack
 import zmq
@@ -53,6 +51,8 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.outputs import OmniRequestOutput
+
+_R = TypeVar("_R")
 
 logger = init_logger(__name__)
 

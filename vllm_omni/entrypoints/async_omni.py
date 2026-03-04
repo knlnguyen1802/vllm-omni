@@ -7,8 +7,6 @@ import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from typing import Any, TypeVar
 
-_R = TypeVar("_R")
-
 from vllm.config import VllmConfig
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
@@ -36,6 +34,8 @@ from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.metrics import OrchestratorAggregator
 from vllm_omni.outputs import OmniRequestOutput
+
+_R = TypeVar("_R")
 
 logger = init_logger(__name__)
 

@@ -21,8 +21,6 @@ from contextlib import contextmanager
 from dataclasses import fields
 from typing import Any, Literal, TypeVar, cast
 
-_R = TypeVar("_R")
-
 from vllm import PromptType, RequestOutput
 from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
@@ -62,6 +60,8 @@ from vllm_omni.entrypoints.zmq_utils import (
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams, OmniTokensPrompt
 from vllm_omni.metrics import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
+
+_R = TypeVar("_R")
 
 logger = init_logger(__name__)
 
