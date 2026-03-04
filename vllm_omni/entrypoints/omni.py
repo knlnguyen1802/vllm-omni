@@ -547,6 +547,7 @@ class OmniBase:
                     out_q = self._stage_out_queues[stage_id] if stage_id < len(self._stage_out_queues) else None
                     if out_q is not None:
                         import queue as _queue
+
                         try:
                             while True:
                                 item = out_q.get_nowait()
@@ -565,6 +566,7 @@ class OmniBase:
                         except _queue.Empty:
                             pass
                     return None
+
                 return rpc_checker
 
             stage._rpc_result_checker = make_rpc_checker(sid)

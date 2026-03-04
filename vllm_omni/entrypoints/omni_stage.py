@@ -447,9 +447,7 @@ class OmniStage:
             It is recommended to use this API to only pass control messages,
             and set up data-plane communication to pass data.
         """
-        assert self._in_q is not None and self._out_q is not None, (
-            "Queues must be attached before collective_rpc"
-        )
+        assert self._in_q is not None and self._out_q is not None, "Queues must be attached before collective_rpc"
 
         # Submit collective_rpc task to worker
         rpc_id = str(uuid.uuid4())
@@ -467,9 +465,7 @@ class OmniStage:
         start_time = time.time()
         while True:
             if timeout is not None and (time.time() - start_time) > timeout:
-                raise TimeoutError(
-                    f"collective_rpc timed out after {timeout} seconds"
-                )
+                raise TimeoutError(f"collective_rpc timed out after {timeout} seconds")
 
             # Check if result was already collected by the orchestrator's
             # output handler (stored in a shared dict).
@@ -481,9 +477,7 @@ class OmniStage:
                 if result.get("type") == "collective_rpc_result":
                     if result.get("rpc_id") == rpc_id:
                         if "error" in result:
-                            raise RuntimeError(
-                                f"collective_rpc failed: {result['error']}"
-                            )
+                            raise RuntimeError(f"collective_rpc failed: {result['error']}")
                         return result["result"]
 
             time.sleep(0.001)  # Small sleep to avoid busy waiting
@@ -980,22 +974,24 @@ def _stage_worker(
                     args=rpc_args,
                     kwargs=rpc_kwargs,
                 )
-                out_q.put({
-                    "type": "collective_rpc_result",
-                    "rpc_id": rpc_id,
-                    "stage_id": stage_id,
-                    "result": rpc_result,
-                })
-            except Exception as e:
-                logger.exception(
-                    "[Stage-%s] collective_rpc failed: %s", stage_id, e
+                out_q.put(
+                    {
+                        "type": "collective_rpc_result",
+                        "rpc_id": rpc_id,
+                        "stage_id": stage_id,
+                        "result": rpc_result,
+                    }
                 )
-                out_q.put({
-                    "type": "collective_rpc_result",
-                    "rpc_id": rpc_id,
-                    "stage_id": stage_id,
-                    "error": str(e),
-                })
+            except Exception as e:
+                logger.exception("[Stage-%s] collective_rpc failed: %s", stage_id, e)
+                out_q.put(
+                    {
+                        "type": "collective_rpc_result",
+                        "rpc_id": rpc_id,
+                        "stage_id": stage_id,
+                        "error": str(e),
+                    }
+                )
             continue
 
         batch_tasks: list[dict[str, Any]] = [task]
@@ -1552,24 +1548,28 @@ async def _stage_worker_async(
                             args=rpc_args,
                             kwargs=rpc_kwargs,
                         )
-                    out_q.put({
-                        "type": "collective_rpc_result",
-                        "rpc_id": rpc_id,
-                        "stage_id": stage_id,
-                        "result": rpc_result,
-                    })
+                    out_q.put(
+                        {
+                            "type": "collective_rpc_result",
+                            "rpc_id": rpc_id,
+                            "stage_id": stage_id,
+                            "result": rpc_result,
+                        }
+                    )
                 except Exception as e:
                     logger.exception(
                         "[Stage-%s] collective_rpc failed: %s",
                         stage_id,
                         e,
                     )
-                    out_q.put({
-                        "type": "collective_rpc_result",
-                        "rpc_id": rpc_id,
-                        "stage_id": stage_id,
-                        "error": str(e),
-                    })
+                    out_q.put(
+                        {
+                            "type": "collective_rpc_result",
+                            "rpc_id": rpc_id,
+                            "stage_id": stage_id,
+                            "error": str(e),
+                        }
+                    )
             else:
                 asyncio.create_task(generation_single_request(task))
 

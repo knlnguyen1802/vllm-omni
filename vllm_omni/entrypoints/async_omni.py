@@ -276,6 +276,7 @@ class AsyncOmni(OmniBase):
                     if stage_id in self._rpc_results and rpc_id in self._rpc_results[stage_id]:
                         return self._rpc_results[stage_id].pop(rpc_id)
                     return None
+
                 return rpc_checker
 
             stage._rpc_result_checker = make_rpc_checker(sid)
@@ -787,9 +788,7 @@ class AsyncOmni(OmniBase):
             )
 
         # Run all stages concurrently
-        results = await asyncio.gather(
-            *[run_stage_rpc(stage) for stage in self.stage_list]
-        )
+        results = await asyncio.gather(*[run_stage_rpc(stage) for stage in self.stage_list])
         return list(results)
 
     async def sleep(self, level: int = 1) -> None:
