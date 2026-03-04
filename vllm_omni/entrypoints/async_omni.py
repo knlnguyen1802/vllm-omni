@@ -199,6 +199,7 @@ class AsyncOmni(OmniBase):
                     "enforce_eager": kwargs.get("enforce_eager", False),
                     "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+                    "worker_extension_cls": kwargs.get("worker_extension_cls", None),
                     "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
                     "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
@@ -806,6 +807,21 @@ class AsyncOmni(OmniBase):
     async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Load a new LoRA adapter into the engine for future requests."""
         result = await self.collective_rpc(method="add_lora", args=(lora_request,))
+        return result[0][0]
+
+    async def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA adapter from the engine."""
+        result = await self.collective_rpc(method="remove_lora", args=(adapter_id,))
+        return result[0][0]
+
+    async def list_loras(self) -> list[int]:
+        """List all loaded LoRA adapter IDs."""
+        result = await self.collective_rpc(method="list_loras")
+        return result[0][0]
+
+    async def pin_lora(self, adapter_id: int) -> bool:
+        """Pin a LoRA adapter so it is not evicted from the cache."""
+        result = await self.collective_rpc(method="pin_lora", args=(adapter_id,))
         return result[0][0]
 
     async def encode(
