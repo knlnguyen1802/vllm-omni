@@ -536,19 +536,27 @@ class OmniBase:
         ``OmniStage.collective_rpc`` can retrieve results that were
         collected by the orchestrator (or, in the sync path, by the
         stage-level checker that drains the output queue).
+
+        Uses a weak reference to ``self`` to avoid a circular reference
+        (OmniBase → stage_list → OmniStage → closure → OmniBase) that
+        would prevent the instance from being freed by reference counting.
         """
+        weak_self = weakref.ref(self)
         for stage in self.stage_list:
             sid = stage.stage_id
 
             def make_rpc_checker(stage_id: int):
                 def rpc_checker(rpc_id: str) -> dict[str, Any] | None:
+                    _self = weak_self()
+                    if _self is None:
+                        return None
                     # First check the shared dict
-                    if stage_id in self._rpc_results and rpc_id in self._rpc_results[stage_id]:
-                        return self._rpc_results[stage_id].pop(rpc_id)
+                    if stage_id in _self._rpc_results and rpc_id in _self._rpc_results[stage_id]:
+                        return _self._rpc_results[stage_id].pop(rpc_id)
                     # In the sync path there is no background output handler,
                     # so drain the output queue ourselves and stash any
                     # non-RPC results back.
-                    out_q = self._stage_out_queues[stage_id] if stage_id < len(self._stage_out_queues) else None
+                    out_q = _self._stage_out_queues[stage_id] if stage_id < len(_self._stage_out_queues) else None
                     if out_q is not None:
                         import queue as _queue
 
@@ -560,9 +568,9 @@ class OmniBase:
                                     if item_rpc_id == rpc_id:
                                         return item
                                     # Stash for another caller
-                                    if stage_id not in self._rpc_results:
-                                        self._rpc_results[stage_id] = {}
-                                    self._rpc_results[stage_id][item_rpc_id] = item
+                                    if stage_id not in _self._rpc_results:
+                                        _self._rpc_results[stage_id] = {}
+                                    _self._rpc_results[stage_id][item_rpc_id] = item
                                 else:
                                     # Non-RPC item — put it back
                                     out_q.put(item)
