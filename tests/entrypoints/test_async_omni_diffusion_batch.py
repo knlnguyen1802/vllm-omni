@@ -2,21 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Unit tests for AsyncOmniDiffusion.generate_batch.
+Unit tests for AsyncOmniDiffusion.generate (unified single/batch API).
 
-Tests cover the new ``generate_batch`` method introduced in the
-``batching_async_omni`` branch (on top of d6a3551):
+Tests cover the unified ``generate`` method that auto-adapts based on
+whether a single prompt or a list of prompts is provided:
 
-1.  Auto-generates request_ids when none are supplied.
-2.  Pads request_ids when fewer are supplied than prompts.
-3.  Uses supplied request_ids as-is when count matches.
+1.  Auto-generates request_ids when none are supplied (batch).
+2.  Pads request_ids when fewer are supplied than prompts (batch).
+3.  Uses supplied request_ids as-is when count matches (batch).
 4.  Delegates to ``engine.step`` via the thread executor with a single
-    ``OmniDiffusionRequest`` carrying all prompts.
+    ``OmniDiffusionRequest`` carrying all prompts (batch).
 5.  Stamps missing ``request_id`` on each result returned by the engine.
 6.  Propagates ``lora_request`` into ``sampling_params``.
-7.  Wraps engine exceptions in ``RuntimeError("Diffusion batch generation
+7.  Wraps engine exceptions in ``RuntimeError("Diffusion generation
     failed: ...")``.
 8.  Sets ``guidance_scale_provided`` when ``guidance_scale`` is truthy.
+9.  Single prompt returns a single ``OmniRequestOutput`` (not a list).
+10. Single prompt auto-generates request_id when None.
 """
 
 import asyncio
@@ -53,7 +55,7 @@ def _make_async_omni_diffusion(engine_step_return=None, engine_step_raises=None)
 
     obj = object.__new__(AsyncOmniDiffusion)
 
-    # Minimal attributes expected by generate_batch
+    # Minimal attributes expected by generate
     mock_engine = MagicMock()
     if engine_step_raises is not None:
 
@@ -72,12 +74,12 @@ def _make_async_omni_diffusion(engine_step_return=None, engine_step_raises=None)
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests – Batch (list of prompts)
 # ---------------------------------------------------------------------------
 
 
 class TestAsyncOmniDiffusionBatchGenerate:
-    """Tests for AsyncOmniDiffusion.generate_batch."""
+    """Tests for AsyncOmniDiffusion.generate with a list of prompts."""
 
     def _sampling_params(self, guidance_scale=0.0) -> OmniDiffusionSamplingParams:
         sp = OmniDiffusionSamplingParams(num_inference_steps=1)
@@ -96,7 +98,7 @@ class TestAsyncOmniDiffusionBatchGenerate:
         obj = _make_async_omni_diffusion(engine_step_return=results)
         sp = self._sampling_params()
 
-        outputs = asyncio.run(obj.generate_batch(prompts=prompts, sampling_params=sp))
+        outputs = asyncio.run(obj.generate(prompt=prompts, sampling_params=sp))
 
         # engine.step was called once
         obj.engine.step.assert_called_once()
@@ -119,7 +121,7 @@ class TestAsyncOmniDiffusionBatchGenerate:
         obj = _make_async_omni_diffusion(engine_step_return=results)
         sp = self._sampling_params()
 
-        asyncio.run(obj.generate_batch(prompts=prompts, sampling_params=sp, request_ids=supplied_ids))
+        asyncio.run(obj.generate(prompt=prompts, sampling_params=sp, request_id=supplied_ids))
 
         call_arg = obj.engine.step.call_args[0][0]
         assert call_arg.request_ids[0] == "my-id-0"
@@ -139,7 +141,7 @@ class TestAsyncOmniDiffusionBatchGenerate:
         obj = _make_async_omni_diffusion(engine_step_return=results)
         sp = self._sampling_params()
 
-        outputs = asyncio.run(obj.generate_batch(prompts=prompts, sampling_params=sp, request_ids=supplied_ids))
+        outputs = asyncio.run(obj.generate(prompt=prompts, sampling_params=sp, request_id=supplied_ids))
 
         call_arg = obj.engine.step.call_args[0][0]
         assert call_arg.request_ids == ["req-a", "req-b"]
@@ -155,7 +157,7 @@ class TestAsyncOmniDiffusionBatchGenerate:
         obj = _make_async_omni_diffusion(engine_step_return=results)
         sp = self._sampling_params()
 
-        asyncio.run(obj.generate_batch(prompts=prompts, sampling_params=sp))
+        asyncio.run(obj.generate(prompt=prompts, sampling_params=sp))
 
         # Exactly one step call with all three prompts
         assert obj.engine.step.call_count == 1
@@ -174,7 +176,7 @@ class TestAsyncOmniDiffusionBatchGenerate:
         obj = _make_async_omni_diffusion(engine_step_return=results)
         sp = self._sampling_params()
 
-        outputs = asyncio.run(obj.generate_batch(prompts=prompts, sampling_params=sp, request_ids=supplied_ids))
+        outputs = asyncio.run(obj.generate(prompt=prompts, sampling_params=sp, request_id=supplied_ids))
 
         assert outputs[0].request_id == "id-0"
         assert outputs[1].request_id == "id-1"
@@ -190,7 +192,7 @@ class TestAsyncOmniDiffusionBatchGenerate:
         sp = self._sampling_params()
         lora = MagicMock()
 
-        asyncio.run(obj.generate_batch(prompts=prompts, sampling_params=sp, lora_request=lora))
+        asyncio.run(obj.generate(prompt=prompts, sampling_params=sp, lora_request=lora))
 
         assert sp.lora_request is lora
 
@@ -202,8 +204,8 @@ class TestAsyncOmniDiffusionBatchGenerate:
         obj = _make_async_omni_diffusion(engine_step_raises=ValueError("bad model"))
         sp = self._sampling_params()
 
-        with pytest.raises(RuntimeError, match="Diffusion batch generation failed"):
-            asyncio.run(obj.generate_batch(prompts=["p1"], sampling_params=sp))
+        with pytest.raises(RuntimeError, match="Diffusion generation failed"):
+            asyncio.run(obj.generate(prompt=["p1"], sampling_params=sp))
 
     # ------------------------------------------------------------------
     # 8. guidance_scale_provided set when guidance_scale is truthy
@@ -214,7 +216,7 @@ class TestAsyncOmniDiffusionBatchGenerate:
         obj = _make_async_omni_diffusion(engine_step_return=results)
         sp = self._sampling_params(guidance_scale=7.5)
 
-        asyncio.run(obj.generate_batch(prompts=["a landscape"], sampling_params=sp))
+        asyncio.run(obj.generate(prompt=["a landscape"], sampling_params=sp))
 
         assert sp.guidance_scale_provided is True
 
@@ -223,7 +225,65 @@ class TestAsyncOmniDiffusionBatchGenerate:
         obj = _make_async_omni_diffusion(engine_step_return=results)
         sp = self._sampling_params(guidance_scale=0.0)
 
-        asyncio.run(obj.generate_batch(prompts=["a landscape"], sampling_params=sp))
+        asyncio.run(obj.generate(prompt=["a landscape"], sampling_params=sp))
 
         # Should remain False (falsy guidance_scale)
         assert sp.guidance_scale_provided is False
+
+
+# ---------------------------------------------------------------------------
+# Tests – Single prompt
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncOmniDiffusionSingleGenerate:
+    """Tests for AsyncOmniDiffusion.generate with a single prompt."""
+
+    def _sampling_params(self, guidance_scale=0.0) -> OmniDiffusionSamplingParams:
+        sp = OmniDiffusionSamplingParams(num_inference_steps=1)
+        sp.guidance_scale = guidance_scale
+        sp.guidance_scale_provided = False
+        sp.lora_request = None
+        return sp
+
+    # ------------------------------------------------------------------
+    # 9. Single prompt returns a single OmniRequestOutput (not a list)
+    # ------------------------------------------------------------------
+
+    def test_single_prompt_returns_single_result(self):
+        result = _make_result("r0")
+        obj = _make_async_omni_diffusion(engine_step_return=[result])
+        sp = self._sampling_params()
+
+        output = asyncio.run(obj.generate(prompt="a cat", sampling_params=sp))
+
+        assert isinstance(output, MagicMock)  # single OmniRequestOutput, not list
+        assert output.request_id == "r0"
+
+    # ------------------------------------------------------------------
+    # 10. Single prompt auto-generates request_id when None
+    # ------------------------------------------------------------------
+
+    def test_single_prompt_auto_generates_request_id(self):
+        result = _make_result(request_id=None)
+        obj = _make_async_omni_diffusion(engine_step_return=[result])
+        sp = self._sampling_params()
+
+        output = asyncio.run(obj.generate(prompt="a cat", sampling_params=sp))
+
+        call_arg = obj.engine.step.call_args[0][0]
+        assert len(call_arg.request_ids) == 1
+        assert call_arg.request_ids[0].startswith("diff-")
+
+    def test_single_prompt_with_explicit_request_id(self):
+        result = _make_result("my-req")
+        obj = _make_async_omni_diffusion(engine_step_return=[result])
+        sp = self._sampling_params()
+
+        output = asyncio.run(
+            obj.generate(prompt="a cat", sampling_params=sp, request_id="my-req")
+        )
+
+        call_arg = obj.engine.step.call_args[0][0]
+        assert call_arg.request_ids == ["my-req"]
+        assert output.request_id == "my-req"

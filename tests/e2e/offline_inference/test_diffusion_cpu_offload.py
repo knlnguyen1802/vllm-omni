@@ -1,3 +1,4 @@
+import gc
 import sys
 from pathlib import Path
 
@@ -20,11 +21,18 @@ models = ["riverclouds/qwen_image_random"]
 
 
 def inference(model_name: str, offload: bool = True):
+    gc.collect()
     current_omni_platform.empty_cache()
     device_index = torch.cuda.current_device()
+    torch.cuda.reset_peak_memory_stats(device=device_index)
     monitor = GPUMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
-    m = Omni(model=model_name, enable_cpu_offload=offload)
+    m = Omni(
+        model=model_name,
+        # TODO: we might want to add overlapped feature e2e tests
+        # cache_backend="cache_dit",
+        enable_cpu_offload=offload,
+    )
     torch.cuda.reset_peak_memory_stats(device=device_index)
     height = 256
     width = 256
@@ -42,19 +50,22 @@ def inference(model_name: str, offload: bool = True):
     peak = monitor.peak_used_mb
     monitor.stop()
 
+    del m
+    gc.collect()
+    current_omni_platform.empty_cache()
+
     return peak
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.skipif(current_omni_platform.is_npu() or current_omni_platform.is_rocm(), reason="Hardware not supported")
 @pytest.mark.parametrize("model_name", models)
 def test_cpu_offload_diffusion_model(model_name: str):
     try:
-        no_offload_peak_memory = inference(model_name, offload=False)
-        cleanup_dist_env_and_memory()
         offload_peak_memory = inference(model_name, offload=True)
+        cleanup_dist_env_and_memory()
+        no_offload_peak_memory = inference(model_name, offload=False)
     except Exception:
         pytest.fail("Inference failed")
     print(f"Offload peak memory: {offload_peak_memory} MB")
