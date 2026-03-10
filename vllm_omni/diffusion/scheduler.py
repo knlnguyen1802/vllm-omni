@@ -2,14 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import multiprocessing as mp
-import threading
 
-import zmq
-from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -24,7 +20,6 @@ class Scheduler:
 
         self.num_workers = od_config.num_gpus
         self.od_config = od_config
-        self._lock = threading.Lock()
 
         # One mp.Queue per worker to simulate broadcast semantics.
         # The scheduler enqueues the same message into every queue so that
@@ -49,39 +44,24 @@ class Scheduler:
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         """Sends a request to the scheduler and waits for the response."""
-        with self._lock:
-            try:
-                # Prepare RPC request for generation
-                rpc_request = {
-                    "type": "rpc",
-                    "method": "generate",
-                    "args": (request,),
-                    "kwargs": {},
-                    "output_rank": 0,
-                    "exec_all_ranks": True,
-                }
+        # Prepare RPC request for generation
+        rpc_request = {
+            "type": "rpc",
+            "method": "generate",
+            "args": (request,),
+            "kwargs": {},
+            "output_rank": 0,
+            "exec_all_ranks": True,
+        }
 
-                # Broadcast RPC request to all workers
-                self.mq.enqueue(rpc_request)
+        # Broadcast RPC request to all workers
+        self.broadcast(rpc_request)
 
-                # Wait for result from Rank 0 (or whoever sends it)
-                if self.result_mq is None:
-                    raise RuntimeError("Result queue not initialized")
-
-                output = self.result_mq.dequeue()
-
-                try:
-                    unpack_diffusion_output_shm(output)
-                except Exception as e:
-                    logger.warning("SHM unpack failed (data may already be inline): %s", e)
-
-                # {"status": "error", "error": str(e)}
-                if isinstance(output, dict) and output.get("status") == "error":
-                    raise RuntimeError("worker error")
-                return output
-            except zmq.error.Again:
-                logger.error("Timeout waiting for response from scheduler.")
-                raise TimeoutError("Scheduler did not respond in time.")
+        # Wait for result from Rank 0
+        output = self.result_queue.get()  # blocks until available
+        if isinstance(output, dict) and output.get("status") == "error":
+            raise RuntimeError("worker error")
+        return output
 
     def close(self):
         """Closes all queues."""
