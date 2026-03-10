@@ -51,6 +51,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._processes: list[mp.Process] = []
         self._closed = False
 
+        # Set the start method to 'spawn' BEFORE creating any multiprocessing objects
+        # This ensures all queues and locks are created in the correct context
+        mp.set_start_method("spawn", force=True)
+
         # Initialize scheduler (creates broadcast_queues and result_queue)
         self.scheduler = Scheduler()
         self.scheduler.initialize(self.od_config)
@@ -75,7 +79,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         logger.info("Starting server...")
 
         num_gpus = od_config.num_gpus
-        mp.set_start_method("spawn", force=True)
         processes: list[mp.Process] = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
