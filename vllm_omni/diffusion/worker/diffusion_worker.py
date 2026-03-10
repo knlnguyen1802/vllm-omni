@@ -364,12 +364,12 @@ class WorkerProc:
 
     def return_result(self, output: DiffusionOutput):
         """Reply to client, only on rank 0."""
-        if self.result_mq is not None:
+        if self.result_queue is not None:
             try:
                 pack_diffusion_output_shm(output)
             except Exception as e:
                 logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
-            self.result_mq.enqueue(output)
+            self.result_queue.put(output)
 
     def recv_message(self):
         """Receive messages from broadcast queue."""
