@@ -1439,6 +1439,170 @@ async def _stage_worker_async(
     _rx_decode_ms_by_rid: dict[Any, float] = {}
     _in_flight_ms_by_rid: dict[Any, float] = {}
 
+    max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
+    logger.info(f"[Stage-{stage_id}] Max batch size: {max_batch_size}")
+
+    async def _collect_diffusion_batch(first_task: dict[str, Any]) -> list[dict[str, Any]]:
+        """Collect up to max_batch_size diffusion tasks with matching sampling params."""
+        batch_tasks = [first_task]
+        start_time = _time.time()
+
+        if max_batch_size <= 1:
+            return batch_tasks
+
+        while len(batch_tasks) < max_batch_size:
+            # Check if batch_timeout has elapsed
+            elapsed = _time.time() - start_time
+            if elapsed > batch_timeout:
+                logger.debug(
+                    "[Stage-%s] Batch timeout reached after %.3fs, batch_size=%d",
+                    stage_id,
+                    elapsed,
+                    len(batch_tasks),
+                )
+                break
+
+            try:
+                extra = in_q.get_nowait()
+
+                # Handle shutdown
+                if extra == SHUTDOWN_TASK:
+                    in_q.put(SHUTDOWN_TASK)
+                    break
+
+                # Handle special task types that arrive during batching
+                extra_type = extra.get("type") if isinstance(extra, dict) else None
+                if extra_type in (
+                    OmniStageTaskType.SHUTDOWN,
+                    OmniStageTaskType.ABORT,
+                    OmniStageTaskType.PROFILER_START,
+                    OmniStageTaskType.PROFILER_STOP,
+                    OmniStageTaskType.COLLECTIVE_RPC,
+                ):
+                    # Re-queue special tasks to be processed outside batch collection
+                    in_q.put(extra)
+                    logger.debug(
+                        "[Stage-%s] Found special task %s during batch collection, re-queued",
+                        stage_id,
+                        extra_type,
+                    )
+                    break
+
+                # Only batch tasks with matching sampling params
+                if first_task.get("sampling_params") != extra.get("sampling_params"):
+                    logger.warning(
+                        "[Stage-%s] Diffusion batch: sampling params mismatch, "
+                        "prompt %s has params %s whereas prompt %s has params %s. "
+                        "Cannot batch, re-queuing the second task.",
+                        stage_id,
+                        first_task.get("request_id"),
+                        first_task.get("sampling_params"),
+                        extra.get("request_id"),
+                        extra.get("sampling_params"),
+                    )
+                    # Re-queue mismatched task
+                    in_q.put(extra)
+                    break
+
+                batch_tasks.append(extra)
+
+            except queue.Empty:
+                # Queue is empty, wait briefly and check timeout
+                await asyncio.sleep(0.01)
+                continue
+
+        logger.debug(
+            "[Stage-%s] Collected diffusion batch: size=%d, took %.3fs",
+            stage_id,
+            len(batch_tasks),
+            _time.time() - start_time,
+        )
+        return batch_tasks
+
+    async def generation_batch_diffusion(batch_tasks: list[dict[str, Any]]):
+        """Process a batch of diffusion requests together."""
+        _recv_dequeue_ts = _time.time()
+        batch_request_ids = []
+        batch_prompts = []
+
+        # Collect metadata and prompts
+        for task in batch_tasks:
+            rid = task["request_id"]
+            batch_request_ids.append(rid)
+
+            try:
+                sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
+                if sent_ts is not None:
+                    _in_flight_ms_by_rid[rid] = max(0.0, (_recv_dequeue_ts - sent_ts) * 1000.0)
+                else:
+                    _in_flight_ms_by_rid[rid] = 0.0
+            except Exception:
+                _in_flight_ms_by_rid[rid] = 0.0
+
+            try:
+                ein, _rx_metrics = try_recv_via_connector(
+                    task=task,
+                    connectors=connectors,
+                    stage_id=stage_id,
+                )
+                ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
+
+                if ein is None or _rx_metrics is None:
+                    raise RuntimeError(
+                        f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                        "Ensure connectors are configured for all incoming edges."
+                    )
+                _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+                _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+
+                if isinstance(ein, Sequence) and not isinstance(ein, str):
+                    ein = ein[0]
+
+                batch_prompts.append(ein)
+            except Exception as e:
+                logger.exception("Failed to process task for request %s: %s", rid, e)
+                # Put error output for this request
+                out_q.put(
+                    {
+                        "request_id": rid,
+                        "stage_id": stage_id,
+                        "error": str(e),
+                    }
+                )
+                return
+
+        logger.debug("[Stage-%s] Processing diffusion batch size=%d, request_ids=%s", stage_id, len(batch_tasks), batch_request_ids)
+
+        try:
+            # Use shared sampling params from first task
+            diffusion_sampling_params = cast(OmniDiffusionSamplingParams, batch_tasks[0]["sampling_params"])
+
+            _gen_t0 = _time.time()
+            # Call generate_batch with all prompts at once
+            gen_outputs = await cast(AsyncOmniDiffusion, stage_engine).generate_batch(
+                prompts=batch_prompts,
+                sampling_params=diffusion_sampling_params,
+                request_ids=batch_request_ids,
+            )
+            _gen_t1 = _time.time()
+            _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+
+            # Enqueue each output
+            for gen_output in gen_outputs:
+                await generation_out_q.put((gen_output.request_id, gen_output, _gen_ms))
+
+        except Exception as e:
+            logger.exception("Failed on diffusion batch %s: %s", batch_request_ids, e)
+            # Send errors for all requests in batch
+            for rid in batch_request_ids:
+                out_q.put(
+                    {
+                        "request_id": rid,
+                        "stage_id": stage_id,
+                        "error": str(e),
+                    }
+                )
+
     async def generation_single_request(task: dict[str, Any]):
         _recv_dequeue_ts = _time.time()
         rid = task["request_id"]
@@ -1566,7 +1730,12 @@ async def _stage_worker_async(
                         }
                     )
             else:
-                asyncio.create_task(generation_single_request(task))
+                # Handle generation tasks - use batching for diffusion if configured
+                if stage_type == "diffusion" and max_batch_size > 1:
+                    batch_tasks = await _collect_diffusion_batch(task)
+                    asyncio.create_task(generation_batch_diffusion(batch_tasks))
+                else:
+                    asyncio.create_task(generation_single_request(task))
 
         except queue.Empty:
             await asyncio.sleep(0.001)
