@@ -441,7 +441,7 @@ class AsyncOmni(OmniBase):
         sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         *,
         output_modalities: list[str] | None = None,
-    ) -> dict[str, list[OmniRequestOutput]]:
+    ) -> list[OmniRequestOutput]:
         """Generate outputs for multiple prompts asynchronously in batch.
 
         Processes multiple prompts concurrently and returns all results.
@@ -456,22 +456,29 @@ class AsyncOmni(OmniBase):
             output_modalities: Optional list of output modalities.
 
         Returns:
-            Dictionary mapping request_ids to lists of OmniRequestOutput objects.
-            Results are in the same order as input prompts.
+            List of OmniRequestOutput objects, one per input prompt, in the
+            same order as the input prompts.  Each output contains the final
+            result (images, text, etc.) for that prompt.
 
         Raises:
             ValueError: If sampling_params_list has incorrect length.
 
         Example:
             >>> async_omni = AsyncOmni(model="Qwen/Qwen-Image")
-            >>> prompts = ["A sunset", "A mountain", "A beach"]
-            >>> results = await async_omni.generate_batch(prompts)
-            >>> for request_id, outputs in results.items():
-            ...     for output in outputs:
-            ...         print(output.images)
+            >>> prompts = [
+            ...     {"prompt": "A sunset", "negative_prompt": "blurry"},
+            ...     {"prompt": "A mountain", "negative_prompt": "foggy"},
+            ... ]
+            >>> results = await async_omni.generate_batch(prompts,
+            ...     sampling_params_list=[OmniDiffusionSamplingParams(
+            ...         num_inference_steps=10, width=512, height=512
+            ...     )])
+            >>> for i, output in enumerate(results):
+            ...     image = output.images[0]
+            ...     image.save(f"batch_{i}.jpg")
         """
         if not prompts:
-            return {}
+            return []
 
         # Generate unique request IDs for each prompt
         batch_id = uuid.uuid4().hex[:8]
@@ -488,18 +495,32 @@ class AsyncOmni(OmniBase):
             )
             tasks.append(task)
 
-        # Wait for all tasks to complete and collect outputs
-        results: dict[str, list[OmniRequestOutput]] = {rid: [] for rid in request_ids}
+        # Collect the final output for each prompt (preserving order)
+        final_outputs: list[OmniRequestOutput | None] = [None] * len(prompts)
 
-        # Process each generator concurrently
-        async def collect_outputs(request_id: str, gen: AsyncGenerator[OmniRequestOutput, None]):
+        async def collect_final_output(
+            index: int, gen: AsyncGenerator[OmniRequestOutput, None]
+        ):
+            last_output = None
             async for output in gen:
-                results[request_id].append(output)
+                last_output = output
+            if last_output is None:
+                logger.warning(
+                    "[AsyncOmni] Request %s yielded no outputs.",
+                    request_ids[index],
+                )
+            final_outputs[index] = last_output
 
-        collectors = [collect_outputs(rid, task) for rid, task in zip(request_ids, tasks)]
+        collectors = [
+            collect_final_output(i, task) for i, task in enumerate(tasks)
+        ]
         await asyncio.gather(*collectors)
 
-        return results
+        # Return list of final outputs (replace None with empty output if needed)
+        return [
+            out if out is not None else OmniRequestOutput(request_id=request_ids[i], finished=True)
+            for i, out in enumerate(final_outputs)
+        ]
 
     async def _generate_inline(
         self,
