@@ -1571,7 +1571,12 @@ async def _stage_worker_async(
                 )
                 return
 
-        logger.debug("[Stage-%s] Processing diffusion batch size=%d, request_ids=%s", stage_id, len(batch_tasks), batch_request_ids)
+        logger.debug(
+            "[Stage-%s] Processing diffusion batch size=%d, request_ids=%s",
+            stage_id,
+            len(batch_tasks),
+            batch_request_ids,
+        )
 
         try:
             # Use shared sampling params from first task

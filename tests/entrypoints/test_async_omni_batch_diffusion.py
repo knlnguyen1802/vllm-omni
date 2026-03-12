@@ -76,6 +76,7 @@ def test_generate_keeps_list_of_token_ids_as_single_prompt():
     omni._generate_batch_diffusion = _fake_generate_batch_diffusion  # type: ignore[method-assign]
 
     tokenized_prompt = [1, 2, 3, 4]
+
     async def _run_generate() -> list[str]:
         outputs = []
         async for out in omni.generate(
@@ -111,7 +112,8 @@ def test_generate_batch_diffusion_dispatches_to_inline_batch_path():
             prompts=["p1", "p2"],
             request_ids=["r1", "r2"],
             sampling_params_list=sampling_params,
-        ))
+        )
+    )
 
     assert called["prompts"] == ["p1", "p2"]
     assert called["request_ids"] == ["r1", "r2"]
@@ -139,7 +141,8 @@ def test_async_omni_diffusion_generate_batch_fills_missing_request_ids():
             prompts=["a", "b"],
             sampling_params=sampling_params,
             request_ids=["rid-1", "rid-2"],
-        ))
+        )
+    )
 
     request = captured["request"]
     assert request.prompts == ["a", "b"]
@@ -160,4 +163,5 @@ def test_async_omni_diffusion_generate_batch_validates_request_id_count():
                 prompts=["a", "b"],
                 sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
                 request_ids=["only-one"],
-            ))
+            )
+        )

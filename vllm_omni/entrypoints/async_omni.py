@@ -480,9 +480,7 @@ class AsyncOmni(OmniBase):
             raise ValueError(f"Expected {len(prompts)} request_ids, got {len(request_ids)}")
 
         if len(self.stage_list) != 1 or self.stage_list[0].stage_type != "diffusion":
-            raise NotImplementedError(
-                "_generate_batch_diffusion() only supports single-stage diffusion models."
-            )
+            raise NotImplementedError("_generate_batch_diffusion() only supports single-stage diffusion models.")
 
         if sampling_params_list is None:
             sampling_params_list = self.default_sampling_params_list
