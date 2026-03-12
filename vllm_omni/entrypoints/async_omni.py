@@ -304,7 +304,7 @@ class AsyncOmni(OmniBase):
 
     async def generate(
         self,
-        prompt: OmniPromptType,
+        prompt: OmniPromptType | list[OmniPromptType],
         request_id: str,
         sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         *,
@@ -319,8 +319,10 @@ class AsyncOmni(OmniBase):
         sampling parameters from the sampling_params_list.
 
         Args:
-            prompt: Prompt to process. Can be a text string, token IDs,
-                or multimodal prompt.
+            prompt: Prompt to process. Can be a single text/tokens/multimodal
+                prompt, or a batched list of prompts when inline diffusion
+                batching is enabled (``max_batch_size > 1``). A ``list[int]``
+                is still treated as one tokenized prompt (not a batch).
             request_id: Unique identifier for this request
             sampling_params_list: List of SamplingParams, one for each stage.
                 Must have the same length as the number of stages.
@@ -342,9 +344,9 @@ class AsyncOmni(OmniBase):
         if self._inline_diffusion:
             runtime_cfg = getattr(self.stage_list[0].stage_config, "runtime", {}) if self.stage_list else {}
             if isinstance(runtime_cfg, dict):
-                max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
+                max_batch_size = int(runtime_cfg.get("max_batch_size") or 1)
             else:
-                max_batch_size = int(getattr(runtime_cfg, "max_batch_size", 1) or 1)
+                max_batch_size = int(getattr(runtime_cfg, "max_batch_size") or 1)
 
             if max_batch_size > 1:
                 # Batch prompt support for inline diffusion when batching is enabled.
@@ -488,46 +490,12 @@ class AsyncOmni(OmniBase):
         if len(sampling_params_list) != len(self.stage_list):
             raise ValueError(f"Expected {len(self.stage_list)} sampling params, got {len(sampling_params_list)}")
 
-        # Check max_batch_size from first stage runtime config
-        max_batch_size = 1
-        if self.stage_list:
-            runtime_cfg = getattr(self.stage_list[0].stage_config, "runtime", {})
-            if isinstance(runtime_cfg, dict):
-                max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-            else:
-                max_batch_size = int(getattr(runtime_cfg, "max_batch_size", 1) or 1)
-
-        # Inline diffusion path:
-        # - max_batch_size > 1: use one in-engine batch call
-        # - max_batch_size <= 1: reuse single-request inline path
-        if self._inline_diffusion:
-            if max_batch_size > 1:
-                results_by_request = await self._generate_batch_inline(
-                    prompts=prompts,
-                    request_ids=request_ids,
-                    sampling_params_list=sampling_params_list,
-                )
-            else:
-                results_by_request = {rid: [] for rid in request_ids}
-                for request_id, prompt in zip(request_ids, prompts):
-                    async for output in self._generate_inline(
-                        prompt=prompt,
-                        request_id=request_id,
-                        sampling_params_list=sampling_params_list,
-                        output_modalities=output_modalities,
-                    ):
-                        results_by_request[request_id].append(output)
-            return results_by_request
-
-        # For staged single-diffusion pipelines, submit all requests up-front
-        # so stage worker batching can merge them and call
-        # AsyncOmniDiffusion.generate_batch internally.
-        results_by_request = await self._generate_batch_single_stage_diffusion(
+        results_by_request = await self._generate_batch_inline(
             prompts=prompts,
             request_ids=request_ids,
             sampling_params_list=sampling_params_list,
         )
-        return results_by_request
+        return results_by_request    
 
     async def _generate_batch_inline(
         self,
@@ -581,86 +549,6 @@ class AsyncOmni(OmniBase):
                 e,
             )
             raise
-
-    async def _generate_batch_single_stage_diffusion(
-        self,
-        prompts: list[OmniPromptType],
-        request_ids: list[str],
-        sampling_params_list: Sequence[OmniSamplingParams],
-    ) -> dict[str, list[OmniRequestOutput]]:
-        """Batch-generate for one staged diffusion stage using worker-side batching."""
-        self._run_output_handler()
-
-        stage = self.stage_list[0]
-        sp0 = sampling_params_list[0]
-        wall_start = time.time()
-        results_by_request: dict[str, list[OmniRequestOutput]] = {rid: [] for rid in request_ids}
-        req_metrics: dict[str, OrchestratorAggregator] = {}
-        pending = set(request_ids)
-
-        for rid, prompt in zip(request_ids, prompts):
-            metrics = OrchestratorAggregator(
-                num_stages=1,
-                log_stats=self.log_stats,
-                wall_start_ts=wall_start,
-                final_stage_id_for_e2e=0,
-            )
-            metrics.stage_first_ts[0] = time.time()
-            req_metrics[rid] = metrics
-
-            req_state = ClientRequestState(rid)
-            req_state.metrics = metrics
-            self.request_states[rid] = req_state
-
-            stage.submit(
-                {
-                    "request_id": rid,
-                    "engine_inputs": prompt,
-                    "sampling_params": sp0,
-                }
-            )
-
-        try:
-            while pending:
-                progressed = False
-                for rid in list(pending):
-                    req_state = self.request_states.get(rid)
-                    if req_state is None:
-                        pending.discard(rid)
-                        continue
-
-                    try:
-                        result = req_state.queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        continue
-
-                    progressed = True
-                    engine_outputs, finished, output_to_yield = self._process_single_result(
-                        result=result,
-                        stage=stage,
-                        stage_id=0,
-                        metrics=req_metrics[rid],
-                    )
-
-                    if output_to_yield is not None:
-                        results_by_request[rid].append(output_to_yield)
-
-                    if finished:
-                        req_metrics[rid].on_finalize_request(0, rid, wall_start)
-                        pending.discard(rid)
-                        self.request_states.pop(rid, None)
-
-                if not progressed:
-                    await asyncio.sleep(0.001)
-
-            return results_by_request
-        except (asyncio.CancelledError, GeneratorExit):
-            await self.abort(request_ids)
-            logger.info("[AsyncOrchestrator] Batch request aborted: %s", request_ids)
-            raise
-        finally:
-            for rid in request_ids:
-                self.request_states.pop(rid, None)
 
     async def _generate_inline(
         self,
