@@ -197,6 +197,10 @@ class _DiffusionServingModels:
         self._base_model_paths = base_model_paths
         self.model_config = self._NullModelConfig()
 
+    @property
+    def base_model_paths(self) -> list[BaseModelPath]:
+        return self._base_model_paths
+
     def __getattr__(self, name):
         """Return a sentinel that raises NotImplementedError if called or
         accessed, so any use of unsupported OpenAIServingModels features in
