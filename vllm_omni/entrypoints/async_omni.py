@@ -495,7 +495,7 @@ class AsyncOmni(OmniBase):
             request_ids=request_ids,
             sampling_params_list=sampling_params_list,
         )
-        return results_by_request    
+        return results_by_request
 
     async def _generate_batch_inline(
         self,
