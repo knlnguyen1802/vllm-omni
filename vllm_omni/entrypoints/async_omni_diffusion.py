@@ -186,6 +186,68 @@ class AsyncOmniDiffusion:
             result.request_id = request_id
         return result
 
+    async def generate_batch(
+        self,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        request_ids: list[str] | None = None,
+        lora_request: LoRARequest | None = None,
+    ) -> list[OmniRequestOutput]:
+        """Generate images asynchronously from multiple text prompts in batch.
+
+        Args:
+            prompts: List of text prompts describing the desired images
+            sampling_params: Sampling parameters (shared across all prompts)
+            request_ids: Optional list of unique identifiers for tracking requests
+
+        Returns:
+            List of OmniRequestOutput containing generated images, in same order as prompts
+
+        Raises:
+            RuntimeError: If generation fails
+            ValueError: If request_ids length doesn't match prompts length
+        """
+        if not prompts:
+            return []
+
+        if request_ids is None:
+            request_ids = [f"diff-{uuid.uuid4().hex[:16]}" for _ in prompts]
+        elif len(request_ids) != len(prompts):
+            raise ValueError(f"Expected {len(prompts)} request_ids, got {len(request_ids)}")
+
+        if sampling_params.guidance_scale:
+            sampling_params.guidance_scale_provided = True
+
+        if lora_request is not None:
+            sampling_params.lora_request = lora_request
+
+        request = OmniDiffusionRequest(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            request_ids=request_ids,
+        )
+
+        logger.debug("Starting batch generation for %d requests: %s", len(prompts), request_ids)
+
+        # Run engine in thread pool
+        loop = asyncio.get_event_loop()
+        try:
+            results = await loop.run_in_executor(
+                self._executor,
+                self.engine.step,
+                request,
+            )
+        except Exception as e:
+            logger.error("Batch generation failed for requests %s: %s", request_ids, e)
+            raise RuntimeError(f"Diffusion batch generation failed: {e}") from e
+
+        # Update request_ids if needed and ensure order
+        for i, result in enumerate(results):
+            if not result.request_id and i < len(request_ids):
+                result.request_id = request_ids[i]
+
+        return results
+
     async def generate_stream(
         self,
         prompt: str,
