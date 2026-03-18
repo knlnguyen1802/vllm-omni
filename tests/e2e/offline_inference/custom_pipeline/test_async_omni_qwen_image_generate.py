@@ -6,12 +6,16 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
+import shutil
 import uuid
 from contextlib import ExitStack
+from pathlib import Path
 
 import numpy as np
 import pytest
+from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
 from tests.utils import hardware_test
@@ -19,7 +23,10 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
-MODEL = "tiny-random/Qwen-Image"
+MODEL_REPO = "tiny-random/Qwen-Image"
+LOCAL_MODEL_PATH = Path(os.path.expanduser("~/models/tiny-random/Qwen-Image"))
+CACHE_DIR = Path(os.path.expanduser("~/.cache/tiny-random/Qwen-Image"))
+
 CUSTOM_PIPELINE_CLASS = (
     "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob."
     "QwenImagePipelineWithLogProbForTest"
@@ -29,17 +36,50 @@ WORKER_EXTENSION_CLASS = (
     "vLLMOmniColocateWorkerExtensionForTest"
 )
 
+
+def ensure_model_available() -> str:
+    """Ensure the model weights and tokenizer are available for testing.
+
+    If missing locally, download from HF Hub, cache temporarily, and
+    mark for deletion on process exit.
+    """
+    if LOCAL_MODEL_PATH.exists():
+        print(f"\u2705 Using local model at {LOCAL_MODEL_PATH}")
+        return str(LOCAL_MODEL_PATH)
+
+    print(f"\u26a0\ufe0f Local model not found at {LOCAL_MODEL_PATH}. "
+          f"Pulling from Hugging Face Hub...")
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    hf_model_path = snapshot_download(
+        repo_id=MODEL_REPO,
+        cache_dir=str(CACHE_DIR),
+        local_files_only=False,
+        resume_download=True,
+    )
+
+    print(f"\u2705 Downloaded model to cache: {hf_model_path}")
+
+    def _cleanup():
+        print(f"\U0001f9f9 Cleaning up downloaded model cache: {hf_model_path}")
+        shutil.rmtree(hf_model_path, ignore_errors=True)
+
+    atexit.register(_cleanup)
+    return hf_model_path
+
+
+MODEL = ensure_model_available()
+
 _TOKENIZER_CACHE = None
 
 
 def _get_tokenizer():
-    """Lazy load tokenizer."""
+    """Lazy load tokenizer from the resolved model path."""
     global _TOKENIZER_CACHE
     if _TOKENIZER_CACHE is None:
-        tokenizer_path = os.path.join(os.path.dirname(__file__), "../..", "models", "tokenizer")
         _TOKENIZER_CACHE = AutoTokenizer.from_pretrained(
-            tokenizer_path, trust_remote_code=True
-        ) if os.path.exists(tokenizer_path) else None
+            MODEL, trust_remote_code=True
+        )
     return _TOKENIZER_CACHE
 
 
@@ -47,7 +87,10 @@ def _tokenize_prompt(text: str) -> list[int]:
     """Tokenize a text prompt into valid token IDs for the model."""
     tokenizer = _get_tokenizer()
     if tokenizer is None:
-        raise RuntimeError("Tokenizer not found. Please ensure tokenizer is available at expected path.")
+        raise RuntimeError(
+            "Tokenizer not found. ensure_model_available() should have "
+            "downloaded the model; check that the repo exists on HF Hub."
+        )
     messages = [{"role": "user", "content": text}]
     token_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
     return token_ids
@@ -194,3 +237,4 @@ async def test_async_omni_generate_concurrent():
         assert len(outputs) == len(prompts)
         for output in outputs:
             _assert_valid_image_output(output)
+
