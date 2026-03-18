@@ -6,18 +6,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from contextlib import ExitStack
 
 import numpy as np
 import pytest
+from transformers import AutoTokenizer
 
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
-MODEL = "riverclouds/qwen_image_random"
+MODEL = "tiny-random/Qwen-Image"
 CUSTOM_PIPELINE_CLASS = (
     "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob."
     "QwenImagePipelineWithLogProbForTest"
@@ -26,6 +28,29 @@ WORKER_EXTENSION_CLASS = (
     "tests.e2e.offline_inference.custom_pipeline.worker_extension."
     "vLLMOmniColocateWorkerExtensionForTest"
 )
+
+_TOKENIZER_CACHE = None
+
+
+def _get_tokenizer():
+    """Lazy load tokenizer."""
+    global _TOKENIZER_CACHE
+    if _TOKENIZER_CACHE is None:
+        tokenizer_path = os.path.join(os.path.dirname(__file__), "../..", "models", "tokenizer")
+        _TOKENIZER_CACHE = AutoTokenizer.from_pretrained(
+            tokenizer_path, trust_remote_code=True
+        ) if os.path.exists(tokenizer_path) else None
+    return _TOKENIZER_CACHE
+
+
+def _tokenize_prompt(text: str) -> list[int]:
+    """Tokenize a text prompt into valid token IDs for the model."""
+    tokenizer = _get_tokenizer()
+    if tokenizer is None:
+        raise RuntimeError("Tokenizer not found. Please ensure tokenizer is available at expected path.")
+    messages = [{"role": "user", "content": text}]
+    token_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+    return token_ids
 
 
 def _sampling_params(*, logprobs: bool = False, seed: int = 42) -> OmniDiffusionSamplingParams:
@@ -41,11 +66,19 @@ def _sampling_params(*, logprobs: bool = False, seed: int = 42) -> OmniDiffusion
 
 async def _generate_once(
     engine: AsyncOmni,
-    prompt: str,
+    prompt: str | list[int] | dict,
     *,
     request_id: str,
     sampling_params: OmniDiffusionSamplingParams,
 ) -> OmniRequestOutput:
+    # Convert text prompt to dict with tokenized prompt_ids
+    if isinstance(prompt, str):
+        prompt_ids = _tokenize_prompt(prompt)
+        prompt = {"prompt_ids": prompt_ids}
+    elif isinstance(prompt, list):
+        prompt = {"prompt_ids": prompt}
+    # else: assume it's already a dict with prompt_ids
+
     last_output = None
     async for output in engine.generate(
         prompt=prompt,
