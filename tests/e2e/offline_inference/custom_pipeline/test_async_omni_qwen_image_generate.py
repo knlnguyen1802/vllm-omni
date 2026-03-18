@@ -197,7 +197,8 @@ async def test_async_omni_generate():
 
         output = await _generate_once(
             engine,
-            "a beautiful sunset over the ocean with vibrant clouds",
+            "a beautiful sunset over the ocean with vibrant orange and purple clouds "
+            "reflecting on the calm water surface near a rocky coastline",
             request_id=f"test_{uuid.uuid4().hex[:8]}",
             sampling_params=_sampling_params(logprobs=False, seed=42),
         )
