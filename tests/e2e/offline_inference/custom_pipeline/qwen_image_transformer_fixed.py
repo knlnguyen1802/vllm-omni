@@ -20,7 +20,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
 
 # This class is need because there is bug in vllm-omni
 # TODO: Remove this class after the bug is fixed and vllm-omni is updated to the fixed version
-class QwenImageTransformer2DModelFixed(QwenImageTransformer2DModel):
+class QwenImageTransformer2DModelFixedForTest(QwenImageTransformer2DModel):
     def __init__(
         self,
         od_config: OmniDiffusionConfig,

@@ -14,7 +14,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 
 @dataclass
-class FlowMatchSDEDiscreteSchedulerOutput(BaseOutput):
+class FlowMatchSDEDiscreteSchedulerOutputForTest(BaseOutput):
     """
     Output class for the scheduler's `step` function output.
 
@@ -36,7 +36,7 @@ class FlowMatchSDEDiscreteSchedulerOutput(BaseOutput):
     std_dev_t: torch.FloatTensor
 
 
-class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
+class FlowMatchSDEDiscreteSchedulerForTest(FlowMatchEulerDiscreteScheduler):
     """SDE version of the FlowMatchEulerDiscreteScheduler.
     The implementation is based on FlowGRPO paper (https://arxiv.org/abs/2505.05470)
     and diffusers v0.37 branch.

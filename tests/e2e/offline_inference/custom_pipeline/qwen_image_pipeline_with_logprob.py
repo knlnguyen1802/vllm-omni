@@ -23,8 +23,8 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
-from verl.models.diffusion.schedulers import FlowMatchSDEDiscreteScheduler
-from verl.models.diffusion.vllm_omni.qwen_image.qwen_image_transformer import QwenImageTransformer2DModelFixed
+from tests.e2e.offline_inference.custom_pipeline.flow_match_sde_scheduler import FlowMatchSDEDiscreteSchedulerForTest
+from tests.e2e.offline_inference.custom_pipeline.qwen_image_transformer_fixed import QwenImageTransformer2DModelFixedForTest
 
 
 def _maybe_to_cpu(v):
@@ -55,7 +55,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         # Check if model is a local path
         local_files_only = os.path.exists(model)
 
-        self.scheduler = FlowMatchSDEDiscreteScheduler.from_pretrained(
+        self.scheduler = FlowMatchSDEDiscreteSchedulerForTest.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -64,7 +64,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = QwenImageTransformer2DModelFixed(od_config=od_config)
+        self.transformer = QwenImageTransformer2DModelFixedForTest(od_config=od_config)
 
         self.stage = None
 
