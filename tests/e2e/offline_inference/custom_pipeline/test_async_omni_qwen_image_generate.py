@@ -206,69 +206,74 @@ async def test_async_omni_generate():
         _assert_valid_image_output(output)
 
 
-# @pytest.mark.core_model
-# @pytest.mark.diffusion
-# @hardware_test(res={"cuda": "L4"}, num_cards=1)
-# @pytest.mark.asyncio
-# async def test_async_omni_generate_with_logprobs():
-#     with ExitStack() as after:
-#         engine = AsyncOmni(
-#             model=MODEL,
-#             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
-#             worker_extension_cls=WORKER_EXTENSION_CLASS,
-#             enforce_eager=True,
-#         )
-#         after.callback(engine.shutdown)
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.asyncio
+async def test_async_omni_generate_with_logprobs():
+    with ExitStack() as after:
+        engine = AsyncOmni(
+            model=MODEL_PATH,
+            custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
+            worker_extension_cls=WORKER_EXTENSION_CLASS,
+            enforce_eager=True,
+        )
+        after.callback(engine.shutdown)
 
-#         output = await _generate_once(
-#             engine,
-#             "a futuristic city at night with neon lights",
-#             request_id=f"test_lp_{uuid.uuid4().hex[:8]}",
-#             sampling_params=_sampling_params(logprobs=True, seed=123),
-#         )
+        output = await _generate_once(
+            engine,
+            "a futuristic city at night with neon lights glowing on tall glass "
+            "skyscrapers and flying vehicles soaring between the buildings",
+            request_id=f"test_lp_{uuid.uuid4().hex[:8]}",
+            sampling_params=_sampling_params(logprobs=True, seed=123),
+        )
 
-#         _assert_valid_image_output(output)
+        _assert_valid_image_output(output)
 
-#         all_log_probs = output.custom_output.get("all_log_probs")
-#         assert all_log_probs is not None, "all_log_probs should be present when logprobs=True"
-#         assert hasattr(all_log_probs, "shape")
-#         assert all_log_probs.numel() > 0
+        all_log_probs = output.custom_output.get("all_log_probs")
+        assert all_log_probs is not None, "all_log_probs should be present when logprobs=True"
+        assert hasattr(all_log_probs, "shape")
+        assert all_log_probs.numel() > 0
 
 
-# @pytest.mark.core_model
-# @pytest.mark.diffusion
-# @hardware_test(res={"cuda": "L4"}, num_cards=1)
-# @pytest.mark.asyncio
-# async def test_async_omni_generate_concurrent():
-#     with ExitStack() as after:
-#         engine = AsyncOmni(
-#             model=MODEL,
-#             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
-#             worker_extension_cls=WORKER_EXTENSION_CLASS,
-#             enforce_eager=True,
-#         )
-#         after.callback(engine.shutdown)
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.asyncio
+async def test_async_omni_generate_concurrent():
+    with ExitStack() as after:
+        engine = AsyncOmni(
+            model=MODEL_PATH,
+            custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
+            worker_extension_cls=WORKER_EXTENSION_CLASS,
+            enforce_eager=True,
+        )
+        after.callback(engine.shutdown)
 
-#         prompts = [
-#             "a beautiful sunset over the ocean with vibrant clouds",
-#             "a fluffy orange cat on a windowsill in sunlight",
-#             "a mountain landscape with snow and a frozen lake",
-#             "a futuristic city skyline with flying cars",
-#         ]
+        prompts = [
+            "a beautiful sunset over the ocean with vibrant orange and purple clouds "
+            "reflecting on the calm water surface near a rocky coastline",
+            "a fluffy orange cat sitting on a wooden windowsill looking outside at "
+            "a garden full of colorful flowers on a bright sunny afternoon",
+            "a majestic mountain landscape covered with fresh white snow under a "
+            "clear blue sky with pine trees in the foreground and a frozen lake",
+            "a futuristic city at night with neon lights glowing on tall glass "
+            "skyscrapers and flying vehicles soaring between the buildings",
+        ]
 
-#         tasks = [
-#             _generate_once(
-#                 engine,
-#                 prompt,
-#                 request_id=f"concurrent_{i}_{uuid.uuid4().hex[:8]}",
-#                 sampling_params=_sampling_params(logprobs=False, seed=100 + i),
-#             )
-#             for i, prompt in enumerate(prompts)
-#         ]
+        tasks = [
+            _generate_once(
+                engine,
+                prompt,
+                request_id=f"concurrent_{i}_{uuid.uuid4().hex[:8]}",
+                sampling_params=_sampling_params(logprobs=False, seed=100 + i),
+            )
+            for i, prompt in enumerate(prompts)
+        ]
 
-#         outputs = await asyncio.gather(*tasks)
+        outputs = await asyncio.gather(*tasks)
 
-#         assert len(outputs) == len(prompts)
-#         for output in outputs:
-#             _assert_valid_image_output(output)
+        assert len(outputs) == len(prompts)
+        for output in outputs:
+            _assert_valid_image_output(output)
 
