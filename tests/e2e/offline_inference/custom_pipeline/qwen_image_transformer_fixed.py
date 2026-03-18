@@ -6,7 +6,6 @@ from __future__ import annotations
 import torch.nn as nn
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.model_executor.layers.layernorm import RMSNorm
-
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     ImageRopePrepare,
@@ -19,9 +18,9 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
 )
 
 
+# This class is need because there is bug in vllm-omni
+# TODO: Remove this class after the bug is fixed and vllm-omni is updated to the fixed version
 class QwenImageTransformer2DModelFixed(QwenImageTransformer2DModel):
-    """Test-time fixed transformer init compatible with Qwen-Image pipeline."""
-
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
@@ -32,7 +31,7 @@ class QwenImageTransformer2DModelFixed(QwenImageTransformer2DModel):
         attention_head_dim: int = 128,
         num_attention_heads: int = 24,
         joint_attention_dim: int = 3584,
-        guidance_embeds: bool = False,
+        guidance_embeds: bool = False,  # TODO: this should probably be removed
         axes_dims_rope: tuple[int, int, int] = (16, 56, 56),
         zero_cond_t: bool = False,
         use_additional_t_cond: bool = False,
@@ -57,11 +56,11 @@ class QwenImageTransformer2DModelFixed(QwenImageTransformer2DModel):
             self.pos_embed = QwenEmbedLayer3DRope(theta=10000, axes_dim=list(self.axes_dims_rope), scale_rope=True)
 
         self.time_text_embed = QwenTimestepProjEmbeddings(
-            embedding_dim=self.inner_dim,
-            use_additional_t_cond=use_additional_t_cond,
+            embedding_dim=self.inner_dim, use_additional_t_cond=use_additional_t_cond
         )
 
         self.txt_norm = RMSNorm(self.joint_attention_dim, eps=1e-6)
+
         self.img_in = nn.Linear(in_channels, self.inner_dim)
         self.txt_in = nn.Linear(self.joint_attention_dim, self.inner_dim)
 
@@ -82,5 +81,6 @@ class QwenImageTransformer2DModelFixed(QwenImageTransformer2DModel):
 
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
+
         self.image_rope_prepare = ImageRopePrepare(self.img_in, self.pos_embed)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
