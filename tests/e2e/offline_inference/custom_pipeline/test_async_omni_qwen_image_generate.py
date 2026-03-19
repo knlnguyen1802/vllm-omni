@@ -32,46 +32,10 @@ WORKER_EXTENSION_CLASS = (
     "vLLMOmniColocateWorkerExtensionForTest"
 )
 
-
-LOCAL_MODEL_PATH = Path(os.path.expanduser("~/models/tiny-random/Qwen-Image"))
-CACHE_DIR = Path(os.path.expanduser("~/.cache/tiny-random/Qwen-Image"))
-
 # Use your specified HF repo name/path directly here
-MODEL_REPO = "tiny-random/Qwen-Image"
-MODEL_PATH = LOCAL_MODEL_PATH
+MODEL = "tiny-random/Qwen-Image"
 
-
-def ensure_model_available() -> str:
-    """Ensure the model weights and tokenizer are available for testing.
-
-    If missing locally, download from HF Hub, cache temporarily, and
-    mark for deletion on process exit.
-    """
-    if LOCAL_MODEL_PATH.exists():
-        print(f"✅ Using local model at {LOCAL_MODEL_PATH}")
-        return str(LOCAL_MODEL_PATH)
-
-    print(f"⚠️ Local model not found at {LOCAL_MODEL_PATH}. Pulling from Hugging Face Hub...")
-
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    hf_model_path = snapshot_download(
-        repo_id=MODEL_REPO,
-        cache_dir=str(CACHE_DIR),
-        local_files_only=False,
-        resume_download=True,
-    )
-
-    print(f"✅ Downloaded model to cache: {hf_model_path}")
-
-    def _cleanup():
-        print(f"🧹 Cleaning up downloaded model cache: {hf_model_path}")
-        shutil.rmtree(hf_model_path, ignore_errors=True)
-
-    atexit.register(_cleanup)
-    return hf_model_path
-
-
-MODEL_PATH = ensure_model_available()
+TOKENIZER_MODEL="Qwen/Qwen2-1.5B-Instruct"
 
 
 # ---------------------------------------------------------------------
@@ -118,7 +82,7 @@ def normalize_token_ids(tokenized_output) -> list[int]:
 
 def _tokenize_prompt(text: str) -> list[int]:
     """Tokenize a text prompt into valid token IDs for the model."""
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_PATH, "tokenizer"), trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, trust_remote_code=True)
     messages = [{"role": "user", "content": text}]
     token_ids = normalize_token_ids(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False))
     assert len(token_ids) > _MIN_PROMPT_TOKENS, (
@@ -188,7 +152,7 @@ def _assert_valid_image_output(output: OmniRequestOutput) -> None:
 async def test_async_omni_generate():
     with ExitStack() as after:
         engine = AsyncOmni(
-            model=MODEL_PATH,
+            model=MODEL,
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
@@ -213,7 +177,7 @@ async def test_async_omni_generate():
 async def test_async_omni_generate_with_logprobs():
     with ExitStack() as after:
         engine = AsyncOmni(
-            model=MODEL_PATH,
+            model=MODEL,
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
@@ -243,7 +207,7 @@ async def test_async_omni_generate_with_logprobs():
 async def test_async_omni_generate_concurrent():
     with ExitStack() as after:
         engine = AsyncOmni(
-            model=MODEL_PATH,
+            model=MODEL,
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
