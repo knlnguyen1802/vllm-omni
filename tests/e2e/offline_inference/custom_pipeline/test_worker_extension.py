@@ -19,6 +19,5 @@ def test_worker_extension_inheritance():
 
 def test_worker_extension_test_function():
     assert (
-        vLLMOmniColocateWorkerExtensionForTest.test_extension_name()
-        == "vllm-omni-colocate-worker-extension-for-test"
+        vLLMOmniColocateWorkerExtensionForTest.test_extension_name() == "vllm-omni-colocate-worker-extension-for-test"
     )

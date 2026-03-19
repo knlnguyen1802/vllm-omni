@@ -6,16 +6,11 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
-import os
-import shutil
 import uuid
 from contextlib import ExitStack
-from pathlib import Path
 
 import numpy as np
 import pytest
-from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
 from tests.utils import hardware_test
@@ -24,18 +19,16 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 CUSTOM_PIPELINE_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob."
-    "QwenImagePipelineWithLogProbForTest"
+    "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob.QwenImagePipelineWithLogProbForTest"
 )
 WORKER_EXTENSION_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline.worker_extension."
-    "vLLMOmniColocateWorkerExtensionForTest"
+    "tests.e2e.offline_inference.custom_pipeline.worker_extension.vLLMOmniColocateWorkerExtensionForTest"
 )
 
 # Use your specified HF repo name/path directly here
 MODEL = "tiny-random/Qwen-Image"
 
-TOKENIZER_MODEL="Qwen/Qwen2-1.5B-Instruct"
+TOKENIZER_MODEL = "Qwen/Qwen2-1.5B-Instruct"
 
 
 # ---------------------------------------------------------------------
@@ -43,6 +36,7 @@ TOKENIZER_MODEL="Qwen/Qwen2-1.5B-Instruct"
 # ---------------------------------------------------------------------
 
 _MIN_PROMPT_TOKENS = 35
+
 
 def normalize_token_ids(tokenized_output) -> list[int]:
     """Normalize tokenizer outputs into a flat ``list[int]``.
@@ -79,6 +73,7 @@ def normalize_token_ids(tokenized_output) -> list[int]:
         except (TypeError, ValueError) as e:
             raise TypeError(f"token_id must be int-convertible, got {type(token_id).__name__}: {token_id!r}") from e
     return normalized_ids
+
 
 def _tokenize_prompt(text: str) -> list[int]:
     """Tokenize a text prompt into valid token IDs for the model."""
@@ -240,4 +235,3 @@ async def test_async_omni_generate_concurrent():
         assert len(outputs) == len(prompts)
         for output in outputs:
             _assert_valid_image_output(output)
-

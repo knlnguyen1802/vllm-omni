@@ -29,17 +29,14 @@ import pytest
 from tests.utils import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 MODEL = "tiny-random/Qwen-Image"
 CUSTOM_PIPELINE_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob."
-    "QwenImagePipelineWithLogProbForTest"
+    "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob.QwenImagePipelineWithLogProbForTest"
 )
 WORKER_EXTENSION_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline.worker_extension."
-    "vLLMOmniColocateWorkerExtensionForTest"
+    "tests.e2e.offline_inference.custom_pipeline.worker_extension.vLLMOmniColocateWorkerExtensionForTest"
 )
 
 

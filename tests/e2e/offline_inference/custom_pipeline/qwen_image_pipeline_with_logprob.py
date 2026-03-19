@@ -17,16 +17,17 @@ from typing import Any, Literal
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_qwenimage import AutoencoderKLQwenImage
 from transformers import Qwen2_5_VLForConditionalGeneration
+
+from tests.e2e.offline_inference.custom_pipeline.flow_match_sde_scheduler import FlowMatchSDEDiscreteSchedulerForTest
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import QwenImageTransformer2DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
-from tests.e2e.offline_inference.custom_pipeline.flow_match_sde_scheduler import FlowMatchSDEDiscreteSchedulerForTest
 
-from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import QwenImageTransformer2DModel
 def _maybe_to_cpu(v):
     if isinstance(v, torch.Tensor):
         return v.detach().cpu()
