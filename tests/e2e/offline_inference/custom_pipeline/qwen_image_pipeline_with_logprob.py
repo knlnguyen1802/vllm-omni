@@ -225,6 +225,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
                 generator=generator,
                 noise_level=cur_noise_level,
                 sde_type=sde_type,
+                return_logprobs=logprobs,
                 return_dict=False,
             )
 
