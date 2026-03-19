@@ -22,11 +22,11 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
 from tests.e2e.offline_inference.custom_pipeline.flow_match_sde_scheduler import FlowMatchSDEDiscreteSchedulerForTest
-from tests.e2e.offline_inference.custom_pipeline.qwen_image_transformer_fixed import QwenImageTransformer2DModelFixedForTest
 
-
+from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import QwenImageTransformer2DModel
 def _maybe_to_cpu(v):
     if isinstance(v, torch.Tensor):
         return v.detach().cpu()
@@ -64,7 +64,8 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = QwenImageTransformer2DModelFixedForTest(od_config=od_config)
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
+        self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
 
         self.stage = None
 
