@@ -6,12 +6,16 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
+import shutil
 import uuid
 from contextlib import ExitStack
+from pathlib import Path
 
 import numpy as np
 import pytest
+from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
 
 from tests.utils import hardware_test
@@ -19,7 +23,6 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
-MODEL = "tiny-random/Qwen-Image"
 CUSTOM_PIPELINE_CLASS = (
     "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob."
     "QwenImagePipelineWithLogProbForTest"
@@ -29,27 +32,100 @@ WORKER_EXTENSION_CLASS = (
     "vLLMOmniColocateWorkerExtensionForTest"
 )
 
-_TOKENIZER_CACHE = None
+
+LOCAL_MODEL_PATH = Path(os.path.expanduser("~/models/tiny-random/Qwen-Image"))
+CACHE_DIR = Path(os.path.expanduser("~/.cache/tiny-random/Qwen-Image"))
+
+# Use your specified HF repo name/path directly here
+MODEL_REPO = "tiny-random/Qwen-Image"
+MODEL_PATH = LOCAL_MODEL_PATH
 
 
-def _get_tokenizer():
-    """Lazy load tokenizer."""
-    global _TOKENIZER_CACHE
-    if _TOKENIZER_CACHE is None:
-        tokenizer_path = os.path.join(os.path.dirname(__file__), "../..", "models", "tokenizer")
-        _TOKENIZER_CACHE = AutoTokenizer.from_pretrained(
-            tokenizer_path, trust_remote_code=True
-        ) if os.path.exists(tokenizer_path) else None
-    return _TOKENIZER_CACHE
+def ensure_model_available() -> str:
+    """Ensure the model weights and tokenizer are available for testing.
 
+    If missing locally, download from HF Hub, cache temporarily, and
+    mark for deletion on process exit.
+    """
+    if LOCAL_MODEL_PATH.exists():
+        print(f"✅ Using local model at {LOCAL_MODEL_PATH}")
+        return str(LOCAL_MODEL_PATH)
+
+    print(f"⚠️ Local model not found at {LOCAL_MODEL_PATH}. Pulling from Hugging Face Hub...")
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    hf_model_path = snapshot_download(
+        repo_id=MODEL_REPO,
+        cache_dir=str(CACHE_DIR),
+        local_files_only=False,
+        resume_download=True,
+    )
+
+    print(f"✅ Downloaded model to cache: {hf_model_path}")
+
+    def _cleanup():
+        print(f"🧹 Cleaning up downloaded model cache: {hf_model_path}")
+        shutil.rmtree(hf_model_path, ignore_errors=True)
+
+    atexit.register(_cleanup)
+    return hf_model_path
+
+
+MODEL_PATH = ensure_model_available()
+
+
+# ---------------------------------------------------------------------
+#                👇 Test Helper Functions & Fixtures 👇
+# ---------------------------------------------------------------------
+
+_MIN_PROMPT_TOKENS = 35
+
+def normalize_token_ids(tokenized_output) -> list[int]:
+    """Normalize tokenizer outputs into a flat ``list[int]``.
+
+    This handles Transformers 4/5 differences where ``apply_chat_template(tokenize=True)``
+    may return either ``list[int]`` or a ``BatchEncoding``/mapping with ``input_ids``.
+    """
+
+    token_ids = tokenized_output
+    if isinstance(tokenized_output, dict):
+        if "input_ids" in tokenized_output:
+            token_ids = tokenized_output["input_ids"]
+    elif hasattr(tokenized_output, "input_ids"):
+        token_ids = tokenized_output.input_ids
+
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+
+    if isinstance(token_ids, tuple):
+        token_ids = list(token_ids)
+
+    if isinstance(token_ids, list) and len(token_ids) == 1 and isinstance(token_ids[0], list | tuple):
+        token_ids = list(token_ids[0])
+
+    if not isinstance(token_ids, list):
+        raise TypeError(f"token_ids must be list-like token ids, got {type(token_ids).__name__}: {token_ids!r}")
+
+    normalized_ids = []
+    for idx, token_id in enumerate(token_ids):
+        if hasattr(token_id, "item"):
+            token_id = token_id.item()
+        try:
+            normalized_ids.append(int(token_id))
+        except (TypeError, ValueError) as e:
+            raise TypeError(f"token_id must be int-convertible, got {type(token_id).__name__}: {token_id!r}") from e
+    return normalized_ids
 
 def _tokenize_prompt(text: str) -> list[int]:
     """Tokenize a text prompt into valid token IDs for the model."""
-    tokenizer = _get_tokenizer()
-    if tokenizer is None:
-        raise RuntimeError("Tokenizer not found. Please ensure tokenizer is available at expected path.")
+    tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_PATH, "tokenizer"), trust_remote_code=True)
     messages = [{"role": "user", "content": text}]
-    token_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+    token_ids = normalize_token_ids(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False))
+    assert len(token_ids) > _MIN_PROMPT_TOKENS, (
+        f"Prompt too short ({len(token_ids)} tokens, need >{_MIN_PROMPT_TOKENS}). "
+        f"The pipeline drops the first 34 chat‑template prefix tokens; "
+        f"use a longer prompt so content tokens remain after the drop."
+    )
     return token_ids
 
 
@@ -112,7 +188,7 @@ def _assert_valid_image_output(output: OmniRequestOutput) -> None:
 async def test_async_omni_generate():
     with ExitStack() as after:
         engine = AsyncOmni(
-            model=MODEL,
+            model=MODEL_PATH,
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
@@ -121,7 +197,8 @@ async def test_async_omni_generate():
 
         output = await _generate_once(
             engine,
-            "a beautiful sunset over the ocean with vibrant clouds",
+            "a beautiful sunset over the ocean with vibrant orange and purple clouds "
+            "reflecting on the calm water surface near a rocky coastline",
             request_id=f"test_{uuid.uuid4().hex[:8]}",
             sampling_params=_sampling_params(logprobs=False, seed=42),
         )
@@ -136,7 +213,7 @@ async def test_async_omni_generate():
 async def test_async_omni_generate_with_logprobs():
     with ExitStack() as after:
         engine = AsyncOmni(
-            model=MODEL,
+            model=MODEL_PATH,
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
@@ -145,7 +222,8 @@ async def test_async_omni_generate_with_logprobs():
 
         output = await _generate_once(
             engine,
-            "a futuristic city at night with neon lights",
+            "a futuristic city at night with neon lights glowing on tall glass "
+            "skyscrapers and flying vehicles soaring between the buildings",
             request_id=f"test_lp_{uuid.uuid4().hex[:8]}",
             sampling_params=_sampling_params(logprobs=True, seed=123),
         )
@@ -165,7 +243,7 @@ async def test_async_omni_generate_with_logprobs():
 async def test_async_omni_generate_concurrent():
     with ExitStack() as after:
         engine = AsyncOmni(
-            model=MODEL,
+            model=MODEL_PATH,
             custom_pipeline_args={"pipeline_class": CUSTOM_PIPELINE_CLASS},
             worker_extension_cls=WORKER_EXTENSION_CLASS,
             enforce_eager=True,
@@ -173,10 +251,14 @@ async def test_async_omni_generate_concurrent():
         after.callback(engine.shutdown)
 
         prompts = [
-            "a beautiful sunset over the ocean with vibrant clouds",
-            "a fluffy orange cat on a windowsill in sunlight",
-            "a mountain landscape with snow and a frozen lake",
-            "a futuristic city skyline with flying cars",
+            "a beautiful sunset over the ocean with vibrant orange and purple clouds "
+            "reflecting on the calm water surface near a rocky coastline",
+            "a fluffy orange cat sitting on a wooden windowsill looking outside at "
+            "a garden full of colorful flowers on a bright sunny afternoon",
+            "a majestic mountain landscape covered with fresh white snow under a "
+            "clear blue sky with pine trees in the foreground and a frozen lake",
+            "a futuristic city at night with neon lights glowing on tall glass "
+            "skyscrapers and flying vehicles soaring between the buildings",
         ]
 
         tasks = [
@@ -194,3 +276,4 @@ async def test_async_omni_generate_concurrent():
         assert len(outputs) == len(prompts)
         for output in outputs:
             _assert_valid_image_output(output)
+
