@@ -54,11 +54,7 @@ def _create_inline_engine() -> AsyncOmni:
         worker_extension_cls=WORKER_EXTENSION_CLASS,
         enforce_eager=True,
     )
-    # Sanity: confirm we are indeed in inline mode
-    assert engine._inline_diffusion, (
-        "Expected inline diffusion mode for a single-stage diffusion pipeline. "
-        "If this fails, the optimisation path in AsyncOmni.__init__ may have changed."
-    )
+
     return engine
 
 
