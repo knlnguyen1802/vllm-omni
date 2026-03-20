@@ -13,7 +13,7 @@ requests will be batched internally.
 Even without explicit batching config this test is useful for verifying
 that concurrent async requests are handled correctly.
 
-Usage (standalone – not included in the regular CI test flow):
+Usage (standalone):
 
     python tests/e2e/offline_inference/test_diffusion_batching.py \
         --model <model_name_or_path> \
@@ -28,13 +28,31 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import sys
 import time
 import uuid
+from pathlib import Path
 
+import pytest
+import torch
+
+from tests.utils import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
+# ruff: noqa: E402
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from vllm_omni import Omni
+
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
+
+models = ["riverclouds/qwen_image_random"]
 
 # ------------------------------------------------------------------
 # Prompt fixtures
@@ -74,6 +92,19 @@ def _default_sampling_params(**overrides) -> OmniDiffusionSamplingParams:
     return OmniDiffusionSamplingParams(**defaults)
 
 
+def _default_sync_sampling_params(**overrides) -> OmniDiffusionSamplingParams:
+    """Create sampling params for the synchronous Omni.generate() API."""
+    defaults = dict(
+        num_inference_steps=2,
+        width=256,
+        height=256,
+        guidance_scale=0.0,
+        generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
+    )
+    defaults.update(overrides)
+    return OmniDiffusionSamplingParams(**defaults)
+
+
 async def _collect_generate(omni: AsyncOmni, prompt, request_id, sampling_params_list) -> OmniRequestOutput:
     """Consume the AsyncOmni.generate() async generator and return the last output."""
     last_output: OmniRequestOutput | None = None
@@ -88,8 +119,21 @@ async def _collect_generate(omni: AsyncOmni, prompt, request_id, sampling_params
     return last_output
 
 
+def _extract_images(output: OmniRequestOutput) -> list:
+    """Extract images from an OmniRequestOutput, handling both direct
+    and nested request_output structures."""
+    if output.images:
+        return output.images
+    # When the output comes from the orchestrator pipeline, images may be
+    # nested inside request_output.
+    inner = getattr(output, "request_output", None)
+    if inner is not None and hasattr(inner, "images") and inner.images:
+        return inner.images
+    return []
+
+
 # ------------------------------------------------------------------
-# Warm-up
+# Warm-up (async)
 # ------------------------------------------------------------------
 
 async def warmup(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
@@ -174,19 +218,6 @@ async def run_batch(
     return elapsed
 
 
-def _extract_images(output: OmniRequestOutput) -> list:
-    """Extract images from an OmniRequestOutput, handling both direct
-    and nested request_output structures."""
-    if output.images:
-        return output.images
-    # When the output comes from the orchestrator pipeline, images may be
-    # nested inside request_output.
-    inner = getattr(output, "request_output", None)
-    if inner is not None and hasattr(inner, "images") and inner.images:
-        return inner.images
-    return []
-
-
 # ------------------------------------------------------------------
 # Explicit batch (passes list of prompts to generate())
 # ------------------------------------------------------------------
@@ -224,6 +255,10 @@ async def run_batch_explicit(
     return elapsed
 
 
+# ------------------------------------------------------------------
+# Async validation helpers
+# ------------------------------------------------------------------
+
 async def validate_batch_explicit(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
     """Validate generate(prompt=[...]) returns correct results for every prompt."""
     print(f"🔍 Validating batch generate() correctness with {len(prompts)} prompts ...")
@@ -248,10 +283,6 @@ async def validate_batch_explicit(omni: AsyncOmni, prompts: list[dict[str, str]]
 
     print("   ✅ All request_ids matched, results count correct.\n")
 
-
-# ------------------------------------------------------------------
-# Validation
-# ------------------------------------------------------------------
 
 async def validate_concurrent(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
     """Validate that every concurrent request receives a distinct result
@@ -279,7 +310,7 @@ async def validate_concurrent(omni: AsyncOmni, prompts: list[dict[str, str]]) ->
 
 
 # ------------------------------------------------------------------
-# Single vs Parallel comparison
+# Single vs Parallel comparison (CLI only)
 # ------------------------------------------------------------------
 
 async def compare_single_vs_parallel(
@@ -309,7 +340,7 @@ async def compare_single_vs_parallel(
 
 
 # ------------------------------------------------------------------
-# Main entrypoint
+# CLI main entrypoint
 # ------------------------------------------------------------------
 
 async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> None:
@@ -339,38 +370,264 @@ async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> 
         omni.shutdown()
 
 
-# ------------------------------------------------------------------
-# pytest entry point (for quick validation, not in CI flow)
-# ------------------------------------------------------------------
+# ==================================================================
+# pytest test cases
+# ==================================================================
 
-def test_diffusion_batching_correctness():
-    """Lightweight pytest-compatible smoke test.
 
-    Instantiates AsyncOmni, fires 4 requests in parallel and checks
-    that every request_id comes back.
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@pytest.mark.parametrize("model_name", models)
+def test_diffusion_batching_sync_sequential(model_name: str):
+    """Test that synchronous Omni can generate images for multiple prompts
+    submitted sequentially (one at a time) and each returns a valid image."""
+    m = None
+    try:
+        m = Omni(model=model_name)
+        sp = _default_sync_sampling_params()
+        prompts = TEST_PROMPTS[:4]
 
-    Skips automatically when the model is not available.
-    """
-    import os
+        for i, prompt in enumerate(prompts):
+            outputs = m.generate(prompt, sp)
+            first_output = outputs[0]
+            assert first_output.final_output_type == "image"
+            assert hasattr(first_output, "request_output") and first_output.request_output is not None, (
+                f"No request_output found for prompt {i}"
+            )
 
-    import pytest
+            req_out = first_output.request_output
+            assert isinstance(req_out, OmniRequestOutput), (
+                f"Invalid request_output type for prompt {i}"
+            )
+            assert hasattr(req_out, "images") and req_out.images, (
+                f"No images in request_output for prompt {i}"
+            )
+            images = req_out.images
+            assert len(images) >= 1, f"Expected at least 1 image for prompt {i}, got {len(images)}"
+            assert images[0].width == 256
+            assert images[0].height == 256
+            print(f"   prompt {i}: OK ({len(images)} images)")
+    except Exception as e:
+        print(f"Test failed with error: {e}")
+        raise
+    finally:
+        if m is not None and hasattr(m, "close"):
+            m.close()
 
-    model = os.environ.get("DIFFUSION_TEST_MODEL")
-    if not model:
-        pytest.skip("Set DIFFUSION_TEST_MODEL env var to run this test")
 
-    batch_size = int(os.environ.get("DIFFUSION_BATCH_SIZE", "1"))
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@pytest.mark.parametrize("model_name", models)
+def test_diffusion_batching_sync_multi_prompt(model_name: str):
+    """Test that synchronous Omni correctly handles a batch of multiple
+    prompts submitted at once and returns one result per prompt."""
+    m = None
+    try:
+        m = Omni(model=model_name)
+        sp = _default_sync_sampling_params()
+        prompts = TEST_PROMPTS[:4]
+
+        outputs = m.generate(prompts, sp)
+        assert len(outputs) == len(prompts), (
+            f"Expected {len(prompts)} outputs, got {len(outputs)}"
+        )
+
+        for i, output in enumerate(outputs):
+            assert output.final_output_type == "image", (
+                f"Output {i} final_output_type expected 'image', got '{output.final_output_type}'"
+            )
+            req_out = output.request_output
+            assert req_out is not None, f"No request_output for prompt {i}"
+            assert isinstance(req_out, OmniRequestOutput), (
+                f"Invalid request_output type for prompt {i}"
+            )
+            images = req_out.images
+            assert images and len(images) >= 1, (
+                f"Expected at least 1 image for prompt {i}"
+            )
+            assert images[0].width == 256
+            assert images[0].height == 256
+            print(f"   prompt {i}: OK ({len(images)} images, request_id={output.request_id})")
+
+        # Verify all request_ids are distinct
+        request_ids = [o.request_id for o in outputs]
+        assert len(set(request_ids)) == len(request_ids), (
+            f"Duplicate request_ids found: {request_ids}"
+        )
+    except Exception as e:
+        print(f"Test failed with error: {e}")
+        raise
+    finally:
+        if m is not None and hasattr(m, "close"):
+            m.close()
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@pytest.mark.parametrize("model_name", models)
+def test_diffusion_batching_async_concurrent(model_name: str):
+    """Test that AsyncOmni correctly handles multiple concurrent requests
+    fired via asyncio.gather. Each request_id must appear in the results."""
 
     async def _inner():
-        omni = AsyncOmni(model=model, diffusion_batch_size=batch_size)
+        omni = AsyncOmni(model=model_name, diffusion_batch_size=1)
         try:
             prompts = TEST_PROMPTS[:4]
-            await validate_concurrent(omni, prompts)
-            await validate_batch_explicit(omni, prompts)
+            sp = _default_sampling_params()
+            request_ids = [f"async-concurrent-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(prompts))]
+
+            tasks = [
+                _collect_generate(omni, prompt=p, request_id=rid, sampling_params_list=[sp])
+                for p, rid in zip(prompts, request_ids)
+            ]
+            results = await asyncio.gather(*tasks)
+
+            assert len(results) == len(prompts), (
+                f"Expected {len(prompts)} results, got {len(results)}"
+            )
+
+            returned_ids = [r.request_id for r in results]
+            for rid in request_ids:
+                assert rid in returned_ids, f"Missing request_id {rid} in results"
+
+            for i, result in enumerate(results):
+                images = _extract_images(result)
+                assert len(images) >= 1, f"No images for prompt {i}"
+                assert images[0].width == 256
+                assert images[0].height == 256
+                print(f"   prompt {i}: OK ({len(images)} images, request_id={result.request_id})")
         finally:
             omni.shutdown()
 
     asyncio.run(_inner())
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@pytest.mark.parametrize("model_name", models)
+def test_diffusion_batching_async_explicit_batch(model_name: str):
+    """Test that AsyncOmni batch mode (generate(prompt=[...])) dispatches
+    all prompts in a single engine call and returns correct results."""
+
+    async def _inner():
+        omni = AsyncOmni(model=model_name, diffusion_batch_size=4)
+        try:
+            prompts = TEST_PROMPTS[:4]
+            sp = _default_sampling_params()
+            request_ids = [f"explicit-batch-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(prompts))]
+
+            results: list[OmniRequestOutput] = []
+            async for output in omni.generate(
+                prompt=prompts,
+                sampling_params_list=[sp],
+                request_ids=request_ids,
+            ):
+                results.append(output)
+
+            assert len(results) == len(prompts), (
+                f"Expected {len(prompts)} results, got {len(results)}"
+            )
+
+            returned_ids = [r.request_id for r in results]
+            for rid in request_ids:
+                assert rid in returned_ids, f"Missing request_id {rid} in results"
+
+            for i, result in enumerate(results):
+                images = _extract_images(result)
+                assert len(images) >= 1, f"No images for prompt {i}"
+                assert images[0].width == 256
+                assert images[0].height == 256
+                print(f"   prompt {i}: OK ({len(images)} images, request_id={result.request_id})")
+        finally:
+            omni.shutdown()
+
+    asyncio.run(_inner())
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@pytest.mark.parametrize("model_name", models)
+def test_diffusion_batching_num_outputs(model_name: str):
+    """Test that the diffusion model respects num_outputs_per_prompt and
+    generates the correct number of images per request."""
+    m = None
+    try:
+        m = Omni(model=model_name)
+        num_outputs = 2
+        sp = _default_sync_sampling_params(num_outputs_per_prompt=num_outputs)
+
+        outputs = m.generate(
+            "a photo of a cat sitting on a laptop keyboard",
+            sp,
+        )
+
+        first_output = outputs[0]
+        assert first_output.final_output_type == "image"
+        req_out = first_output.request_output
+        assert req_out is not None, "No request_output found"
+        assert isinstance(req_out, OmniRequestOutput)
+
+        images = req_out.images
+        assert images is not None and len(images) == num_outputs, (
+            f"Expected {num_outputs} images, got {len(images) if images else 0}"
+        )
+        for img in images:
+            assert img.width == 256
+            assert img.height == 256
+    except Exception as e:
+        print(f"Test failed with error: {e}")
+        raise
+    finally:
+        if m is not None and hasattr(m, "close"):
+            m.close()
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@pytest.mark.parametrize("model_name", models)
+def test_diffusion_batching_distinct_results(model_name: str):
+    """Test that different prompts produce distinct images when batched,
+    ensuring the batching logic does not mix up results across requests."""
+    m = None
+    try:
+        m = Omni(model=model_name)
+        sp = _default_sync_sampling_params()
+        prompts = [
+            {"prompt": "a bright red apple on a white table", "negative_prompt": "blurry"},
+            {"prompt": "a blue ocean with white waves crashing", "negative_prompt": "blurry"},
+        ]
+
+        outputs = m.generate(prompts, sp)
+        assert len(outputs) == len(prompts), (
+            f"Expected {len(prompts)} outputs, got {len(outputs)}"
+        )
+
+        # Verify each output has a unique request_id
+        request_ids = [o.request_id for o in outputs]
+        assert len(set(request_ids)) == len(request_ids), (
+            f"Duplicate request_ids: {request_ids}"
+        )
+
+        # Verify each output has images
+        for i, output in enumerate(outputs):
+            req_out = output.request_output
+            assert req_out is not None, f"No request_output for prompt {i}"
+            images = req_out.images
+            assert images and len(images) >= 1, f"No images for prompt {i}"
+            assert images[0].width == 256
+            assert images[0].height == 256
+    except Exception as e:
+        print(f"Test failed with error: {e}")
+        raise
+    finally:
+        if m is not None and hasattr(m, "close"):
+            m.close()
 
 
 # ------------------------------------------------------------------
