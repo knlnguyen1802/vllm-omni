@@ -153,13 +153,18 @@ class AsyncOmniDiffusion:
 
         # Batching infrastructure
         self._batch_timeout: float = 0.01  # seconds to wait for more requests
-        self._batch_queue: asyncio.Queue[tuple[
-            OmniPromptType,
-            OmniDiffusionSamplingParams,
-            str,
-            LoRARequest | None,
-            asyncio.Future[OmniRequestOutput],
-        ]] | None = None
+        self._batch_queue: (
+            asyncio.Queue[
+                tuple[
+                    OmniPromptType,
+                    OmniDiffusionSamplingParams,
+                    str,
+                    LoRARequest | None,
+                    asyncio.Future[OmniRequestOutput],
+                ]
+            ]
+            | None
+        ) = None
         self._batch_worker_task: asyncio.Task | None = None
 
         logger.info("AsyncOmniDiffusion initialized with model: %s, batch_size: %d", model, self.batch_size)
@@ -217,13 +222,15 @@ class AsyncOmniDiffusion:
         """
         assert self._batch_queue is not None
         while not self._closed:
-            batch: list[tuple[
-                OmniPromptType,
-                OmniDiffusionSamplingParams,
-                str,
-                LoRARequest | None,
-                asyncio.Future[OmniRequestOutput],
-            ]] = []
+            batch: list[
+                tuple[
+                    OmniPromptType,
+                    OmniDiffusionSamplingParams,
+                    str,
+                    LoRARequest | None,
+                    asyncio.Future[OmniRequestOutput],
+                ]
+            ] = []
 
             # --- wait for the first item (blocking) ---
             try:
@@ -236,7 +243,8 @@ class AsyncOmniDiffusion:
             for _ in range(self._batch_size - 1):
                 try:
                     item = await asyncio.wait_for(
-                        self._batch_queue.get(), timeout=self._batch_timeout,
+                        self._batch_queue.get(),
+                        timeout=self._batch_timeout,
                     )
                     batch.append(item)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -255,12 +263,17 @@ class AsyncOmniDiffusion:
 
             logger.debug(
                 "Batch worker dispatching %d/%d requests: %s",
-                len(batch), self._batch_size, request_ids,
+                len(batch),
+                self._batch_size,
+                request_ids,
             )
 
             try:
                 results = await self._generate_batch(
-                    prompts, sampling_params, request_ids, lora_request,
+                    prompts,
+                    sampling_params,
+                    request_ids,
+                    lora_request,
                 )
                 for fut, res in zip(futures, results):
                     if not fut.done():

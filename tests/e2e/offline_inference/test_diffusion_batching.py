@@ -81,6 +81,7 @@ TEST_PROMPTS: list[dict[str, str]] = [
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _default_sampling_params(**overrides) -> OmniDiffusionSamplingParams:
     defaults = dict(
         num_inference_steps=2,
@@ -136,6 +137,7 @@ def _extract_images(output: OmniRequestOutput) -> list:
 # Warm-up (async)
 # ------------------------------------------------------------------
 
+
 async def warmup(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
     """Warm-up: send prompts in parallel to pre-load the model."""
     print(f"🔥 Warming up with {len(prompts)} prompts ...")
@@ -160,6 +162,7 @@ async def warmup(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
 # ------------------------------------------------------------------
 # Single (sequential) benchmark
 # ------------------------------------------------------------------
+
 
 async def run_single(omni: AsyncOmni, prompts: list[dict[str, str]]) -> float:
     """Run prompts one-by-one sequentially."""
@@ -187,6 +190,7 @@ async def run_single(omni: AsyncOmni, prompts: list[dict[str, str]]) -> float:
 # ------------------------------------------------------------------
 # Batch (parallel) benchmark
 # ------------------------------------------------------------------
+
 
 async def run_batch(
     omni: AsyncOmni,
@@ -221,6 +225,7 @@ async def run_batch(
 # ------------------------------------------------------------------
 # Explicit batch (passes list of prompts to generate())
 # ------------------------------------------------------------------
+
 
 async def run_batch_explicit(
     omni: AsyncOmni,
@@ -259,6 +264,7 @@ async def run_batch_explicit(
 # Async validation helpers
 # ------------------------------------------------------------------
 
+
 async def validate_batch_explicit(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
     """Validate generate(prompt=[...]) returns correct results for every prompt."""
     print(f"🔍 Validating batch generate() correctness with {len(prompts)} prompts ...")
@@ -273,9 +279,7 @@ async def validate_batch_explicit(omni: AsyncOmni, prompts: list[dict[str, str]]
     ):
         results.append(output)
 
-    assert len(results) == len(prompts), (
-        f"Expected {len(prompts)} results, got {len(results)}"
-    )
+    assert len(results) == len(prompts), f"Expected {len(prompts)} results, got {len(results)}"
 
     returned_ids = [r.request_id for r in results]
     for rid in request_ids:
@@ -298,9 +302,7 @@ async def validate_concurrent(omni: AsyncOmni, prompts: list[dict[str, str]]) ->
     ]
     results = await asyncio.gather(*tasks)
 
-    assert len(results) == len(prompts), (
-        f"Expected {len(prompts)} results, got {len(results)}"
-    )
+    assert len(results) == len(prompts), f"Expected {len(prompts)} results, got {len(results)}"
 
     returned_ids = [r.request_id for r in results]
     for rid in request_ids:
@@ -312,6 +314,7 @@ async def validate_concurrent(omni: AsyncOmni, prompts: list[dict[str, str]]) ->
 # ------------------------------------------------------------------
 # Single vs Parallel comparison (CLI only)
 # ------------------------------------------------------------------
+
 
 async def compare_single_vs_parallel(
     model: str,
@@ -342,6 +345,7 @@ async def compare_single_vs_parallel(
 # ------------------------------------------------------------------
 # CLI main entrypoint
 # ------------------------------------------------------------------
+
 
 async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> None:
     prompts = (TEST_PROMPTS * ((num_prompts // len(TEST_PROMPTS)) + 1))[:num_prompts]
@@ -397,12 +401,8 @@ def test_diffusion_batching_sync_sequential(model_name: str):
             )
 
             req_out = first_output.request_output
-            assert isinstance(req_out, OmniRequestOutput), (
-                f"Invalid request_output type for prompt {i}"
-            )
-            assert hasattr(req_out, "images") and req_out.images, (
-                f"No images in request_output for prompt {i}"
-            )
+            assert isinstance(req_out, OmniRequestOutput), f"Invalid request_output type for prompt {i}"
+            assert hasattr(req_out, "images") and req_out.images, f"No images in request_output for prompt {i}"
             images = req_out.images
             assert len(images) >= 1, f"Expected at least 1 image for prompt {i}, got {len(images)}"
             assert images[0].width == 256
@@ -430,9 +430,7 @@ def test_diffusion_batching_sync_multi_prompt(model_name: str):
         prompts = TEST_PROMPTS[:4]
 
         outputs = m.generate(prompts, sp)
-        assert len(outputs) == len(prompts), (
-            f"Expected {len(prompts)} outputs, got {len(outputs)}"
-        )
+        assert len(outputs) == len(prompts), f"Expected {len(prompts)} outputs, got {len(outputs)}"
 
         for i, output in enumerate(outputs):
             assert output.final_output_type == "image", (
@@ -440,22 +438,16 @@ def test_diffusion_batching_sync_multi_prompt(model_name: str):
             )
             req_out = output.request_output
             assert req_out is not None, f"No request_output for prompt {i}"
-            assert isinstance(req_out, OmniRequestOutput), (
-                f"Invalid request_output type for prompt {i}"
-            )
+            assert isinstance(req_out, OmniRequestOutput), f"Invalid request_output type for prompt {i}"
             images = req_out.images
-            assert images and len(images) >= 1, (
-                f"Expected at least 1 image for prompt {i}"
-            )
+            assert images and len(images) >= 1, f"Expected at least 1 image for prompt {i}"
             assert images[0].width == 256
             assert images[0].height == 256
             print(f"   prompt {i}: OK ({len(images)} images, request_id={output.request_id})")
 
         # Verify all request_ids are distinct
         request_ids = [o.request_id for o in outputs]
-        assert len(set(request_ids)) == len(request_ids), (
-            f"Duplicate request_ids found: {request_ids}"
-        )
+        assert len(set(request_ids)) == len(request_ids), f"Duplicate request_ids found: {request_ids}"
     except Exception as e:
         print(f"Test failed with error: {e}")
         raise
@@ -485,9 +477,7 @@ def test_diffusion_batching_async_concurrent(model_name: str):
             ]
             results = await asyncio.gather(*tasks)
 
-            assert len(results) == len(prompts), (
-                f"Expected {len(prompts)} results, got {len(results)}"
-            )
+            assert len(results) == len(prompts), f"Expected {len(prompts)} results, got {len(results)}"
 
             returned_ids = [r.request_id for r in results]
             for rid in request_ids:
@@ -528,9 +518,7 @@ def test_diffusion_batching_async_explicit_batch(model_name: str):
             ):
                 results.append(output)
 
-            assert len(results) == len(prompts), (
-                f"Expected {len(prompts)} results, got {len(results)}"
-            )
+            assert len(results) == len(prompts), f"Expected {len(prompts)} results, got {len(results)}"
 
             returned_ids = [r.request_id for r in results]
             for rid in request_ids:
@@ -604,15 +592,11 @@ def test_diffusion_batching_distinct_results(model_name: str):
         ]
 
         outputs = m.generate(prompts, sp)
-        assert len(outputs) == len(prompts), (
-            f"Expected {len(prompts)} outputs, got {len(outputs)}"
-        )
+        assert len(outputs) == len(prompts), f"Expected {len(prompts)} outputs, got {len(outputs)}"
 
         # Verify each output has a unique request_id
         request_ids = [o.request_id for o in outputs]
-        assert len(set(request_ids)) == len(request_ids), (
-            f"Duplicate request_ids: {request_ids}"
-        )
+        assert len(set(request_ids)) == len(request_ids), f"Duplicate request_ids: {request_ids}"
 
         # Verify each output has images
         for i, output in enumerate(outputs):

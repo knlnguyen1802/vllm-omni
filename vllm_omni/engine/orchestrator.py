@@ -630,9 +630,7 @@ class Orchestrator:
 
         stage_client = self.stage_clients[stage_id]
         if getattr(stage_client, "stage_type", None) != "diffusion":
-            raise ValueError(
-                "generate_batch is only supported when stage 0 is a diffusion stage"
-            )
+            raise ValueError("generate_batch is only supported when stage 0 is a diffusion stage")
 
         now = _time.time()
         for rid, prompt in zip(request_ids, prompts):

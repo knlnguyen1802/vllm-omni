@@ -109,7 +109,9 @@ class StageDiffusionClient:
     ) -> None:
         try:
             results = await self._engine.generate_batch(
-                prompts, sampling_params, request_ids,
+                prompts,
+                sampling_params,
+                request_ids,
             )
             for result in results:
                 await self._output_queue.put(result)

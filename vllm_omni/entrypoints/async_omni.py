@@ -227,15 +227,9 @@ class AsyncOmni(EngineClient, OmniBase):
         if is_batch:
             prompts: list[OmniPromptType] = prompt  # type: ignore[assignment]
             if request_ids is None:
-                request_ids = [
-                    f"batch-{i}-{uuid.uuid4().hex[:8]}"
-                    for i in range(len(prompts))
-                ]
+                request_ids = [f"batch-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(prompts))]
             if len(request_ids) != len(prompts):
-                raise ValueError(
-                    f"request_ids length ({len(request_ids)}) must match "
-                    f"prompts length ({len(prompts)})"
-                )
+                raise ValueError(f"request_ids length ({len(request_ids)}) must match prompts length ({len(prompts)})")
             all_request_ids = request_ids
         else:
             if request_id is None:
@@ -248,7 +242,8 @@ class AsyncOmni(EngineClient, OmniBase):
 
         logger.debug(
             "[AsyncOmni] generate() called – batch=%s, request_ids=%s",
-            is_batch, all_request_ids,
+            is_batch,
+            all_request_ids,
         )
 
         try:
@@ -259,10 +254,7 @@ class AsyncOmni(EngineClient, OmniBase):
             wall_start_ts = time.time()
             final_stage_id = self._compute_final_stage_id(output_modalities)
 
-            req_states = [
-                self._setup_request_state(rid, wall_start_ts, final_stage_id)
-                for rid in all_request_ids
-            ]
+            req_states = [self._setup_request_state(rid, wall_start_ts, final_stage_id) for rid in all_request_ids]
 
             # ---- submit (only difference between the two paths) ----
             if is_batch:

@@ -476,7 +476,9 @@ class AsyncOmniEngine:
                             inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
                         _inject_kv_stage_info(stage_cfg, stage_id)
                         stage_clients[stage_id] = initialize_diffusion_stage(
-                            self.model, stage_cfg, metadata,
+                            self.model,
+                            stage_cfg,
+                            metadata,
                             batch_size=self.diffusion_batch_size,
                         )
                         logger.info("[AsyncOmniEngine] Stage %s initialized (diffusion)", stage_id)
@@ -974,9 +976,7 @@ class AsyncOmniEngine:
         prompts are processed in one ``DiffusionEngine.step()`` call.
         """
         effective_spl = (
-            list(sampling_params_list)
-            if sampling_params_list is not None
-            else list(self.default_sampling_params_list)
+            list(sampling_params_list) if sampling_params_list is not None else list(self.default_sampling_params_list)
         )
         msg = {
             "type": "add_batch_request",
