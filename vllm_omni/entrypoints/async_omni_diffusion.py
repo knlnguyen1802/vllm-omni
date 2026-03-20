@@ -271,6 +271,37 @@ class AsyncOmniDiffusion:
                         fut.set_exception(e)
 
     # ------------------------------------------------------------------
+    # Public batch generation API
+    # ------------------------------------------------------------------
+
+    async def generate_batch(
+        self,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        request_ids: list[str] | None = None,
+        lora_request: LoRARequest | None = None,
+    ) -> list[OmniRequestOutput]:
+        """Generate images from multiple prompts in a single engine call.
+
+        Unlike the queue-based batching used by ``generate()`` with
+        ``batch_size > 1``, this method explicitly batches the given
+        prompts into **one** ``DiffusionEngine.step()`` call.
+
+        Args:
+            prompts: List of text prompts describing the desired images.
+            sampling_params: Shared sampling parameters for all prompts.
+            request_ids: Optional list of unique identifiers (one per prompt).
+                Auto-generated when *None*.
+            lora_request: Optional LoRA adapter to apply.
+
+        Returns:
+            List of ``OmniRequestOutput``, one per prompt.
+        """
+        if request_ids is None:
+            request_ids = [f"diff-batch-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(prompts))]
+        return await self._generate_batch(prompts, sampling_params, request_ids, lora_request)
+
+    # ------------------------------------------------------------------
     # Internal batch generation
     # ------------------------------------------------------------------
 

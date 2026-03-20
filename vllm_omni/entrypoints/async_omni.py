@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import AsyncGenerator, Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -60,12 +61,21 @@ class AsyncOmni(EngineClient, OmniBase):
 
     Example:
         >>> async_omni = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
+        >>> # Single prompt
         >>> async for output in async_omni.generate(
         ...     prompt="Hello",
         ...     request_id="req-1",
         ...     sampling_params_list=[SamplingParams(), SamplingParams()]
         ... ):
         ...     print(output)
+        >>>
+        >>> # Batch of prompts (diffusion, when diffusion_batch_size > 1)
+        >>> async_omni = AsyncOmni(model="my-diffusion", diffusion_batch_size=4)
+        >>> async for output in async_omni.generate(
+        ...     prompt=["a cat", "a dog", "a bird"],
+        ...     sampling_params_list=[OmniDiffusionSamplingParams()],
+        ... ):
+        ...     print(output.request_id, output.images)
     """
 
     def __init__(self, model: str, **kwargs: Any) -> None:
@@ -127,96 +137,172 @@ class AsyncOmni(EngineClient, OmniBase):
             return None
         return vllm_config.model_config
 
+    # ==================== Internal helpers ====================
+
+    @property
+    def _is_diffusion_stage0(self) -> bool:
+        """Whether stage-0 is a diffusion stage."""
+        return self.engine.get_stage_metadata(0).get("stage_type") == "diffusion"
+
+    @property
+    def diffusion_batch_size(self) -> int:
+        """Configured diffusion batch size (from engine)."""
+        return getattr(self.engine, "diffusion_batch_size", 1)
+
+    def _setup_request_state(
+        self,
+        request_id: str,
+        wall_start_ts: float,
+        final_stage_id_for_e2e: int,
+    ) -> ClientRequestState:
+        """Create and register a :class:`ClientRequestState` with metrics."""
+        metrics = OrchestratorMetrics(
+            self.num_stages,
+            self.log_stats,
+            wall_start_ts,
+            final_stage_id_for_e2e,
+        )
+        req_state = ClientRequestState(request_id)
+        req_state.metrics = metrics
+        self.request_states[request_id] = req_state
+        return req_state
+
     # ==================== Generate Method ====================
 
     async def generate(
         self,
-        prompt: OmniPromptType,
-        request_id: str,
+        prompt: OmniPromptType | list[OmniPromptType],
+        request_id: str | None = None,
         sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         *,
+        request_ids: list[str] | None = None,
         output_modalities: list[str] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
-        """Generate outputs for the given prompt asynchronously.
+        """Generate outputs for the given prompt(s) asynchronously.
 
-        Coordinates multi-stage pipeline execution. Processes the prompt through
-        all stages in the pipeline and yields outputs as they become available.
+        Coordinates multi-stage pipeline execution.  Processes the prompt
+        through all stages in the pipeline and yields outputs as they become
+        available.
+
+        **Batch mode (diffusion only):**
+        When *prompt* is a ``list`` **and** ``diffusion_batch_size > 1``,
+        all prompts are dispatched in a single ``DiffusionEngine.step()``
+        call.  Each individual result is yielded in order.  In this mode
+        *request_ids* can be provided (one per prompt); *request_id* is
+        ignored.
 
         Args:
-            prompt: Prompt to process. Can be a text string, token IDs,
-                or multimodal prompt.
-            request_id: Unique identifier for this request
-            sampling_params_list: List of SamplingParams, one for each stage.
+            prompt: A single prompt **or** a list of prompts.  A list
+                triggers batch mode when the diffusion batch size is > 1.
+            request_id: Unique identifier for a single-prompt request.
+                Ignored in batch mode.
+            sampling_params_list: List of SamplingParams, one per stage.
                 Must have the same length as the number of stages.
-                If None, uses default sampling params for each stage.
+                If *None*, uses default sampling params for each stage.
+            request_ids: (Batch mode only) Unique identifiers, one per
+                prompt.  Auto-generated when *None*.
             output_modalities: Optional list of output modalities.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
+            In batch mode, one output per prompt is yielded in order.
 
         Raises:
             ValueError: If sampling_params_list has incorrect length.
         """
+        # ---- normalise inputs into (prompts_list, request_id_list, is_batch) ----
+        is_list = isinstance(prompt, list)
+        is_batch = (
+            is_list
+            and self._is_diffusion_stage0
+            and self.diffusion_batch_size > 1
+        )
+
+        if is_list and not is_batch:
+            # Caller passed a list but batch mode is off – only allow len-1.
+            if len(prompt) != 1:  # type: ignore[arg-type]
+                raise ValueError(
+                    "A list of prompts was passed but batch mode is not active "
+                    f"(diffusion_batch_size={self.diffusion_batch_size}). "
+                    "Pass a single prompt or set diffusion_batch_size > 1."
+                )
+            prompt = prompt[0]  # type: ignore[index]
+            is_list = False
+
+        if is_batch:
+            prompts: list[OmniPromptType] = prompt  # type: ignore[assignment]
+            if request_ids is None:
+                request_ids = [
+                    f"batch-{i}-{uuid.uuid4().hex[:8]}"
+                    for i in range(len(prompts))
+                ]
+            if len(request_ids) != len(prompts):
+                raise ValueError(
+                    f"request_ids length ({len(request_ids)}) must match "
+                    f"prompts length ({len(prompts)})"
+                )
+            all_request_ids = request_ids
+        else:
+            if request_id is None:
+                request_id = f"req-{uuid.uuid4().hex[:8]}"
+            all_request_ids = [request_id]
+
         # Wait until generation is resumed if the engine is paused
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
 
-        logger.debug(f"[AsyncOmni] generate() called for request {request_id}")
+        logger.debug(
+            "[AsyncOmni] generate() called – batch=%s, request_ids=%s",
+            is_batch, all_request_ids,
+        )
 
         try:
-            # Start final output dispatcher on the first call to generate()
+            # ---- common setup ----
             self._final_output_handler()
-
             sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
 
-            # Track per-request metrics
             wall_start_ts = time.time()
-            req_start_ts: dict[str, float] = {}
+            final_stage_id = self._compute_final_stage_id(output_modalities)
 
-            # Determine the final stage for E2E stats
-            final_stage_id_for_e2e = self._compute_final_stage_id(output_modalities)
+            req_states = [
+                self._setup_request_state(rid, wall_start_ts, final_stage_id)
+                for rid in all_request_ids
+            ]
 
-            metrics = OrchestratorMetrics(
-                self.num_stages,
-                self.log_stats,
-                wall_start_ts,
-                final_stage_id_for_e2e,
-            )
-            req_state = ClientRequestState(request_id)
-            req_state.metrics = metrics
-            self.request_states[request_id] = req_state
+            # ---- submit (only difference between the two paths) ----
+            if is_batch:
+                await self.engine.add_batch_request_async(
+                    request_ids=all_request_ids,
+                    prompts=prompts,
+                    sampling_params_list=sampling_params_list,
+                    final_stage_id=final_stage_id,
+                )
+            else:
+                await self.engine.add_request_async(
+                    request_id=all_request_ids[0],
+                    prompt=prompt,
+                    sampling_params_list=sampling_params_list,
+                    final_stage_id=final_stage_id,
+                )
+                submit_ts = time.time()
+                req_states[0].metrics.stage_first_ts[0] = submit_ts
 
-            # Add request to stage 0 (Orchestrator handles all stage transitions)
-            await self.engine.add_request_async(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params_list=sampling_params_list,
-                final_stage_id=final_stage_id_for_e2e,
-            )
-            submit_ts = time.time()
-            req_state.metrics.stage_first_ts[0] = submit_ts
-            req_start_ts[request_id] = submit_ts
-
-            # Process results based on mode
-            # Both sequential and async_chunk modes read the same message stream
-            # from Orchestrator; stage-transfer behavior differs inside
-            # Orchestrator._route_output().
-            async for output in self._process_orchestrator_results(
-                request_id,
-                metrics,
-                final_stage_id_for_e2e,
-                req_start_ts,
-                wall_start_ts,
-            ):
-                yield output
-
-            logger.debug(f"[AsyncOmni] Request {request_id} completed")
-
-            self._log_summary_and_cleanup(request_id)
+            # ---- collect results (same for both paths) ----
+            for rid, req_state in zip(all_request_ids, req_states):
+                req_start_ts: dict[str, float] = {rid: wall_start_ts}
+                async for output in self._process_orchestrator_results(
+                    rid,
+                    req_state.metrics,
+                    final_stage_id,
+                    req_start_ts,
+                    wall_start_ts,
+                ):
+                    yield output
+                self._log_summary_and_cleanup(rid)
 
         except (asyncio.CancelledError, GeneratorExit):
-            await self.abort(request_id)
-            logger.info(f"[AsyncOmni] Request {request_id} aborted.")
+            await self.abort(all_request_ids)
+            logger.info("[AsyncOmni] Request(s) %s aborted.", all_request_ids)
             raise
 
     async def encode(

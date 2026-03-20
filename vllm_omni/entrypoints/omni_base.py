@@ -270,6 +270,7 @@ class OmniBase:
 
         images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
         return OmniRequestOutput(
+            request_id=req_id or "",
             stage_id=stage_id,
             final_output_type=stage_meta["final_output_type"],
             request_output=engine_outputs,

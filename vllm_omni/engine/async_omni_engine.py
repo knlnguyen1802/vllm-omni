@@ -961,6 +961,49 @@ class AsyncOmniEngine:
             arrival_time=arrival_time,
         )
 
+    def add_batch_request(
+        self,
+        request_ids: list[str],
+        prompts: list[Any],
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+    ) -> None:
+        """Send a batch of prompts to the Orchestrator as a single message.
+
+        This is only supported when stage-0 is a diffusion stage.  All
+        prompts are processed in one ``DiffusionEngine.step()`` call.
+        """
+        effective_spl = (
+            list(sampling_params_list)
+            if sampling_params_list is not None
+            else list(self.default_sampling_params_list)
+        )
+        msg = {
+            "type": "add_batch_request",
+            "request_ids": request_ids,
+            "prompts": prompts,
+            "sampling_params_list": effective_spl,
+            "final_stage_id": final_stage_id,
+        }
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        self.request_queue.sync_q.put_nowait(msg)
+
+    async def add_batch_request_async(
+        self,
+        request_ids: list[str],
+        prompts: list[Any],
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+    ) -> None:
+        """Async add_batch_request API."""
+        self.add_batch_request(
+            request_ids=request_ids,
+            prompts=prompts,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+        )
+
     def try_get_output(self, timeout: float = 0.001) -> dict[str, Any] | None:
         """Read one output message from the Orchestrator output queue."""
         if self.output_queue is None:

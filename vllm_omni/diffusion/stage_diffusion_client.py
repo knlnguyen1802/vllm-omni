@@ -83,6 +83,47 @@ class StageDiffusionClient:
         finally:
             self._tasks.pop(request_id, None)
 
+    async def add_batch_request_async(
+        self,
+        request_ids: list[str],
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+    ) -> None:
+        """Submit a list of prompts as a single batched engine call.
+
+        All prompts are processed in one ``DiffusionEngine.step()`` call
+        and individual results are placed on the output queue.
+        """
+        task = asyncio.create_task(
+            self._run_batch(request_ids, prompts, sampling_params),
+            name=f"diffusion-batch-{request_ids[0]}",
+        )
+        for rid in request_ids:
+            self._tasks[rid] = task
+
+    async def _run_batch(
+        self,
+        request_ids: list[str],
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+    ) -> None:
+        try:
+            results = await self._engine.generate_batch(
+                prompts, sampling_params, request_ids,
+            )
+            for result in results:
+                await self._output_queue.put(result)
+        except Exception as e:
+            logger.exception(
+                "[StageDiffusionClient] Stage-%s batch req=%s failed: %s",
+                self.stage_id,
+                request_ids,
+                e,
+            )
+        finally:
+            for rid in request_ids:
+                self._tasks.pop(rid, None)
+
     def get_diffusion_output_async(self) -> OmniRequestOutput | None:
         try:
             return self._output_queue.get_nowait()

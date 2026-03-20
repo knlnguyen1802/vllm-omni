@@ -188,6 +188,68 @@ def _extract_images(output: OmniRequestOutput) -> list:
 
 
 # ------------------------------------------------------------------
+# Explicit batch (passes list of prompts to generate())
+# ------------------------------------------------------------------
+
+async def run_batch_explicit(
+    omni: AsyncOmni,
+    prompts: list[dict[str, str]],
+    label: str = "batch_explicit",
+) -> float:
+    """Send all prompts as a single batch via generate(prompt=[...]).
+
+    Unlike ``run_batch`` (which fires concurrent ``generate()`` calls),
+    this passes a list so that all prompts are processed in **one**
+    ``DiffusionEngine.step()`` call when ``diffusion_batch_size > 1``.
+    """
+    print(f"⚡ Running {label.upper()} mode – {len(prompts)} prompts in ONE engine call ...")
+    sp = _default_sampling_params()
+    request_ids = [f"{label}-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(prompts))]
+    start = time.perf_counter()
+
+    results: list[OmniRequestOutput] = []
+    async for output in omni.generate(
+        prompt=prompts,
+        sampling_params_list=[sp],
+        request_ids=request_ids,
+    ):
+        results.append(output)
+
+    elapsed = time.perf_counter() - start
+    for i, result in enumerate(results):
+        images = _extract_images(result)
+        print(f"   prompt {i}: {len(images)} images, request_id={result.request_id}")
+
+    print(f"   ✅ Total {label} mode: {elapsed:.2f}s\n")
+    return elapsed
+
+
+async def validate_batch_explicit(omni: AsyncOmni, prompts: list[dict[str, str]]) -> None:
+    """Validate generate(prompt=[...]) returns correct results for every prompt."""
+    print(f"🔍 Validating batch generate() correctness with {len(prompts)} prompts ...")
+    sp = _default_sampling_params()
+    request_ids = [f"validate-batch-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(prompts))]
+
+    results: list[OmniRequestOutput] = []
+    async for output in omni.generate(
+        prompt=prompts,
+        sampling_params_list=[sp],
+        request_ids=request_ids,
+    ):
+        results.append(output)
+
+    assert len(results) == len(prompts), (
+        f"Expected {len(prompts)} results, got {len(results)}"
+    )
+
+    returned_ids = [r.request_id for r in results]
+    for rid in request_ids:
+        assert rid in returned_ids, f"Missing request_id {rid} in results"
+
+    print("   ✅ All request_ids matched, results count correct.\n")
+
+
+# ------------------------------------------------------------------
 # Validation
 # ------------------------------------------------------------------
 
@@ -232,15 +294,17 @@ async def compare_single_vs_parallel(
         await warmup(omni, WARMUP_PROMPTS)
         single_time = await run_single(omni, prompts)
         parallel_time = await run_batch(omni, prompts, label="parallel")
+        explicit_time = await run_batch_explicit(omni, prompts, label="batch_explicit")
     finally:
         omni.shutdown()
 
-    speedup = single_time / parallel_time if parallel_time > 0 else float("inf")
+    speedup_parallel = single_time / parallel_time if parallel_time > 0 else float("inf")
+    speedup_explicit = single_time / explicit_time if explicit_time > 0 else float("inf")
     print("=" * 60)
     print(f"📊 Summary ({len(prompts)} prompts)")
-    print(f"   Sequential : {single_time:.2f}s")
-    print(f"   Parallel   : {parallel_time:.2f}s")
-    print(f"   Speed-up   : {speedup:.2f}x")
+    print(f"   Sequential        : {single_time:.2f}s")
+    print(f"   Parallel (gather) : {parallel_time:.2f}s  ({speedup_parallel:.2f}x)")
+    print(f"   Explicit batch    : {explicit_time:.2f}s  ({speedup_explicit:.2f}x)")
     print("=" * 60)
 
 
@@ -261,8 +325,12 @@ async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> 
 
         if mode == "validate":
             await validate_concurrent(omni, prompts)
+        elif mode == "validate_batch":
+            await validate_batch_explicit(omni, prompts)
         elif mode == "batch":
             await run_batch(omni, prompts, label="measurement")
+        elif mode == "batch_explicit":
+            await run_batch_explicit(omni, prompts)
         elif mode == "single":
             await run_single(omni, prompts)
         else:
@@ -298,6 +366,7 @@ def test_diffusion_batching_correctness():
         try:
             prompts = TEST_PROMPTS[:4]
             await validate_concurrent(omni, prompts)
+            await validate_batch_explicit(omni, prompts)
         finally:
             omni.shutdown()
 
@@ -315,9 +384,13 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1, help="Diffusion batch size (1 = no batching)")
     parser.add_argument(
         "--mode",
-        choices=["batch", "single", "compare", "validate"],
+        choices=["batch", "batch_explicit", "single", "compare", "validate", "validate_batch"],
         default="compare",
-        help="Run mode: 'batch' (parallel), 'single' (sequential), 'compare' (both), or 'validate' (correctness)",
+        help=(
+            "Run mode: 'batch' (parallel gather), 'batch_explicit' (generate_batch API), "
+            "'single' (sequential), 'compare' (all three), "
+            "'validate' (concurrent correctness), 'validate_batch' (generate_batch correctness)"
+        ),
     )
     args = parser.parse_args()
 
