@@ -37,6 +37,7 @@ class StageDiffusionClient:
         model: str,
         od_config: OmniDiffusionConfig,
         metadata: StageMetadata,
+        batch_size: int = 1,
     ) -> None:
         self.stage_id = metadata.stage_id
         self.final_output = metadata.final_output
@@ -45,11 +46,11 @@ class StageDiffusionClient:
         self.custom_process_input_func = metadata.custom_process_input_func
         self.engine_input_source = metadata.engine_input_source
 
-        self._engine = AsyncOmniDiffusion(model=model, od_config=od_config)
+        self._engine = AsyncOmniDiffusion(model=model, od_config=od_config, batch_size=batch_size)
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._tasks: dict[str, asyncio.Task] = {}
 
-        logger.info("[StageDiffusionClient] Stage-%s initialized", self.stage_id)
+        logger.info("[StageDiffusionClient] Stage-%s initialized (batch_size=%d)", self.stage_id, batch_size)
 
     async def add_request_async(
         self,

@@ -74,6 +74,7 @@ class OmniBase:
         log_stats = kwargs.pop("log_stats", False)
         async_chunk = kwargs.pop("async_chunk", False)
         output_modalities = kwargs.pop("output_modalities", None)
+        diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
@@ -90,6 +91,7 @@ class OmniBase:
             engine_args=engine_args,
             init_timeout=init_timeout,
             stage_init_timeout=stage_init_timeout,
+            diffusion_batch_size=diffusion_batch_size,
             **kwargs,
         )
         self._shutdown_called = False

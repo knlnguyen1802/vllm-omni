@@ -54,6 +54,8 @@ class AsyncOmni(EngineClient, OmniBase):
             - init_timeout: Total timeout for orchestrator startup.
             - async_chunk: Whether to enable async chunk mode.
             - output_modalities: Requested output modalities.
+            - diffusion_batch_size: Maximum number of diffusion requests
+              to batch together (default 1, no batching).
             - Additional keyword arguments passed to stage engines.
 
     Example:
