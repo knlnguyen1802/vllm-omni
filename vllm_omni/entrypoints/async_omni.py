@@ -212,19 +212,14 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         # ---- normalise inputs into (prompts_list, request_id_list, is_batch) ----
         is_list = isinstance(prompt, list)
-        is_batch = (
-            is_list
-            and self._is_diffusion_stage0
-            and self.diffusion_batch_size > 1
-        )
+        is_batch = is_list and self._is_diffusion_stage0
 
         if is_list and not is_batch:
-            # Caller passed a list but batch mode is off – only allow len-1.
+            # Non-diffusion pipeline: only allow a single-element list.
             if len(prompt) != 1:  # type: ignore[arg-type]
                 raise ValueError(
-                    "A list of prompts was passed but batch mode is not active "
-                    f"(diffusion_batch_size={self.diffusion_batch_size}). "
-                    "Pass a single prompt or set diffusion_batch_size > 1."
+                    "A list of prompts is only supported when stage-0 is a "
+                    "diffusion stage. Pass a single prompt instead."
                 )
             prompt = prompt[0]  # type: ignore[index]
             is_list = False
