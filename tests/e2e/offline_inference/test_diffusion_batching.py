@@ -52,6 +52,7 @@ from vllm_omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
+# ------------------------------------------------------------------
 models = ["tiny-random/Qwen-Image"]
 
 # ------------------------------------------------------------------
