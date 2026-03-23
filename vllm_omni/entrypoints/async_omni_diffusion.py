@@ -151,26 +151,10 @@ class AsyncOmniDiffusion:
             self._executor,
         )
 
-        # Batching infrastructure
-        self._batch_timeout: float = 0.01  # seconds to wait for more requests
-        self._batch_queue: (
-            asyncio.Queue[
-                tuple[
-                    OmniPromptType,
-                    OmniDiffusionSamplingParams,
-                    str,
-                    LoRARequest | None,
-                    asyncio.Future[OmniRequestOutput],
-                ]
-            ]
-            | None
-        ) = None
-        self._batch_worker_task: asyncio.Task | None = None
-
         logger.info("AsyncOmniDiffusion initialized with model: %s, batch_size: %d", model, self._batch_size)
 
     # ------------------------------------------------------------------
-    # batch_size / batch_timeout properties
+    # batch_size property
     # ------------------------------------------------------------------
 
     @property
@@ -183,106 +167,6 @@ class AsyncOmniDiffusion:
         if not isinstance(value, int) or value < 1:
             raise ValueError("batch_size must be a positive integer")
         self._batch_size = value
-
-    @property
-    def batch_timeout(self) -> float:
-        """Seconds the batch worker waits for additional requests before
-        dispatching an incomplete batch.  Default 0.01 s."""
-        return self._batch_timeout
-
-    @batch_timeout.setter
-    def batch_timeout(self, value: float) -> None:
-        if value < 0:
-            raise ValueError("batch_timeout must be non-negative")
-        self._batch_timeout = value
-
-    # ------------------------------------------------------------------
-    # Batch worker – collects up to batch_size requests then dispatches
-    # ------------------------------------------------------------------
-
-    def _ensure_batch_worker(self) -> None:
-        """Lazily start the background batch-worker task.
-
-        Called on the first ``generate()`` invocation when *batch_size > 1*.
-        The worker is created lazily so that the event loop is guaranteed to
-        exist (``__init__`` may run outside an async context).
-        """
-        if self._batch_worker_task is None or self._batch_worker_task.done():
-            self._batch_queue = asyncio.Queue()
-            self._batch_worker_task = asyncio.create_task(self._batch_worker_loop())
-
-    async def _batch_worker_loop(self) -> None:
-        """Background coroutine that drains the batch queue.
-
-        1. Blocks until at least one request arrives.
-        2. Tries to collect up to ``batch_size`` requests within
-           ``batch_timeout`` seconds.
-        3. Sends the collected batch to ``_generate_batch``.
-        4. Resolves each caller's Future with its result (or exception).
-        """
-        assert self._batch_queue is not None
-        while not self._closed:
-            batch: list[
-                tuple[
-                    OmniPromptType,
-                    OmniDiffusionSamplingParams,
-                    str,
-                    LoRARequest | None,
-                    asyncio.Future[OmniRequestOutput],
-                ]
-            ] = []
-
-            # --- wait for the first item (blocking) ---
-            try:
-                first = await self._batch_queue.get()
-            except asyncio.CancelledError:
-                return
-            batch.append(first)
-
-            # --- greedily collect more items up to batch_size ---
-            for _ in range(self._batch_size - 1):
-                try:
-                    item = await asyncio.wait_for(
-                        self._batch_queue.get(),
-                        timeout=self._batch_timeout,
-                    )
-                    batch.append(item)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    break
-
-            # Unpack batch
-            prompts = [b[0] for b in batch]
-            # Use the first request's sampling_params (shared across batch)
-            sampling_params = batch[0][1]
-            request_ids = [b[2] for b in batch]
-            lora_requests = [b[3] for b in batch]
-            futures = [b[4] for b in batch]
-
-            # Pick the first non-None LoRA request (if any)
-            lora_request = next((lr for lr in lora_requests if lr is not None), None)
-
-            logger.debug(
-                "Batch worker dispatching %d/%d requests: %s",
-                len(batch),
-                self._batch_size,
-                request_ids,
-            )
-
-            try:
-                results = await self._generate_batch(
-                    prompts,
-                    sampling_params,
-                    request_ids[0],
-                    lora_request,
-                )
-                # The combined result contains all images; each caller gets the same output
-                for fut in futures:
-                    if not fut.done():
-                        fut.set_result(results)
-            except Exception as e:
-                for fut in futures:
-                    if not fut.done():
-                        fut.set_exception(e)
 
     # ------------------------------------------------------------------
     # Public batch generation API
@@ -297,10 +181,10 @@ class AsyncOmniDiffusion:
     ) -> OmniRequestOutput:
         """Generate images from multiple prompts in a single engine call.
 
-        Unlike the queue-based batching used by ``generate()`` with
-        ``batch_size > 1``, this method explicitly batches the given
-        prompts into **one** ``DiffusionEngine.step()`` call and returns
-        a single ``OmniRequestOutput`` containing all generated images.
+        Batches the given prompts into **one** ``DiffusionEngine.step()``
+        call and returns a single ``OmniRequestOutput`` containing all
+        generated images.  Called by ``StageDiffusionClient._run_batch``
+        when the orchestrator receives a list-prompt request.
 
         Args:
             prompts: List of text prompts describing the desired images.
@@ -378,15 +262,11 @@ class AsyncOmniDiffusion:
         request_id: str | None = None,
         lora_request: LoRARequest | None = None,
     ) -> OmniRequestOutput:
-        """Generate images asynchronously from a text prompt.
+        """Generate images asynchronously from a single text prompt.
 
-        When ``batch_size > 1`` the request is placed into an internal queue
-        and the background batch-worker will group up to ``batch_size``
-        concurrent requests into a single ``engine.step`` call.  The caller
-        transparently awaits its individual result.
-
-        When ``batch_size == 1`` (default) the request is executed directly
-        with zero queuing overhead – fully backward-compatible.
+        For batched generation (multiple prompts in one engine call), use
+        :meth:`generate_batch` instead.  This method always processes
+        exactly one prompt per call.
 
         Args:
             prompt: Text prompt describing the desired image
@@ -402,18 +282,6 @@ class AsyncOmniDiffusion:
         """
         if request_id is None:
             request_id = f"diff-{uuid.uuid4().hex[:16]}"
-
-        # ----- batched path (batch_size > 1) -----
-        if self._batch_size > 1:
-            self._ensure_batch_worker()
-            loop = asyncio.get_event_loop()
-            fut: asyncio.Future[OmniRequestOutput] = loop.create_future()
-            await self._batch_queue.put(  # type: ignore[union-attr]
-                (prompt, sampling_params, request_id, lora_request, fut),
-            )
-            return await fut
-
-        # ----- direct path (batch_size == 1, no queuing overhead) -----
         if sampling_params.guidance_scale:
             sampling_params.guidance_scale_provided = True
 
@@ -475,21 +343,6 @@ class AsyncOmniDiffusion:
         if self._closed:
             return
         self._closed = True
-
-        # Cancel the batch worker if running
-        if self._batch_worker_task is not None and not self._batch_worker_task.done():
-            self._batch_worker_task.cancel()
-            self._batch_worker_task = None
-
-        # Drain any pending futures so callers don't hang
-        if self._batch_queue is not None:
-            while not self._batch_queue.empty():
-                try:
-                    _, _, _, _, fut = self._batch_queue.get_nowait()
-                    if not fut.done():
-                        fut.set_exception(RuntimeError("AsyncOmniDiffusion closed"))
-                except Exception:
-                    break
 
         finalizer = getattr(self, "_weak_finalizer", None)
         if finalizer is not None and finalizer.alive:

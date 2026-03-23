@@ -486,7 +486,7 @@ class Orchestrator:
                     )
 
             if isinstance(diffusion_prompt, list):
-                await next_client.add_diffusion_batch_request_async(
+                await next_client.add_batch_request_async(
                     req_id,
                     diffusion_prompt,
                     params,
@@ -611,7 +611,7 @@ class Orchestrator:
         stage_client = self.stage_clients[stage_id]
         if stage_client.stage_type == "diffusion":
             if isinstance(prompt, list):
-                await stage_client.add_diffusion_batch_request_async(
+                await stage_client.add_batch_request_async(
                     request_id,
                     prompt,
                     params,
