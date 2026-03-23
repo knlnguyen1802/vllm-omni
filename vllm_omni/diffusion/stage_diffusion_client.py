@@ -83,6 +83,8 @@ class StageDiffusionClient:
         finally:
             self._tasks.pop(request_id, None)
 
+    # TODO(Long): Temporary solution to boost performance of diffusion stages.
+    # Remove this after scheduling algorithm is implemented
     async def add_batch_request_async(
         self,
         request_id: str,
