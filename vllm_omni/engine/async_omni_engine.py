@@ -476,10 +476,16 @@ class AsyncOmniEngine:
                             inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
                         _inject_kv_stage_info(stage_cfg, stage_id)
                         stage_clients[stage_id] = initialize_diffusion_stage(
-                            self.model, stage_cfg, metadata,
+                            self.model,
+                            stage_cfg,
+                            metadata,
                             batch_size=self.diffusion_batch_size,
                         )
-                        logger.info("[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)", stage_id, self.diffusion_batch_size)
+                        logger.info(
+                            "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
+                            stage_id,
+                            self.diffusion_batch_size,
+                        )
                         continue
 
                     llm_stage_ids.append(stage_id)

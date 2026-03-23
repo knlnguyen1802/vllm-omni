@@ -288,12 +288,8 @@ async def validate_batch_explicit(omni: AsyncOmni, prompts: list[dict[str, str]]
     assert result is not None, "No output received from batch generate()"
     images = _extract_images(result)
     # Batch mode returns ONE output with ALL images combined
-    assert len(images) == len(prompts), (
-        f"Expected {len(prompts)} images (one per prompt), got {len(images)}"
-    )
-    assert result.request_id == request_id, (
-        f"Expected request_id={request_id}, got {result.request_id}"
-    )
+    assert len(images) == len(prompts), f"Expected {len(prompts)} images (one per prompt), got {len(images)}"
+    assert result.request_id == request_id, f"Expected request_id={request_id}, got {result.request_id}"
     print(f"   ✅ Batch returned {len(images)} images with correct request_id.\n")
 
 
@@ -537,12 +533,8 @@ def test_diffusion_batching_async_explicit_batch(model_name: str):
 
             images = _extract_images(result)
             # One image per prompt, all in a single output
-            assert len(images) == len(prompts), (
-                f"Expected {len(prompts)} images in combined output, got {len(images)}"
-            )
-            assert result.request_id == request_id, (
-                f"Expected request_id={request_id}, got {result.request_id}"
-            )
+            assert len(images) == len(prompts), f"Expected {len(prompts)} images in combined output, got {len(images)}"
+            assert result.request_id == request_id, f"Expected request_id={request_id}, got {result.request_id}"
             for i, img in enumerate(images):
                 assert img.width == 256, f"Image {i} width mismatch"
                 assert img.height == 256, f"Image {i} height mismatch"
