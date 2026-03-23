@@ -38,19 +38,7 @@ def _maybe_to_cpu(v):
 # This is for test
 class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
-        super(QwenImagePipeline, self).__init__()
-        self.od_config = od_config
-        self.parallel_config = od_config.parallel_config
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=None,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            )
-        ]
-
+        super().__init__(od_config=od_config, prefix=prefix)
         self.device = get_local_device()
         model = od_config.model
         # Check if model is a local path
@@ -59,26 +47,6 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         self.scheduler = FlowMatchSDEDiscreteSchedulerForTest.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
-        )
-        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
-        self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
-
-        self.stage = None
-
-        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
-        # QwenImage latents are turned into 2x2 patches and packed.
-        # This means the latent width and height has to be divisible
-        # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
-        # self.image_processor = VaeImageProcessor(
-        #     vae_scale_factor=self.vae_scale_factor * 2
-        # )
-        self.prompt_template_encode_start_idx = 34
-        self.default_sample_size = 128
 
     def _get_qwen_prompt_embeds(
         self,

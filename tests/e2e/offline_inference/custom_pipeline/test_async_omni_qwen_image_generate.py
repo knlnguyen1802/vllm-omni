@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import lru_cache
 import uuid
 from contextlib import ExitStack
 
@@ -75,6 +76,7 @@ def normalize_token_ids(tokenized_output) -> list[int]:
     return normalized_ids
 
 
+@lru_cache(maxsize=1)
 def _tokenize_prompt(text: str) -> list[int]:
     """Tokenize a text prompt into valid token IDs for the model."""
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, trust_remote_code=True)
