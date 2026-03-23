@@ -15,13 +15,13 @@ that concurrent async requests are handled correctly.
 
 Usage (standalone):
 
-    python tests/e2e/offline_inference/test_diffusion_batching.py \
+    python tests/e2e/offline_inference/test_qwen_image_diffusion_batching.py \
         --model <model_name_or_path> \
         --num-prompts 8
 
 Or via pytest:
 
-    pytest tests/e2e/offline_inference/test_diffusion_batching.py -s
+    pytest tests/e2e/offline_inference/test_qwen_image_diffusion_batching.py -s
 """
 
 from __future__ import annotations
