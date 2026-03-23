@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import asyncio
-from functools import lru_cache
 import uuid
 from contextlib import ExitStack
+from functools import lru_cache
 
 import numpy as np
 import pytest
