@@ -53,6 +53,11 @@ def omni_snapshot_download(model_id: str) -> str:
         )
     except huggingface_hub.errors.RepositoryNotFoundError:
         logger.warning("Repository not found for '%s'.", model_id)
+    except PermissionError:
+        logger.warning(
+            "Permission denied when downloading '%s'. Assuming the model is already cached locally.",
+            model_id,
+        )
 
     return model_id
 
@@ -238,6 +243,7 @@ class OmniBase:
     ) -> OmniRequestOutput | None:
         req_id = result.get("request_id")
         engine_outputs = result.get("engine_outputs")
+        stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")
@@ -271,6 +277,7 @@ class OmniBase:
             final_output_type=stage_meta["final_output_type"],
             request_output=engine_outputs,
             images=images,
+            stage_durations=stage_durations,
         )
 
     def shutdown(self) -> None:
