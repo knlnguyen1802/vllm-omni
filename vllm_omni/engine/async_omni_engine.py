@@ -203,9 +203,11 @@ class AsyncOmniEngine:
         engine_args: OmniEngineArgs | None = None,
         stage_init_timeout: int = 300,
         init_timeout: int = 600,
+        diffusion_batch_size: int = 1,
         **kwargs: Any,
     ) -> None:
         self.model = model
+        self.diffusion_batch_size = diffusion_batch_size
         startup_timeout = int(init_timeout)
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
@@ -473,7 +475,12 @@ class AsyncOmniEngine:
 
                             inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
                         _inject_kv_stage_info(stage_cfg, stage_id)
-                        stage_clients[stage_id] = initialize_diffusion_stage(self.model, stage_cfg, metadata)
+                        stage_clients[stage_id] = initialize_diffusion_stage(
+                            self.model,
+                            stage_cfg,
+                            metadata,
+                            batch_size=self.diffusion_batch_size,
+                        )
                         logger.info("[AsyncOmniEngine] Stage %s initialized (diffusion)", stage_id)
                         continue
 
@@ -955,6 +962,47 @@ class AsyncOmniEngine:
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
             arrival_time=arrival_time,
+        )
+
+    def add_diffusion_batch_request(
+        self,
+        request_ids: list[str],
+        prompts: list[Any],
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+    ) -> None:
+        """Send a batch of prompts to the Orchestrator as a single message.
+
+        This is only supported when stage-0 is a diffusion stage.  All
+        prompts are processed in one ``DiffusionEngine.step()`` call.
+        """
+        effective_spl = (
+            list(sampling_params_list) if sampling_params_list is not None else list(self.default_sampling_params_list)
+        )
+        msg = {
+            "type": "add_diffusion_batch_request",
+            "request_ids": request_ids,
+            "prompts": prompts,
+            "sampling_params_list": effective_spl,
+            "final_stage_id": final_stage_id,
+        }
+        if self.request_queue is None:
+            raise RuntimeError("request_queue is not initialized")
+        self.request_queue.sync_q.put_nowait(msg)
+
+    async def add_diffusion_batch_request_async(
+        self,
+        request_ids: list[str],
+        prompts: list[Any],
+        sampling_params_list: Sequence[Any] | None = None,
+        final_stage_id: int = 0,
+    ) -> None:
+        """Async add_diffusion_batch_request API."""
+        self.add_diffusion_batch_request(
+            request_ids=request_ids,
+            prompts=prompts,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
         )
 
     def try_get_output(self, timeout: float = 0.001) -> dict[str, Any] | None:
