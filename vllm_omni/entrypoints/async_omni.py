@@ -29,6 +29,7 @@ from vllm_omni.outputs import OmniRequestOutput
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
     from vllm.tokenizers import TokenizerLike
+    from vllm.v1.engine import PauseMode
 
     from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
 
@@ -66,7 +67,7 @@ class AsyncOmni(EngineClient, OmniBase):
         ...     print(output)
     """
 
-    def __init__(self, model: str, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
@@ -130,9 +131,12 @@ class AsyncOmni(EngineClient, OmniBase):
     async def generate(
         self,
         prompt: OmniPromptType | list[OmniPromptType],
-        request_id: str,
-        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
+        request_id: str = "",
         *,
+        prompt_text: str | None = None,
+        lora_request: Any = None,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        sampling_params_list: Sequence[OmniSamplingParams] | None = None,
         output_modalities: list[str] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
@@ -235,6 +239,7 @@ class AsyncOmni(EngineClient, OmniBase):
         trace_headers: dict[str, str] | None = None,
         priority: int = 0,
         tokenization_kwargs: dict[str, Any] | None = None,
+        reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
         """EngineClient.encode() stub.
 
@@ -405,6 +410,7 @@ class AsyncOmni(EngineClient, OmniBase):
     async def pause_generation(
         self,
         *,
+        mode: PauseMode = "abort",
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
     ) -> None:
@@ -476,7 +482,7 @@ class AsyncOmni(EngineClient, OmniBase):
         logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
         return True
 
-    async def sleep(self, level: int = 1) -> None:
+    async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         """Sleep all stages.
 
         Best-effort: unsupported stages will emit a TODO result.
@@ -593,7 +599,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     # ==================== Shutdown ====================
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown the engine."""
         if self.final_output_task is not None:
             self.final_output_task.cancel()
