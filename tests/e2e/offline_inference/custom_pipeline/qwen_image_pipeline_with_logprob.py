@@ -294,7 +294,7 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         sde_window_size = sp.extra_args.get("sde_window_size", None) or sde_window_size
         sde_window_range = sp.extra_args.get("sde_window_range", None) or sde_window_range
         sde_type = sp.extra_args.get("sde_type", None) or sde_type
-        logprobs = sp.extra_args.get("logprobs", None)
+        logprobs = sp.extra_args.get("logprobs", None) or logprobs
 
         generator = sp.generator or generator
         if generator is None and sp.seed is not None:
