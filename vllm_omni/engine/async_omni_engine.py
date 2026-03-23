@@ -964,7 +964,7 @@ class AsyncOmniEngine:
             arrival_time=arrival_time,
         )
 
-    def add_batch_request(
+    def add_diffusion_batch_request(
         self,
         request_ids: list[str],
         prompts: list[Any],
@@ -980,7 +980,7 @@ class AsyncOmniEngine:
             list(sampling_params_list) if sampling_params_list is not None else list(self.default_sampling_params_list)
         )
         msg = {
-            "type": "add_batch_request",
+            "type": "add_diffusion_batch_request",
             "request_ids": request_ids,
             "prompts": prompts,
             "sampling_params_list": effective_spl,
@@ -990,15 +990,15 @@ class AsyncOmniEngine:
             raise RuntimeError("request_queue is not initialized")
         self.request_queue.sync_q.put_nowait(msg)
 
-    async def add_batch_request_async(
+    async def add_diffusion_batch_request_async(
         self,
         request_ids: list[str],
         prompts: list[Any],
         sampling_params_list: Sequence[Any] | None = None,
         final_stage_id: int = 0,
     ) -> None:
-        """Async add_batch_request API."""
-        self.add_batch_request(
+        """Async add_diffusion_batch_request API."""
+        self.add_diffusion_batch_request(
             request_ids=request_ids,
             prompts=prompts,
             sampling_params_list=sampling_params_list,

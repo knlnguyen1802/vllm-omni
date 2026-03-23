@@ -263,7 +263,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
             # ---- submit (only difference between the two paths) ----
             if is_batch:
-                await self.engine.add_batch_request_async(
+                await self.engine.add_diffusion_batch_request_async(
                     request_ids=all_request_ids,
                     prompts=prompts,
                     sampling_params_list=sampling_params_list,

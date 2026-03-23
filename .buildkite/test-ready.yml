@@ -53,7 +53,7 @@ steps:
   - label: "Diffusion Batching Test"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 20m pytest -s -v tests/e2e/offline_inference/test_diffusion_batching.py -m "core_model and diffusion" --run-level "core_model"
+      - timeout 20m pytest -s -v tests/e2e/offline_inference/test_qwen_image_diffusion_batching.py -m "core_model and diffusion" --run-level "core_model"
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:

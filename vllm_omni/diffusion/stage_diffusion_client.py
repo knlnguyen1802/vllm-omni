@@ -83,7 +83,7 @@ class StageDiffusionClient:
         finally:
             self._tasks.pop(request_id, None)
 
-    async def add_batch_request_async(
+    async def add_diffusion_batch_request_async(
         self,
         request_ids: list[str],
         prompts: list[OmniPromptType],

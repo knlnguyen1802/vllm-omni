@@ -200,8 +200,8 @@ class Orchestrator:
 
             if msg_type == "add_request":
                 await self._handle_add_request(msg)
-            elif msg_type == "add_batch_request":
-                await self._handle_add_batch_request(msg)
+            elif msg_type == "add_diffusion_batch_request":
+                await self._handle_add_diffusion_batch_request(msg)
             elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
             elif msg_type == "abort":
@@ -612,8 +612,8 @@ class Orchestrator:
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
-    async def _handle_add_batch_request(self, msg: dict[str, Any]) -> None:
-        """Handle an add_batch_request message – diffusion stages only.
+    async def _handle_add_diffusion_batch_request(self, msg: dict[str, Any]) -> None:
+        """Handle an add_diffusion_batch_request message – diffusion stages only.
 
         Creates per-request bookkeeping for every prompt in the batch,
         then dispatches the whole list to the stage client in one call.
@@ -625,7 +625,7 @@ class Orchestrator:
         final_stage_id = msg.get("final_stage_id", 0)
 
         if not sampling_params_list:
-            raise ValueError("Missing sampling_params_list in add_batch_request")
+            raise ValueError("Missing sampling_params_list in add_diffusion_batch_request")
         params = sampling_params_list[0]
 
         stage_client = self.stage_clients[stage_id]
@@ -643,10 +643,10 @@ class Orchestrator:
             req_state.stage_submit_ts[stage_id] = now
             self.request_states[rid] = req_state
 
-        await stage_client.add_batch_request_async(request_ids, prompts, params)
+        await stage_client.add_diffusion_batch_request_async(request_ids, prompts, params)
 
         logger.info(
-            "[Orchestrator] _handle_add_batch_request: %d prompts dispatched to diffusion stage",
+            "[Orchestrator] _handle_add_diffusion_batch_request: %d prompts dispatched to diffusion stage",
             len(prompts),
         )
 
