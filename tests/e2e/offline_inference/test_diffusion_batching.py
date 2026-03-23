@@ -52,7 +52,7 @@ from vllm_omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
-models = ["riverclouds/qwen_image_random"]
+models = ["tiny-random/Qwen-Image"]
 
 # ------------------------------------------------------------------
 # Prompt fixtures
