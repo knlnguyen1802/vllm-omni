@@ -27,7 +27,6 @@ if str(REPO_ROOT) not in sys.path:
 from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
-
 MODEL_NAME = "riverclouds/qwen_image_random"
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 
@@ -138,9 +137,7 @@ def test_diffusion_sleep_wake_up(runtime: str, tp_size: int) -> None:
     if current_omni_platform.is_rocm() or current_omni_platform.is_npu() or current_omni_platform.is_xpu():
         pytest.skip("qwen_image_random sleep/wake_up e2e is only enabled on CUDA.")
 
-    if tp_size == 2 and (
-        not current_omni_platform.is_available() or current_omni_platform.device_count() < 2
-    ):
+    if tp_size == 2 and (not current_omni_platform.is_available() or current_omni_platform.device_count() < 2):
         pytest.skip("TP=2 sleep/wake_up test requires >= 2 devices.")
 
     if runtime == "omni":
