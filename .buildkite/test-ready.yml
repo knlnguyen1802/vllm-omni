@@ -82,7 +82,7 @@ steps:
             - "HF_HOME=/fsx/hf_cache"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
-            
+
   - label: "Diffusion Model CPU offloading Test"
     depends_on: upload-ready-pipeline
     commands:
