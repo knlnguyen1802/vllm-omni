@@ -28,7 +28,7 @@ from vllm_omni import Omni
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 
-MODEL_NAME = "/data/n0090/models/qwen_image_random"
+MODEL_NAME = "riverclouds/qwen_image_random"
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
 
 
