@@ -203,42 +203,37 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         deadline = None if timeout is None else time.monotonic() + timeout
         kwargs = kwargs or {}
 
-        # Prepare RPC request message
+        # Prepare RPC request message.
+        # exec_all_ranks=True ensures every worker executes the method even
+        # when output_rank targets a single responder.  Only rank 0 owns a
+        # result_mq, so we always expect exactly one response.
         rpc_request = {
             "type": "rpc",
             "method": method,
             "args": args,
             "kwargs": kwargs,
             "output_rank": unique_reply_rank,
+            "exec_all_ranks": True,
         }
 
         try:
-            # Broadcast RPC request to all workers via unified message queue
             self._broadcast_mq.enqueue(rpc_request)
 
-            # Determine which workers we expect responses from
-            num_responses = 1 if unique_reply_rank is not None else self.od_config.num_gpus
+            dequeue_timeout = None if deadline is None else max(0, deadline - time.monotonic())
+            try:
+                response = self._result_mq.dequeue(timeout=dequeue_timeout)
 
-            responses = []
-            for _ in range(num_responses):
-                dequeue_timeout = None if deadline is None else max(0, deadline - time.monotonic())
-                try:
-                    response = self._result_mq.dequeue(timeout=dequeue_timeout)
+                if isinstance(response, dict) and response.get("status") == "error":
+                    raise RuntimeError(
+                        f"Worker failed with error '{response.get('error')}', "
+                        "please check the stack trace above for the root cause"
+                    )
+            except zmq.error.Again as e:
+                raise TimeoutError(f"RPC call to {method} timed out.") from e
+            except TimeoutError as e:
+                raise TimeoutError(f"RPC call to {method} timed out.") from e
 
-                    # Check if response indicates an error
-                    if isinstance(response, dict) and response.get("status") == "error":
-                        raise RuntimeError(
-                            f"Worker failed with error '{response.get('error')}', "
-                            "please check the stack trace above for the root cause"
-                        )
-
-                    responses.append(response)
-                except zmq.error.Again as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-                except TimeoutError as e:
-                    raise TimeoutError(f"RPC call to {method} timed out.") from e
-
-            return responses[0] if unique_reply_rank is not None else responses
+            return response
         except Exception as e:
             logger.error(f"RPC call failed: {e}")
             raise
