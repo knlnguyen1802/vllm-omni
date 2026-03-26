@@ -53,4 +53,4 @@ async def test_collective_rpc_test_extension_name():
         result = await engine.collective_rpc(method="test_extension_name")
 
     assert isinstance(result, list), f"Expected list, got {type(result)}"
-    assert result == ["vllm-omni-colocate-worker-extension-for-test"]
+    assert result == [["vllm-omni-colocate-worker-extension-for-test"]]
