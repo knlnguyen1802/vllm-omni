@@ -38,7 +38,7 @@ import inspect
 import os
 import threading
 from collections import OrderedDict
-from typing import Any, Callable
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -139,7 +139,7 @@ class PromptEmbedCache:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
         self.enabled = enabled
-        self._store: "OrderedDict[Any, Any]" = OrderedDict()
+        self._store: OrderedDict[Any, Any] = OrderedDict()
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
