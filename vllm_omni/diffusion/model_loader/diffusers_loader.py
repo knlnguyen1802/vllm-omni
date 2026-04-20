@@ -50,6 +50,23 @@ MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 
 
+def _resolve_custom_pipeline_cls(custom_pipeline_name: str | type | None) -> type:
+    """Resolve a custom pipeline reference to a class.
+
+    Accepts either a fully qualified name string (resolved via import) or an
+    already-imported class object (returned as-is).
+    """
+    if custom_pipeline_name is None:
+        raise ValueError("custom_pipeline_name is required for load_format='custom_pipeline'")
+    if isinstance(custom_pipeline_name, str):
+        return resolve_obj_by_qualname(custom_pipeline_name)
+    if isinstance(custom_pipeline_name, type):
+        return custom_pipeline_name
+    raise TypeError(
+        f"custom_pipeline_name must be a qualified name string or a class, got {type(custom_pipeline_name).__name__}"
+    )
+
+
 class DiffusersPipelineLoader:
     """Model loader that can load diffusers pipeline components from disk."""
 
@@ -258,7 +275,7 @@ class DiffusersPipelineLoader:
         od_config: OmniDiffusionConfig,
         load_device: str,
         load_format: str = "default",
-        custom_pipeline_name: str | None = None,
+        custom_pipeline_name: str | type[nn.Module] | None = None,
         device: torch.device | None = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
@@ -278,7 +295,7 @@ class DiffusersPipelineLoader:
                     if load_format == "default":
                         model = initialize_model(od_config)
                     elif load_format == "custom_pipeline":
-                        model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+                        model_cls = _resolve_custom_pipeline_cls(custom_pipeline_name)
                         model = model_cls(od_config=od_config)
                 logger.debug("Loading weights on %s ...", load_device)
                 if self._is_gguf_quantization(od_config):
@@ -513,7 +530,7 @@ class DiffusersPipelineLoader:
         self,
         od_config: OmniDiffusionConfig,
         load_format: str = "default",
-        custom_pipeline_name: str | None = None,
+        custom_pipeline_name: str | type[nn.Module] | None = None,
     ) -> nn.Module:
         """Load model with HSDP sharding for inference.
 
@@ -541,7 +558,7 @@ class DiffusersPipelineLoader:
         if load_format == "default":
             model = initialize_model(od_config)
         elif load_format == "custom_pipeline":
-            model_cls = resolve_obj_by_qualname(custom_pipeline_name)
+            model_cls = _resolve_custom_pipeline_cls(custom_pipeline_name)
             model = model_cls(od_config=od_config)
         self.load_weights(model)
 
