@@ -20,9 +20,10 @@ Design points:
       pipeline has loaded, so each runner process owns its own cache.
     * Cache keys are derived from the bound ``encode_prompt`` arguments. Only
       inputs we can safely hash (``str`` / ``int`` / ``float`` / ``bool`` /
-      ``None`` / ``bytes`` / nested lists/tuples/dicts of those) participate
-      in the key. If any argument is a tensor, PIL image, or other non-trivial
-      object, we bypass the cache for that call to guarantee correctness.
+      ``None`` / ``bytes`` / ``torch.device`` / ``torch.dtype`` / numpy
+      scalars / nested lists/tuples/dicts of those) participate in the key.
+      If any argument is a tensor, PIL image, or other non-trivial object, we
+      bypass the cache for that call to guarantee correctness.
     * If a caller passes precomputed ``*_embeds`` into ``encode_prompt`` the
       wrapper also bypasses the cache because the call is already short-circuit.
     * Cache values are detached tensors. Downstream pipeline code typically
@@ -49,6 +50,10 @@ logger = init_logger(__name__)
 # caching for that specific call.
 _NOT_HASHABLE = object()
 
+# Sentinel returned by :meth:`PromptEmbedCache.get` to distinguish a cache
+# miss from a legitimate cached value of ``None``.
+_CACHE_MISS = object()
+
 # Argument names whose presence of a non-None value means the caller is
 # providing precomputed embeddings. In every pipeline we inspected, passing
 # these makes ``encode_prompt`` a cheap passthrough, so caching it has no
@@ -69,10 +74,21 @@ def _hashable(obj: Any) -> Any:
     Only inputs whose textual / scalar identity fully determines the
     ``encode_prompt`` output are considered safe. Tensors and PIL images (which
     flow through e.g. image-edit pipelines) deliberately disable caching for
-    that call rather than risk stale results.
+    that call rather than risk stale results. Common value-like configuration
+    objects such as ``torch.device`` and ``torch.dtype`` are normalized to
+    stable string forms so they can participate in cache keys safely.
     """
     if obj is None or isinstance(obj, (str, int, float, bool, bytes)):
         return obj
+    if isinstance(obj, torch.device):
+        return ("__torch_device__", str(obj))
+    if isinstance(obj, torch.dtype):
+        return ("__torch_dtype__", str(obj))
+    if type(obj).__module__.split(".", 1)[0] == "numpy" and hasattr(obj, "item"):
+        try:
+            return _hashable(obj.item())
+        except (ValueError, TypeError):
+            return _NOT_HASHABLE
     if isinstance(obj, (list, tuple)):
         out = []
         for item in obj:
@@ -98,9 +114,15 @@ def _detach_output(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach()
     if isinstance(value, tuple):
-        return tuple(_detach_output(v) for v in value)
+        detached = tuple(_detach_output(v) for v in value)
+        # Preserve namedtuple types so attribute access keeps working.
+        if hasattr(value, "_fields"):
+            return type(value)(*detached)
+        return detached
     if isinstance(value, list):
         return [_detach_output(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _detach_output(v) for k, v in value.items()}
     return value
 
 
@@ -124,10 +146,15 @@ class PromptEmbedCache:
         self.bypassed = 0
 
     def get(self, key: Any) -> Any:
+        """Return the cached value or ``_CACHE_MISS`` if absent.
+
+        Returning a sentinel (rather than ``None``) lets callers cache
+        legitimate ``None`` results from the wrapped function.
+        """
         with self._lock:
             if key not in self._store:
                 self.misses += 1
-                return None
+                return _CACHE_MISS
             self._store.move_to_end(key)
             self.hits += 1
             return self._store[key]
@@ -230,10 +257,11 @@ def install_prompt_embed_cache(
             return encode_fn(*args, **kwargs)
         key = _build_key(signature, tag, args, kwargs)
         if key is None:
-            cache.bypassed += 1
+            with cache._lock:
+                cache.bypassed += 1
             return encode_fn(*args, **kwargs)
         hit = cache.get(key)
-        if hit is not None:
+        if hit is not _CACHE_MISS:
             return hit
         out = encode_fn(*args, **kwargs)
         cache.put(key, _detach_output(out))
