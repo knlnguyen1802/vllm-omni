@@ -615,7 +615,7 @@ def load_and_resolve_stage_configs(
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = create_config(default_stage_cfg)
+                stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
             else:
                 stage_configs = []
     elif stage_configs_path is None:
@@ -629,7 +629,7 @@ def load_and_resolve_stage_configs(
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = create_config(default_stage_cfg)
+                stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
             else:
                 stage_configs = []
     else:
