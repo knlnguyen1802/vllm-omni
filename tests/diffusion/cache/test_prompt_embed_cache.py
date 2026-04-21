@@ -17,20 +17,18 @@ Covers the module :mod:`vllm_omni.diffusion.cache.prompt_embed_cache`:
 
 from __future__ import annotations
 
-import os
 import threading
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
+    _CACHE_MISS,
+    _NOT_HASHABLE,
     PromptEmbedCache,
     _build_key,
-    _CACHE_MISS,
     _detach_output,
     _hashable,
-    _NOT_HASHABLE,
     install_prompt_embed_cache,
     resolve_prompt_embed_cache_config,
     uninstall_prompt_embed_cache,
@@ -370,6 +368,7 @@ class TestInstallAndUninstall:
         cache = install_prompt_embed_cache(pipe)
         # Put a tensor into a non-precomputed-embed slot to trigger bypass.
         pipe.encode_prompt("cat", device=torch.device("cpu"), num_images_per_prompt=1)
+
         # Now pass a fake tensor via a harmless positional-like call: use
         # the negative_prompt slot with an unhashable object.
         class Unhashable:
