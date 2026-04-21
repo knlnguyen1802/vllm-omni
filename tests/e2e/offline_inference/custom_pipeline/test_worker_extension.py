@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 
 import pytest
+from qwen_image_pipeline_with_logprob import QwenImagePipelineWithLogProbForTest
 
 from tests.e2e.offline_inference.custom_pipeline.worker_extension import (
     vLLMOmniColocateWorkerExtensionForTest,
@@ -13,7 +14,7 @@ from tests.e2e.offline_inference.custom_pipeline.worker_extension import (
 from tests.utils import hardware_test
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from qwen_image_pipeline_with_logprob import QwenImagePipelineWithLogProbForTest
+
 CUSTOM_PIPELINE_CLASS = QwenImagePipelineWithLogProbForTest
 WORKER_EXTENSION_CLASS = (
     "tests.e2e.offline_inference.custom_pipeline.worker_extension.vLLMOmniColocateWorkerExtensionForTest"

@@ -159,9 +159,7 @@ class DiffusionWorker:
     def _get_profiler(self) -> WorkerProfiler | None:
         return getattr(self, "profiler", None)
 
-    def load_model(
-        self, load_format: str = "default", custom_pipeline_name: str | type | None = None
-    ) -> None:
+    def load_model(self, load_format: str = "default", custom_pipeline_name: str | type | None = None) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
         with (
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
