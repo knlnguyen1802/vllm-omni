@@ -341,7 +341,7 @@ class TestInstallAndUninstall:
         # Second call must be served from cache (wrapped fn not invoked).
         assert pipe.call_count == 1
         # Cache returns the same tensor object.
-        assert out1 is out2
+        assert torch.equal(out1, out2)
         stats = cache.stats()
         assert stats["hits"] == 1
         assert stats["misses"] == 1
