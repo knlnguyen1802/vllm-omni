@@ -13,10 +13,8 @@ from tests.e2e.offline_inference.custom_pipeline.worker_extension import (
 from tests.utils import hardware_test
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-
-CUSTOM_PIPELINE_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob.QwenImagePipelineWithLogProbForTest"
-)
+from qwen_image_pipeline_with_logprob import QwenImagePipelineWithLogProbForTest
+CUSTOM_PIPELINE_CLASS = QwenImagePipelineWithLogProbForTest
 WORKER_EXTENSION_CLASS = (
     "tests.e2e.offline_inference.custom_pipeline.worker_extension.vLLMOmniColocateWorkerExtensionForTest"
 )
