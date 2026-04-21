@@ -6,8 +6,10 @@ from __future__ import annotations
 from contextlib import ExitStack
 
 import pytest
-from tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob import QwenImagePipelineWithLogProbForTest
 
+from tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob import (
+    QwenImagePipelineWithLogProbForTest,
+)
 from tests.e2e.offline_inference.custom_pipeline.worker_extension import (
     vLLMOmniColocateWorkerExtensionForTest,
 )
