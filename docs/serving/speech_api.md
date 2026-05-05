@@ -22,21 +22,10 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --enforce-eager
 
 # Fish Speech S2 Pro
-vllm-omni serve fishaudio/s2-pro \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml \
-    --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager \
-    --gpu-memory-utilization 0.9
+vllm serve fishaudio/s2-pro --omni --port 8091
 
 # Voxtral TTS
-vllm serve mistralai/Voxtral-4B-TTS-2603 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
-    --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
 ```
 
 ### Generate Speech
@@ -546,7 +535,7 @@ The bundled `qwen3_tts.yaml` uses `max_num_seqs: 1` (single request) on both sta
 |-------|-------------|
 | `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
 
-Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech online serving example](../user_guide/examples/online_serving/fish_speech.md) for details.
+Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro) for details.
 
 ### Voxtral TTS
 
