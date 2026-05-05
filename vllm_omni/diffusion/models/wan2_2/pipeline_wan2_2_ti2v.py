@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Omni
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -87,9 +88,6 @@ def get_wan22_ti2v_pre_process_func(
     od_config: OmniDiffusionConfig,
 ):
     """Pre-process function for TI2V: optionally load and resize input image."""
-    from diffusers.video_processor import VideoProcessor
-
-    video_processor = VideoProcessor(vae_scale_factor=8)
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         for i, prompt in enumerate(request.prompts):
@@ -135,10 +133,6 @@ def get_wan22_ti2v_pre_process_func(
             )
             prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
 
-            # Preprocess for VAE
-            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                image, height=request.sampling_params.height, width=request.sampling_params.width
-            )
             request.prompts[i] = prompt
         return request
 
@@ -182,6 +176,13 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 fall_back_to_pt=True,
             ),
         ]
+
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        prefetch_subfolders(
+            model,
+            ["tokenizer", "text_encoder", "vae"],
+            local_files_only=local_files_only,
+        )
 
         # Text encoder
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
