@@ -135,6 +135,11 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "InternVLAA1Pipeline": (
+        "internvla_a1",
+        "pipeline_internvla_a1",
+        "InternVLAA1Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -159,6 +164,11 @@ _DIFFUSION_MODELS = {
         "flux2_klein",
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
+    ),
+    "ErnieImagePipeline": (
+        "ernie_image",
+        "pipeline_ernie_image",
+        "ErnieImagePipeline",
     ),
     "NextStep11Pipeline": (
         "nextstep_1_1",
@@ -194,6 +204,11 @@ _DIFFUSION_MODELS = {
         "dreamid_omni",
         "pipeline_dreamid_omni",
         "DreamIDOmniPipeline",
+    ),
+    "AudioXPipeline": (
+        "audiox",
+        "pipeline_audiox",
+        "AudioXPipeline",
     ),
     "HunyuanVideo15Pipeline": (
         "hunyuan_video",
@@ -241,6 +256,7 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "AudioXPipeline",
 }
 
 
@@ -416,15 +432,18 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX23Pipeline": "get_ltx2_post_process_func",
     "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
+    "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "ErnieImagePipeline": "get_ernie_image_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
