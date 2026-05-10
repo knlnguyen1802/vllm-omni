@@ -560,7 +560,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
-        speaker = getattr(request, "speaker", None)
+        speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
@@ -2148,6 +2148,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
+        bot_task = extra_body.get("bot_task")
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2157,6 +2158,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 modalities = ["img2img"]
             else:
                 engine_prompt_data = {"image": reference_images}
+
+        if bot_task:
+            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
+
+            prompt = build_prompt(prompt, task=bot_task)
+            if reference_images and len(reference_images) == 1:
+                engine_prompt_data = {"image": reference_images[0]}
+                modalities = ["image"]
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
         engine_prompt["modalities"] = modalities
@@ -2424,6 +2433,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             cfg_text_scale = extra_body.get("cfg_text_scale")
             cfg_img_scale = extra_body.get("cfg_img_scale")
             seed = extra_body.get("seed")
+            if seed is None:
+                seed = getattr(request, "seed", None)
             negative_prompt = extra_body.get("negative_prompt")
             num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
