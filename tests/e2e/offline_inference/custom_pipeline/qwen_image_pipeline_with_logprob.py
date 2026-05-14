@@ -113,7 +113,12 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
         return prompt_embeds, prompt_embeds_mask
 
     def _extract_prompt_ids(self, prompts):
-        """Extract prompt_ids/mask and their negatives from the OmniCustomPrompt list."""
+        """Extract prompt_ids/mask and their negatives from the OmniCustomPrompt list.
+
+        Falls back to tokenizing ``"prompt"`` / ``"negative_prompt"`` text fields
+        when ``prompt_ids`` is not provided (e.g. during the engine's dummy
+        warm-up run, which always submits a text prompt).
+        """
         prompt_ids = None
         prompt_mask = None
         negative_prompt_ids = None
@@ -125,7 +130,27 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
                 prompt_mask = p0.get("prompt_mask", None)
                 negative_prompt_ids = p0.get("negative_prompt_ids", None)
                 negative_prompt_mask = p0.get("negative_prompt_mask", None)
+
+                # Fallback: tokenize raw text prompt (covers _dummy_run path).
+                if prompt_ids is None and p0.get("prompt"):
+                    prompt_ids, prompt_mask = self._tokenize_text_prompt(p0["prompt"])
+                if negative_prompt_ids is None and p0.get("negative_prompt"):
+                    negative_prompt_ids, negative_prompt_mask = self._tokenize_text_prompt(p0["negative_prompt"])
+            elif isinstance(p0, str):
+                prompt_ids, prompt_mask = self._tokenize_text_prompt(p0)
         return prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask
+
+    def _tokenize_text_prompt(self, text: str | list[str]):
+        """Tokenize a text prompt using the Qwen chat template (parent behavior)."""
+        prompt = [text] if isinstance(text, str) else text
+        txt = [self.prompt_template_encode.format(e) for e in prompt]
+        tokens = self.tokenizer(
+            txt,
+            padding=True,
+            truncation=False,
+            return_tensors="pt",
+        ).to(self.device)
+        return tokens.input_ids, tokens.attention_mask
 
     def prepare_encode(
         self,
@@ -148,6 +173,12 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
             prompt_ids = torch.tensor(prompt_ids, device=self.device)
         if isinstance(negative_prompt_ids, list):
             negative_prompt_ids = torch.tensor(negative_prompt_ids, device=self.device)
+
+        if prompt_ids is None:
+            raise ValueError(
+                "QwenImagePipelineWithLogProbForTest.prepare_encode requires either "
+                "'prompt_ids' or a text 'prompt' in state.prompts[0]."
+            )
 
         height = sampling.height or self.default_sample_size * self.vae_scale_factor
         width = sampling.width or self.default_sample_size * self.vae_scale_factor
