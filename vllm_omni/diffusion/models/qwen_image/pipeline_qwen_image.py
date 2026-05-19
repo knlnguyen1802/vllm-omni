@@ -465,24 +465,38 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
     def encode_prompt(
         self,
-        prompt: str | list[str],
+        prompt: str | list[str] | None = None,
         num_images_per_prompt: int = 1,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
         max_sequence_length: int = 1024,
         prompt_name: str = "prompt",
+        prompts: list | None = None,
     ):
-        r"""
+        r"""Encode a text prompt into hidden-state embeddings.
 
         Args:
             prompt (`str` or `list[str]`, *optional*):
-                prompt to be encoded
+                Prompt text to encode. When ``None`` and ``prompt_embeds`` is also
+                ``None``, the method returns ``(None, None)`` (used for the
+                negative side when no negative prompt is supplied).
             num_images_per_prompt (`int`):
-                number of images that should be generated per prompt
+                Number of images that should be generated per prompt.
             prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
+                Pre-generated text embeddings. Can be used to easily tweak text
+                inputs, *e.g.* prompt weighting. If not provided, text embeddings
+                will be generated from ``prompt``.
+            prompts (`list`, *optional*):
+                Raw OmniPromptType list (``state.prompts`` / ``req.prompts``)
+                passed through by :meth:`_prepare_generation_context`. Default
+                implementation ignores it; custom subclasses (e.g. rollout
+                pipelines that consume pre-tokenized ``prompt_ids``) override
+                this method and read structured fields from ``prompts``.
         """
+        del prompts  # default impl encodes from ``prompt`` only
+
+        if prompt is None and prompt_embeds is None:
+            return None, None
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt) if prompt_embeds is None else prompt_embeds.shape[0]
@@ -614,8 +628,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
     def _prepare_generation_context(
         self,
         *,
-        prompt,
-        negative_prompt,
+        prompt=None,
+        negative_prompt=None,
         height,
         width,
         num_inference_steps,
@@ -625,6 +639,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         generator,
         true_cfg_scale,
         max_sequence_length,
+        prompts=None,
         prompt_embeds=None,
         prompt_embeds_mask=None,
         negative_prompt_embeds=None,
@@ -637,6 +652,12 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
         Validates inputs, encodes prompts, prepares latents, computes timesteps,
         and returns all intermediate values as a dict.
+
+        ``prompts`` (the raw OmniPromptType list) is forwarded to
+        :meth:`encode_prompt` so that custom subclasses can override a single
+        method (``encode_prompt``) to consume structured prompt fields such as
+        pre-tokenized ``prompt_ids`` without re-implementing the surrounding
+        bookkeeping.
         """
         self.check_inputs(
             prompt,
@@ -656,40 +677,41 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         self._current_timestep = None
         self._interrupt = False
 
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        elif prompt_embeds is not None:
-            batch_size = prompt_embeds.shape[0]
-        else:
-            batch_size = 1
-
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
-        )
-        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
-        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
-
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt=prompt,
+            prompts=prompts,
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
+            prompt_name="prompt",
         )
-        if do_true_cfg:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-                prompt_embeds_mask=negative_prompt_embeds_mask,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-                prompt_name="negative_prompt",
+        negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+            prompt=negative_prompt,
+            prompts=prompts,
+            prompt_embeds=negative_prompt_embeds,
+            prompt_embeds_mask=negative_prompt_embeds_mask,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+            prompt_name="negative_prompt",
+        )
+
+        if prompt_embeds is None:
+            raise ValueError(
+                "encode_prompt produced no positive embeddings; either `prompt`,"
+                " `prompt_embeds`, or a structured `prompts` entry must be provided."
             )
-        else:
+
+        has_neg_prompt = negative_prompt_embeds is not None
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+        if not do_true_cfg:
             negative_prompt_embeds = None
             negative_prompt_embeds_mask = None
+
+        # ``encode_prompt`` returns embeddings already replicated by
+        # ``num_images_per_prompt``; recover the original prompt count.
+        batch_size = max(1, prompt_embeds.shape[0] // max(1, num_images_per_prompt))
 
         num_channels_latents = self.transformer.in_channels // 4
         latents = self.prepare_latents(
@@ -744,11 +766,13 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
     ) -> "DiffusionRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
         sampling = state.sampling
-        prompt, negative_prompt = self._extract_prompts(state.prompts or [])
+        prompts = state.prompts or []
+        prompt, negative_prompt = self._extract_prompts(prompts)
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
             negative_prompt=negative_prompt,
+            prompts=prompts,
             height=sampling.height or self.default_sample_size * self.vae_scale_factor,
             width=sampling.width or self.default_sample_size * self.vae_scale_factor,
             num_inference_steps=sampling.num_inference_steps or 50,
@@ -1006,6 +1030,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         ctx = self._prepare_generation_context(
             prompt=prompt,
             negative_prompt=negative_prompt,
+            prompts=req.prompts,
             height=height,
             width=width,
             num_inference_steps=num_inference_steps,
