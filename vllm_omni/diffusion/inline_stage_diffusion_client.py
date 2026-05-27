@@ -3,11 +3,21 @@
 Runs DiffusionEngine in a ThreadPoolExecutor inside the Orchestrator process
 instead of spawning a separate StageDiffusionProc subprocess, eliminating ZMQ
 IPC overhead. Used when there is only a single diffusion stage.
+
+Supports Data Parallel (DP) deployment with multiple replicas:
+  * Single-node DP: multiple InlineStageDiffusionClient instances, each with
+    workers bound to a distinct subset of GPUs via ``CUDA_VISIBLE_DEVICES``
+    isolation at engine-creation time.
+  * Multi-node DP: remote replicas run as ``StageDiffusionProc`` subprocesses
+    that register with the OmniMasterServer; ``StageDiffusionClient`` wraps
+    them via ZMQ. The StagePool load-balances across all replicas (local
+    inline + remote ZMQ-backed) transparently.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
@@ -33,7 +43,12 @@ logger = init_logger(__name__)
 
 
 class InlineStageDiffusionClient(StageClientBase):
-    """Runs DiffusionEngine in a thread executor inside the Orchestrator."""
+    """Runs DiffusionEngine in a thread executor inside the Orchestrator.
+
+    When ``num_replicas > 1`` (Data Parallel), each instance binds its
+    ``DiffusionEngine`` worker processes to a distinct GPU subset via
+    ``CUDA_VISIBLE_DEVICES`` isolation at construction time.
+    """
 
     stage_type: str = "diffusion"
     replica_id: int = 0
@@ -45,11 +60,15 @@ class InlineStageDiffusionClient(StageClientBase):
         od_config: OmniDiffusionConfig,
         metadata: StageMetadata,
         batch_size: int = 1,
+        replica_id: int = 0,
+        num_replicas: int = 1,
+        devices: str | None = None,
+        num_gpus: int | None = None,
     ) -> None:
         self.model = model
         self.od_config = od_config
         self.stage_id = metadata.stage_id
-        self.replica_id = metadata.replica_id
+        self.replica_id = metadata.replica_id or replica_id
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
         self.default_sampling_params = metadata.default_sampling_params
@@ -57,10 +76,34 @@ class InlineStageDiffusionClient(StageClientBase):
         self.custom_process_input_func = metadata.custom_process_input_func
         self.engine_input_source = metadata.engine_input_source
         self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self._devices = devices
 
         self._enrich_config()
-        self._engine = DiffusionEngine.make_engine(self.od_config)
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inline-diffusion")
+
+        # Per-replica GPU isolation: restrict CUDA_VISIBLE_DEVICES before
+        # creating the DiffusionEngine so its worker processes inherit the
+        # correct device mask at spawn time. The caller (AsyncOmniEngine)
+        # already applies ``stage_runtime_setup`` which sets the env-var;
+        # here we additionally patch ``num_gpus`` on a per-replica copy of
+        # the config so that ``MultiprocDiffusionExecutor`` spawns the
+        # right number of workers.
+        if devices is not None:
+            self._device_count = len(devices.split(","))
+            if num_gpus is not None and num_gpus > 0:
+                self._device_count = min(self._device_count, num_gpus)
+            replica_od_config = copy.deepcopy(self.od_config)
+            if replica_od_config.num_gpus is not None:
+                replica_od_config.num_gpus = self._device_count
+            self._engine = DiffusionEngine.make_engine(replica_od_config)
+        else:
+            self._device_count = self.od_config.num_gpus or 1
+            self._engine = DiffusionEngine.make_engine(self.od_config)
+
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"inline-diffusion-r{self.replica_id}",
+        )
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._tasks: dict[str, asyncio.Task] = {}
@@ -70,10 +113,14 @@ class InlineStageDiffusionClient(StageClientBase):
         self._engine.executor.register_failure_callback(self._mark_engine_dead)
 
         logger.info(
-            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (batch_size=%d)",
+            "[InlineStageDiffusionClient] stage-%s [rep-%s/%s] initialized inline "
+            "(batch_size=%d, devices=%s, device_count=%d)",
             self.stage_id,
             self.replica_id,
+            self.num_replicas,
             self.batch_size,
+            self._devices or "default",
+            self._device_count,
         )
 
     def _enrich_config(self) -> None:

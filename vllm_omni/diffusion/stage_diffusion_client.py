@@ -48,12 +48,39 @@ def create_diffusion_client(
     stage_init_timeout: int,
     batch_size: int = 1,
     use_inline: bool = False,
+    replica_id: int = 0,
+    num_replicas: int = 1,
+    devices: str | None = None,
+    num_gpus: int | None = None,
 ) -> Any:
-    """Factory to create either an inline or out-of-process diffusion client."""
+    """Factory to create either an inline or out-of-process diffusion client.
+
+    Args:
+        model: Model name or path.
+        od_config: Omni diffusion configuration.
+        metadata: Per-stage metadata (stage_id, final_output, etc.).
+        stage_init_timeout: Handshake timeout for subprocess path (seconds).
+        batch_size: Maximum batch size for the diffusion engine.
+        use_inline: If True, use InlineStageDiffusionClient (no ZMQ).
+        replica_id: Logical replica index within the stage (0-based).
+        num_replicas: Total number of replicas for this stage.
+        devices: Comma-separated GPU device IDs assigned to this replica
+            (e.g. ``"0,1"``). Used for CUDA_VISIBLE_DEVICES isolation.
+        num_gpus: Number of GPUs available to this replica.
+    """
     if use_inline:
         from vllm_omni.diffusion.inline_stage_diffusion_client import InlineStageDiffusionClient
 
-        return InlineStageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
+        return InlineStageDiffusionClient(
+            model,
+            od_config,
+            metadata,
+            batch_size=batch_size,
+            replica_id=replica_id,
+            num_replicas=num_replicas,
+            devices=devices,
+            num_gpus=num_gpus,
+        )
     return StageDiffusionClient(
         model, od_config, metadata, stage_init_timeout=stage_init_timeout, batch_size=batch_size
     )

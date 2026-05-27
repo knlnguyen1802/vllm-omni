@@ -1078,6 +1078,10 @@ def initialize_diffusion_stage(
     stage_init_timeout: int,
     batch_size: int = 1,
     use_inline: bool = False,
+    replica_id: int = 0,
+    num_replicas: int = 1,
+    devices: str | None = None,
+    num_gpus: int | None = None,
 ) -> Any:
     """Build a diffusion stage client.
 
@@ -1090,8 +1094,24 @@ def initialize_diffusion_stage(
             diffusion engine.  Passed through to ``StageDiffusionClient``
             and ultimately to ``AsyncOmni``.
         use_inline: If True, uses the inline diffusion client instead of subprocess.
+        replica_id: Logical replica index within the stage (0-based).
+        num_replicas: Total number of replicas for this stage.
+        devices: Comma-separated GPU device IDs assigned to this replica
+            (e.g. ``"0,1"``). Used for CUDA_VISIBLE_DEVICES isolation.
+        num_gpus: Number of GPUs available to this replica.
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+    return create_diffusion_client(
+        model,
+        od_config,
+        metadata,
+        stage_init_timeout,
+        batch_size,
+        use_inline,
+        replica_id=replica_id,
+        num_replicas=num_replicas,
+        devices=devices,
+        num_gpus=num_gpus,
+    )

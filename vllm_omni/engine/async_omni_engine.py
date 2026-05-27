@@ -1076,6 +1076,22 @@ class AsyncOmniEngine:
                                     batch_size=self.diffusion_batch_size,
                                 )
                             else:
+                                # Inline path: single-stage mode (no PD disaggregation),
+                                # all replicas run inline inside the Orchestrator process.
+                                # Each replica's ``DiffusionEngine`` worker processes are
+                                # isolated to distinct GPUs via the ``stage_runtime_setup``
+                                # context manager which sets CUDA_VISIBLE_DEVICES per replica.
+                                replica_runtime = getattr(plan.stage_cfg, "runtime", None)
+                                replica_devices: str | None = (
+                                    replica_runtime.get("devices")
+                                    if hasattr(replica_runtime, "get")
+                                    else getattr(replica_runtime, "devices", None)
+                                )
+                                replica_num_gpus: int | None = (
+                                    replica_runtime.get("num_gpus")
+                                    if hasattr(replica_runtime, "get")
+                                    else getattr(replica_runtime, "num_gpus", None)
+                                )
                                 client = initialize_diffusion_stage(
                                     plan.metadata.stage_id,
                                     self.model,
@@ -1083,7 +1099,11 @@ class AsyncOmniEngine:
                                     plan.metadata,
                                     stage_init_timeout=stage_init_timeout,
                                     batch_size=self.diffusion_batch_size,
-                                    use_inline=self.num_stages == 1 and plan.num_replicas == 1,
+                                    use_inline=self.num_stages == 1,
+                                    replica_id=plan.replica_id,
+                                    num_replicas=plan.num_replicas,
+                                    devices=replica_devices,
+                                    num_gpus=replica_num_gpus,
                                 )
                     finally:
                         if previous_visible_devices is None:
@@ -1092,9 +1112,10 @@ class AsyncOmniEngine:
                             current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
             logger.info(
-                "[AsyncOmniEngine] Stage %s replica %s initialized (diffusion, batch_size=%d, devices=%s)",
+                "[AsyncOmniEngine] Stage %s replica %s/%s initialized (diffusion, batch_size=%d, devices=%s)",
                 plan.metadata.stage_id,
                 plan.replica_id,
+                plan.num_replicas,
                 self.diffusion_batch_size,
                 getattr(getattr(plan.stage_cfg, "runtime", None), "devices", "default"),
             )
