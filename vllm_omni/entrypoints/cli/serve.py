@@ -754,11 +754,24 @@ def run_headless(args: argparse.Namespace) -> None:
     # falls back to ``vllm_omni/deploy/<model>.yaml`` and the headless's
     # view of ``stage.runtime.devices`` diverges from the head's, breaking
     # the per-replica device split.
+    # When a pure diffusion model has no registered pipeline or deploy
+    # YAML, ``load_and_resolve_stage_configs`` returns an empty list.
+    # Provide the same default-diffusion fallback that the head path
+    # (AsyncOmniEngine._resolve_stage_configs) uses so headless workers
+    # can also serve models like Qwen-Image.
+    from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    _default_diffusion_factory = None
+    if is_diffusion_model(model):
+        _default_diffusion_factory = lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(args_dict)
+
     config_path, stage_configs = load_and_resolve_stage_configs(
         model,
         args_dict.get("stage_configs_path"),
         args_dict,
         deploy_config_path=args_dict.get("deploy_config"),
+        default_stage_cfg_factory=_default_diffusion_factory,
     )
 
     # Locate the stage config that matches stage_id.
