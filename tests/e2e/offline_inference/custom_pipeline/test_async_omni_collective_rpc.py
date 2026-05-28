@@ -187,7 +187,7 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
 
         # Measure global VRAM before sleep (driver view; includes inline worker
         # thread since inline mode runs in the same process).
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         free_before, total = torch.cuda.mem_get_info()
         used_before_gib = (total - free_before) / 1024**3
 
@@ -207,7 +207,7 @@ async def test_sleep_memory_reclaimed_custom_pipeline():
         # Put the engine to sleep; all weights should be offloaded via the pool.
         acks = await engine.sleep(level=1)
         await asyncio.sleep(0.5)  # allow the CUDA driver to settle
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         # Measure after sleep.
         free_after, _ = torch.cuda.mem_get_info()
