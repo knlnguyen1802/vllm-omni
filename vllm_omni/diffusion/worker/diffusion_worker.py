@@ -520,11 +520,11 @@ class DiffusionWorker:
             logger.info(f"[Worker {self.rank}] Handshake Received: Task {task.task_id}")
 
             current_omni_platform.synchronize()
-            usage_before = current_omni_platform.get_current_memory_usage(self.device)
+            free_before = current_omni_platform.get_free_memory(self.device)
             self.sleep(level=task.level)
             current_omni_platform.synchronize()
-            usage_after = current_omni_platform.get_current_memory_usage(self.device)
-            real_freed = max(0, usage_before - usage_after)
+            free_after = current_omni_platform.get_free_memory(self.device)
+            real_freed = max(0, free_after - free_before)
             logger.info(f"[Worker {self.rank}] Preparing ACK: freed_bytes={real_freed / GiB_bytes:.2f} GiB.")
 
             # Ensure all ranks have completed sleep before measuring memory and sending ACK
@@ -536,6 +536,11 @@ class DiffusionWorker:
             if self.rank != 0:
                 return None
 
+            try:
+                total_mem = current_omni_platform.get_device_total_memory()
+            except (NotImplementedError, AttributeError):
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+            residual_gib = (total_mem - free_after) / GiB_bytes
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
@@ -546,7 +551,7 @@ class DiffusionWorker:
                 metadata={
                     "source": f"Platform_{current_omni_platform.get_device_name()}",
                     "total_freed_gib": f"{real_freed / GiB_bytes:.2f}",
-                    "rank_residual_gib": f"{usage_after / GiB_bytes:.2f}",
+                    "rank_residual_gib": f"{residual_gib:.2f}",
                 },
             )
             logger.info(f"[Worker {self.rank}] ACK emitted. Freed {real_freed / GiB_bytes:.2f} GiB.")
@@ -574,8 +579,12 @@ class DiffusionWorker:
                 torch.distributed.barrier()
 
             current_omni_platform.synchronize()
-            usage_now = current_omni_platform.get_current_memory_usage(self.device)
-            current_used_gib = usage_now / (1024**3)
+            free_now = current_omni_platform.get_free_memory(self.device)
+            try:
+                total_mem = current_omni_platform.get_device_total_memory()
+            except (NotImplementedError, AttributeError):
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+            current_used_gib = (total_mem - free_now) / (1024**3)
 
             if self.rank != 0:
                 return None
