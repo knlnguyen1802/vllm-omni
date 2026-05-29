@@ -432,6 +432,15 @@ class OmniDiffusionConfig:
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
 
+    # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
+    # pipeline's ``encode_prompt`` so repeated calls with identical prompt
+    # arguments (e.g. GRPO rollouts that sample the same prompt many times
+    # with different seeds) reuse the text-encoder output instead of re-running
+    # it. Safe against inputs that cannot be hashed (tensors, PIL images):
+    # those calls transparently bypass the cache.
+    enable_prompt_embed_cache: bool = False
+    prompt_embed_cache_size: int = 32
+
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
@@ -1006,6 +1015,28 @@ class DiffusionOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    # When True, move all tensor fields (including tensors inside
+    # ``custom_output``) to CPU at construction time. Useful when the output
+    # is shipped across process boundaries (e.g. step-execution mode) and the
+    # receiving side must not initialise a stray CUDA context.
+    to_cpu: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.to_cpu:
+            return
+
+        def _maybe_to_cpu(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu()
+            return value
+
+        self.output = _maybe_to_cpu(self.output)
+        self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
+        self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
+        self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        if self.custom_output:
+            self.custom_output = {k: _maybe_to_cpu(v) for k, v in self.custom_output.items()}
 
 
 class DiffusionRequestAbortedError(RuntimeError):
