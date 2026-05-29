@@ -644,6 +644,7 @@ class DiffusersPipelineLoader:
         elif load_format == "custom_pipeline":
             model_cls = _resolve_custom_pipeline_cls(custom_pipeline_name)
             from vllm_omni.diffusion.config import set_current_diffusion_config
+
             with set_current_diffusion_config(od_config):
                 model = model_cls(od_config=od_config)
         self.load_weights(model)
