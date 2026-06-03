@@ -908,7 +908,6 @@ class AsyncOmni(EngineClient, OmniBase):
                 if ack is not None:
                     await self.event_resolver.resolve(ack)
                     final_acks.append(ack)
-        current_omni_platform.synchronize()
         await asyncio.sleep(0.1)
         self._is_sleeping = False
         logger.info(f"[{self._name}] All {len(final_acks)}/{total_workers} workers reported WARM for task {task_id}.")
