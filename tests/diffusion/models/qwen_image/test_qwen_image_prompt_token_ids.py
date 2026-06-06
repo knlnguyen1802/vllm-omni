@@ -3,7 +3,6 @@
 """Tests for prompt_token_ids support in QwenImage pipelines."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -39,10 +38,12 @@ class _RecordingTextEncoder:
         self.calls: list[dict] = []
 
     def __call__(self, input_ids, attention_mask, output_hidden_states, **kwargs):
-        self.calls.append({
-            "input_ids": input_ids.clone(),
-            "attention_mask": attention_mask.clone(),
-        })
+        self.calls.append(
+            {
+                "input_ids": input_ids.clone(),
+                "attention_mask": attention_mask.clone(),
+            }
+        )
         batch, seq_len = input_ids.shape
         hidden_dim = 128
         # Return hidden states where each token's embedding encodes its id
@@ -57,10 +58,7 @@ class _RejectingTokenizer:
     """Tokenizer that raises if called — proves tokenizer is skipped."""
 
     def __call__(self, *args, **kwargs):
-        raise AssertionError(
-            "Tokenizer was called but should have been skipped when "
-            "prompt_token_ids is provided."
-        )
+        raise AssertionError("Tokenizer was called but should have been skipped when prompt_token_ids is provided.")
 
     def decode(self, ids):
         return "decoded"
@@ -137,9 +135,11 @@ class TestExtractPrompts:
     def test_extracts_prompt_token_ids_from_dict(self):
         pipeline = object.__new__(QwenImagePipeline)
         nn.Module.__init__(pipeline)
-        prompt, neg_prompt, pt_ids, neg_pt_ids = pipeline._extract_prompts([
-            {"prompt": "a cat", "prompt_token_ids": PROMPT_TOKEN_IDS[0]},
-        ])
+        prompt, neg_prompt, pt_ids, neg_pt_ids = pipeline._extract_prompts(
+            [
+                {"prompt": "a cat", "prompt_token_ids": PROMPT_TOKEN_IDS[0]},
+            ]
+        )
         assert prompt == ["a cat"]
         assert neg_prompt is None
         assert pt_ids == PROMPT_TOKEN_IDS
@@ -148,14 +148,16 @@ class TestExtractPrompts:
     def test_extracts_negative_prompt_token_ids_from_dict(self):
         pipeline = object.__new__(QwenImagePipeline)
         nn.Module.__init__(pipeline)
-        prompt, neg_prompt, pt_ids, neg_pt_ids = pipeline._extract_prompts([
-            {
-                "prompt": "a cat",
-                "negative_prompt": "a dog",
-                "prompt_token_ids": PROMPT_TOKEN_IDS[0],
-                "negative_prompt_token_ids": NEG_PROMPT_TOKEN_IDS[0],
-            },
-        ])
+        prompt, neg_prompt, pt_ids, neg_pt_ids = pipeline._extract_prompts(
+            [
+                {
+                    "prompt": "a cat",
+                    "negative_prompt": "a dog",
+                    "prompt_token_ids": PROMPT_TOKEN_IDS[0],
+                    "negative_prompt_token_ids": NEG_PROMPT_TOKEN_IDS[0],
+                },
+            ]
+        )
         assert prompt == ["a cat"]
         assert neg_prompt == ["a dog"]
         assert pt_ids == PROMPT_TOKEN_IDS
@@ -164,9 +166,11 @@ class TestExtractPrompts:
     def test_prompt_token_ids_none_when_missing(self):
         pipeline = object.__new__(QwenImagePipeline)
         nn.Module.__init__(pipeline)
-        prompt, neg_prompt, pt_ids, neg_pt_ids = pipeline._extract_prompts([
-            {"prompt": "a cat"},
-        ])
+        prompt, neg_prompt, pt_ids, neg_pt_ids = pipeline._extract_prompts(
+            [
+                {"prompt": "a cat"},
+            ]
+        )
         assert prompt == ["a cat"]
         assert pt_ids is None
         assert neg_pt_ids is None
@@ -183,10 +187,12 @@ class TestExtractPrompts:
         """If only some prompts have token_ids, fall back to None (all-or-nothing)."""
         pipeline = object.__new__(QwenImagePipeline)
         nn.Module.__init__(pipeline)
-        prompt, neg_prompt, pt_ids, neg_pt_ids = pipeline._extract_prompts([
-            {"prompt": "a cat", "prompt_token_ids": PROMPT_TOKEN_IDS[0]},
-            {"prompt": "a dog"},  # missing token_ids
-        ])
+        prompt, neg_prompt, pt_ids, neg_pt_ids = pipeline._extract_prompts(
+            [
+                {"prompt": "a cat", "prompt_token_ids": PROMPT_TOKEN_IDS[0]},
+                {"prompt": "a dog"},  # missing token_ids
+            ]
+        )
         assert prompt == ["a cat", "a dog"]
         assert pt_ids is None  # not all prompts have token_ids
 
@@ -280,8 +286,7 @@ class TestGetQwenPromptEmbeds:
         assert short_real > 0
         assert long_real > 0
         assert long_real > short_real, (
-            f"Longer prompt should have more real tokens: "
-            f"short={short_real}, long={long_real}"
+            f"Longer prompt should have more real tokens: short={short_real}, long={long_real}"
         )
 
     def test_prompt_token_ids_embeddings_match_expected_values(self):
@@ -334,9 +339,7 @@ class TestEncodePrompt:
         assert len(pipeline.text_encoder.calls) == 1
 
     @pytest.mark.parametrize(("pipeline_class", "drop_idx"), PIPELINE_CASES)
-    def test_encode_prompt_with_token_ids_respects_max_sequence_length(
-        self, pipeline_class, drop_idx
-    ):
+    def test_encode_prompt_with_token_ids_respects_max_sequence_length(self, pipeline_class, drop_idx):
         """Slicing to max_sequence_length must work with token_ids path."""
         pipeline = _make_pipeline_with_recording_encoder(pipeline_class, drop_idx)
 

@@ -433,10 +433,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         ids are fed directly to the text encoder.
         """
         if prompt is None and prompt_token_ids is None:
-            raise ValueError(
-                "Either `prompt` or `prompt_token_ids` must be provided "
-                f"for {prompt_name}."
-            )
+            raise ValueError(f"Either `prompt` or `prompt_token_ids` must be provided for {prompt_name}.")
         dtype = dtype or self.text_encoder.dtype
 
         if prompt_token_ids is not None:
