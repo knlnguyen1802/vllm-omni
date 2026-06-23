@@ -28,11 +28,13 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
     request_id: str
     kv_sender_info: dict | None = None
+    priority: int = 0
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
         if not isinstance(self.request_id, str) or not self.request_id:
             raise ValueError("OmniDiffusionRequest.request_id must be a non-empty string.")
+        self.priority = int(self.priority)
 
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.

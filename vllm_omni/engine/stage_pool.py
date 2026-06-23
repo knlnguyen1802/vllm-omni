@@ -918,15 +918,16 @@ class StagePool:
             params = OmniDiffusionSamplingParams()
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
+            priority = int(submit_kwargs.pop("priority", getattr(request, "priority", 0)))
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
             client = self._diffusion_client(replica_id)
             if isinstance(request, list):
-                await client.add_batch_request_async(request_id, request, params, **submit_kwargs)
+                await client.add_batch_request_async(request_id, request, params, priority=priority, **submit_kwargs)
             else:
-                await client.add_request_async(request_id, request, params, **submit_kwargs)
+                await client.add_request_async(request_id, request, params, priority=priority, **submit_kwargs)
             return replica_id
 
         replica_id = await self._pick_or_select(
@@ -978,6 +979,7 @@ class StagePool:
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion" and not isinstance(params, OmniDiffusionSamplingParams):
             params = OmniDiffusionSamplingParams()
+        priority = int(getattr(request, "priority", 0))
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
             replica_id = await self._pick_or_select(request_id)
@@ -987,7 +989,7 @@ class StagePool:
             raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
-            await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
+            await self._diffusion_client(replica_id).add_request_async(request_id, request, params, priority=priority)
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest

@@ -334,6 +334,7 @@ class StageDiffusionClient(StageClientBase):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        priority: int = 0,
     ) -> None:
         if self._engine_dead:
             raise EngineDeadError()
@@ -351,6 +352,7 @@ class StageDiffusionClient(StageClientBase):
                     "prompt": prompt,
                     "sampling_params": self._sampling_params_to_dict(sampling_params),
                     "kv_sender_info": kv_sender_info,
+                    "priority": priority,
                 }
             )
         )
@@ -363,6 +365,7 @@ class StageDiffusionClient(StageClientBase):
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        priority: int = 0,
     ) -> None:
         """Submit a list of prompts as a single batched engine call.
 
@@ -406,6 +409,7 @@ class StageDiffusionClient(StageClientBase):
                         "prompts": prompts,
                         "sampling_params": self._sampling_params_to_dict(sampling_params),
                         "kv_sender_info": kv_sender_info,
+                        "priority": priority,
                     }
                 )
             )

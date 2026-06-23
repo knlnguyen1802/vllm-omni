@@ -62,6 +62,19 @@ def test_non_dummy_request_is_not_identified_as_dummy_run():
     assert not OmniDiffusionRequest.is_dummy_run_request_id(None)
 
 
+def test_priority_defaults_to_zero_and_coerces_to_int():
+    default_req = _make_request()
+    priority_req = OmniDiffusionRequest(
+        prompts=[{"prompt": "a cup of coffee on a table"}],
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="priority-request-test",
+        priority="-3",
+    )
+
+    assert default_req.priority == 0
+    assert priority_req.priority == -3
+
+
 def test_tp_seed_same_across_ranks_and_varies_across_requests():
     random.seed(0)
     n_requests = 5

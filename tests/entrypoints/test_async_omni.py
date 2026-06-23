@@ -226,6 +226,59 @@ def test_output_kind_is_preserved_with_explicit_sampling_params(output_kind):
     assert captured_params[0].output_kind == output_kind
 
 
+@pytest.mark.cpu
+def test_generate_forwards_priority_to_engine():
+    captured_kwargs = []
+
+    async def capturing_add_request(*, request_id, prompt, sampling_params_list, final_stage_id, **kwargs):
+        del request_id, prompt, sampling_params_list, final_stage_id
+        captured_kwargs.append(kwargs)
+
+    async def run():
+        omni = get_async_omni_instance(fake_add_request=capturing_add_request)
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id="priority-req",
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["text"],
+            priority=-10,
+        ):
+            pass
+
+    asyncio.run(run())
+    assert captured_kwargs[0]["priority"] == -10
+
+
+@pytest.mark.cpu
+def test_streaming_input_forwards_priority_to_initial_engine_request():
+    captured_kwargs = []
+
+    async def empty_input_stream():
+        if False:
+            yield SimpleNamespace(prompt={"prompt": "unused"})
+
+    async def capturing_add_request(*, request_id, prompt, sampling_params_list, final_stage_id, **kwargs):
+        del request_id, prompt, sampling_params_list, final_stage_id
+        captured_kwargs.append(kwargs)
+
+    async def run():
+        omni = get_async_omni_instance(fake_add_request=capturing_add_request)
+        omni.request_states["stream-req"] = SimpleNamespace(input_stream_task=None, queue=asyncio.Queue())
+        input_task = await omni._add_streaming_input_request(
+            request_id="stream-req",
+            input_stream=empty_input_stream(),
+            sampling_params_list=[SamplingParams(output_kind=RequestOutputKind.DELTA)],
+            final_stage_id=0,
+            final_output_stage_ids=[0],
+            arrival_time=1.0,
+            priority=-5,
+        )
+        await input_task
+
+    asyncio.run(run())
+    assert captured_kwargs[0]["priority"] == -5
+
+
 # End to end tests for ensuring internal manipulation of request ID
 # in diffusion / Omni models don't leak back to the user.
 #

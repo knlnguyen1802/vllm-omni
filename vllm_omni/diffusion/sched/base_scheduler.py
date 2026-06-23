@@ -76,7 +76,7 @@ class _BaseScheduler(SchedulerInterface):
             raise ValueError(f"request_id {request_id!r} is already active.")
         state = self._make_request_state(request_id, request)
         self._request_states[request_id] = state
-        self._waiting.append(request_id)
+        self._add_waiting_request(request_id)
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, request_id, len(self._waiting))
         return request_id
 
@@ -142,8 +142,8 @@ class _BaseScheduler(SchedulerInterface):
             self._running.remove(request_id)
             if not self._running:
                 self._running_sampling_params_key = None
-            self._waiting.appendleft(request_id)
             self._request_states[request_id].status = DiffusionRequestStatus.PREEMPTED
+            self._add_waiting_request(request_id, before_equal_priority=True)
             return True
         return False
 
@@ -232,6 +232,22 @@ class _BaseScheduler(SchedulerInterface):
             req=request,
             sampling_params_key=get_sampling_params_key(request),
         )
+
+    def _add_waiting_request(self, request_id: str, *, before_equal_priority: bool = False) -> None:
+        state = self._request_states.get(request_id)
+        priority = 0 if state is None else state.req.priority
+        if priority == 0 and not before_equal_priority:
+            self._waiting.append(request_id)
+            return
+
+        insert_index = len(self._waiting)
+        for index, waiting_request_id in enumerate(self._waiting):
+            waiting_state = self._request_states.get(waiting_request_id)
+            waiting_priority = 0 if waiting_state is None else waiting_state.req.priority
+            if priority < waiting_priority or (before_equal_priority and priority == waiting_priority):
+                insert_index = index
+                break
+        self._waiting.insert(insert_index, request_id)
 
     def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:
         if not self._running:

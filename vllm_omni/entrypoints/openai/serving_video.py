@@ -422,6 +422,7 @@ class OmniOpenAIServingVideo:
             prompt=prompt,
             request_id=request_id,
             sampling_params_list=sampling_params_list,
+            priority=getattr(request, "priority", 0),
         ):
             result = output
 

@@ -579,6 +579,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     sampling_params_list=sampling_params_list,
                     output_modalities=output_modalities,
                     arrival_time=request_timestamp,
+                    priority=getattr(request, "priority", 0),
                 )
 
                 generators.append(generator)

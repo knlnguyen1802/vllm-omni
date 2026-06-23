@@ -106,6 +106,7 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
                 output_modalities=["audio"],
+                priority=getattr(request, "priority", 0),
             )
 
             final_output: OmniRequestOutput | None = None

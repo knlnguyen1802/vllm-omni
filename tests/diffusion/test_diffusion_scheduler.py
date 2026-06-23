@@ -26,11 +26,12 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-def _make_request(req_id: str) -> OmniDiffusionRequest:
+def _make_request(req_id: str, *, priority: int = 0) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompts=[f"prompt_{req_id}"],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         request_id=req_id,
+        priority=priority,
     )
 
 
@@ -262,6 +263,36 @@ class TestRequestScheduler:
         assert _cached_ids(third) == []
         assert third.num_running_reqs == 1
         assert third.num_waiting_reqs == 0
+
+    def test_priority_schedules_lower_numeric_value_first(self) -> None:
+        req_id_a = self.scheduler.add_request(_make_request("a", priority=0))
+        req_id_b = self.scheduler.add_request(_make_request("b", priority=-10))
+
+        first = self.scheduler.schedule()
+
+        assert _new_ids(first) == [req_id_b]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+        self.scheduler.update_from_output(first, _make_request_output(req_id_b))
+        second = self.scheduler.schedule()
+
+        assert _new_ids(second) == [req_id_a]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 0
+
+    def test_priority_preserves_fcfs_for_equal_priority(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(_make_request("a", priority=-5))
+        req_id_b = scheduler.add_request(_make_request("b", priority=-5))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_id_a, req_id_b]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
 
     def test_batches_compatible_requests_up_to_max_num_seqs(self) -> None:
         scheduler = RequestScheduler()
