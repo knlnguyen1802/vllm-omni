@@ -368,6 +368,7 @@ class DiffusionWorker:
         if self.lora_manager is not None:
             try:
                 self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
+                self.lora_manager.merge_lora_weights()
             except Exception as exc:
                 if req.sampling_params.lora_request is not None:
                     raise
@@ -384,6 +385,8 @@ class DiffusionWorker:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         self._activate_step_lora(scheduler_output)
+        if self.lora_manager is not None:
+            self.lora_manager.merge_lora_weights()
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         with ctx:
@@ -456,6 +459,11 @@ class DiffusionWorker:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
         from vllm.device_allocator.cumem import CuMemAllocator
+
+        # Unmerge LoRA weights before offloading so that the offloaded (and
+        # later restored) base weights are the clean, original values.
+        if self.lora_manager is not None:
+            self.lora_manager.unmerge_lora_weights()
 
         allocator = CuMemAllocator.get_instance()
 

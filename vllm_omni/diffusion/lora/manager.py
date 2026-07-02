@@ -92,6 +92,9 @@ class DiffusionLoRAManager:
         self._lora_modules: dict[str, BaseLayerWithLoRA] = {}
         # Track the maximum LoRA rank we've allocated buffers for.
         self._max_lora_rank: int = 0
+        # LoRA weight merging state
+        self._lora_merged: bool = False
+        self._lora_pre_merge_active_slices: dict[str, tuple[bool, ...]] = {}
 
         logger.info(
             "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
@@ -455,6 +458,10 @@ class DiffusionLoRAManager:
         for lora_layer in self._lora_modules.values():
             lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
 
+        # Pre-merge state is stale after buffer recreation.
+        self._lora_pre_merge_active_slices.clear()
+        self._lora_merged = False
+
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
             active_id = self._active_adapter_id
@@ -509,6 +516,11 @@ class DiffusionLoRAManager:
         if self._is_active_at_scale(adapter_id, scale):
             logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
             return
+
+        # If a previous adapter was merged into base weights, unmerge it
+        # before activating the new one so base weights are clean.
+        if self._lora_merged:
+            self.unmerge_lora_weights()
 
         logger.info("Activating adapter: id=%d", adapter_id)
         lora_model = self._registered_adapters[adapter_id]
@@ -625,6 +637,9 @@ class DiffusionLoRAManager:
         if self._active_adapter_id is None:
             logger.debug("All adapters already inactive")
             return
+        # Unmerge before deactivating to restore original base weights
+        if self._lora_merged:
+            self.unmerge_lora_weights()
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
@@ -705,6 +720,117 @@ class DiffusionLoRAManager:
             self.max_cached_adapters,
         )
         return True
+
+    def merge_lora_weights(self) -> None:
+        """Merge active LoRA adapter weights into base model weights.
+
+        After merging, the LoRA fast-path in
+        :meth:`DiffusionBaseLinearLayerWithLoRA.apply` skips all LoRA matmuls,
+        eliminating the per-step compute overhead during generation.
+
+        This is idempotent: calling it when already merged is a no-op.
+        Call :meth:`unmerge_lora_weights` to restore the original base weights
+        before the next training step or before offloading.
+        """
+        if self._active_adapter_id is None:
+            return
+        if self._lora_merged:
+            return
+
+        scale = self._adapter_scales.get(self._active_adapter_id, 1.0)
+
+        for full_module_name, lora_layer in self._lora_modules.items():
+            lora_a_stacked = lora_layer.lora_a_stacked  # list of (1, 1, rank, in_dim)
+            lora_b_stacked = lora_layer.lora_b_stacked  # list of (1, 1, out_dim, rank)
+            output_slices = getattr(lora_layer, "output_slices", None)
+            active_slices = getattr(lora_layer, "_diffusion_lora_active_slices", None)
+
+            if output_slices is None:
+                output_slices = (lora_b_stacked[0].shape[2],)
+
+            # Save pre-merge state for correct unmerge
+            if active_slices is not None:
+                self._lora_pre_merge_active_slices[full_module_name] = active_slices
+
+            base_weight = lora_layer.base_layer.weight
+            offset = 0
+            for slice_idx, slice_size in enumerate(output_slices):
+                if active_slices is not None and slice_idx < len(active_slices) and not active_slices[slice_idx]:
+                    offset += slice_size
+                    continue
+
+                A = lora_a_stacked[slice_idx][0, 0, :, :]  # (rank, in_dim)
+                B = lora_b_stacked[slice_idx][0, 0, :, :]  # (out_slice, rank)
+
+                if A.numel() == 0 or B.numel() == 0:
+                    offset += slice_size
+                    continue
+
+                delta = (B * scale) @ A  # (out_slice, in_dim)
+                base_weight.data[offset : offset + slice_size, :] += delta
+                offset += slice_size
+
+            # Deactivate all LoRA slices so apply() takes the fast path
+            n_slices = len(output_slices)
+            lora_layer._diffusion_lora_active_slices = (False,) * n_slices
+
+        self._lora_merged = True
+        logger.info("LoRA weights merged into base model for adapter %d", self._active_adapter_id)
+
+    def unmerge_lora_weights(self) -> None:
+        """Remove previously merged LoRA weights from base model weights.
+
+        Restores the original base weights and re-activates LoRA slices so that
+        the per-step LoRA matmuls resume.  This must be called before offloading
+        weights (sleep) or before loading a new adapter (remove_lora / add_lora).
+
+        Idempotent: calling it when not merged is a no-op.
+        """
+        if self._active_adapter_id is None:
+            return
+        if not self._lora_merged:
+            return
+
+        scale = self._adapter_scales.get(self._active_adapter_id, 1.0)
+
+        for full_module_name, lora_layer in self._lora_modules.items():
+            lora_a_stacked = lora_layer.lora_a_stacked
+            lora_b_stacked = lora_layer.lora_b_stacked
+            output_slices = getattr(lora_layer, "output_slices", None)
+            pre_merge_active = self._lora_pre_merge_active_slices.get(full_module_name)
+
+            if output_slices is None:
+                output_slices = (lora_b_stacked[0].shape[2],)
+
+            base_weight = lora_layer.base_layer.weight
+            offset = 0
+            for slice_idx, slice_size in enumerate(output_slices):
+                if (
+                    pre_merge_active is not None
+                    and slice_idx < len(pre_merge_active)
+                    and not pre_merge_active[slice_idx]
+                ):
+                    offset += slice_size
+                    continue
+
+                A = lora_a_stacked[slice_idx][0, 0, :, :]
+                B = lora_b_stacked[slice_idx][0, 0, :, :]
+
+                if A.numel() == 0 or B.numel() == 0:
+                    offset += slice_size
+                    continue
+
+                delta = (B * scale) @ A
+                base_weight.data[offset : offset + slice_size, :] -= delta
+                offset += slice_size
+
+            # Restore pre-merge active state
+            if pre_merge_active is not None:
+                lora_layer._diffusion_lora_active_slices = pre_merge_active
+
+        self._lora_pre_merge_active_slices.clear()
+        self._lora_merged = False
+        logger.info("LoRA weights unmerged from base model for adapter %d", self._active_adapter_id)
 
     def list_adapters(self) -> list[int]:
         """Return list of registered adapter ids."""
