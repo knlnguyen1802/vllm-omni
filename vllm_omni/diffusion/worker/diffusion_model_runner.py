@@ -348,6 +348,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
         kv_recv_ms = (time.perf_counter() - kv_recv_t0) * 1000
         logger.debug("KV recv for %s %.1fms", req.request_id, kv_recv_ms)
+        print(
+            f"[PERF][DiffusionModelRunner._prepare_request_for_forward][KV] request_id={req.request_id} "
+            f"has_lora_request={getattr(req.sampling_params, 'lora_request', None) is not None} "
+            f"use_prefetch={use_prefetch} prefetch_enabled={self._kv_prefetch_enabled} "
+            f"kv_recv_ms={kv_recv_ms:.3f}",
+            flush=True,
+        )
 
         # Kick off the next request's prefetch (+ H2D) to overlap this forward.
         if use_prefetch and self._kv_prefetch_enabled and kv_prefetch_jobs is not None:
@@ -442,6 +449,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
+            t_prepare_start = time.perf_counter()
             for req in reqs:
                 self._prepare_request_for_forward(
                     req,
@@ -449,24 +457,34 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     kv_prefetch_jobs=kv_prefetch_jobs,
                     use_prefetch=allow_single_output,
                 )
+            t_prepare_ms = (time.perf_counter() - t_prepare_start) * 1000.0
 
+            t_cache_start = time.perf_counter()
             self._refresh_cache_for_requests(reqs, od_config=od_config)
+            t_cache_ms = (time.perf_counter() - t_cache_start) * 1000.0
 
+            t_batch_start = time.perf_counter()
             batch = DiffusionRequestBatch(requests=reqs)
+            t_batch_ms = (time.perf_counter() - t_batch_start) * 1000.0
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary:
                 current_omni_platform.reset_peak_memory_stats()
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
                 with record_function(record_name):
+                    t_pipeline_start = time.perf_counter()
                     raw_outputs = self.pipeline.forward(batch)
+                    t_pipeline_ms = (time.perf_counter() - t_pipeline_start) * 1000.0
+                    t_normalize_start = time.perf_counter()
                     outputs = _normalize_pipeline_outputs(
                         raw_outputs,
                         expected_count=len(reqs),
                         allow_single_output=allow_single_output,
                         pipeline_name=type(self.pipeline).__name__,
                     )
+                    t_normalize_ms = (time.perf_counter() - t_normalize_start) * 1000.0
 
+            t_post_start = time.perf_counter()
             if is_primary and outputs:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()
                 for output in outputs:
@@ -484,6 +502,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and od_config.enable_cache_dit_summary
             ):
                 cache_summary(self.pipeline, details=True)
+            t_post_ms = (time.perf_counter() - t_post_start) * 1000.0
+
+            request_ids = ",".join(req.request_id for req in reqs)
+            has_lora_request = any(getattr(req.sampling_params, "lora_request", None) is not None for req in reqs)
+            print(
+                f"[PERF][DiffusionModelRunner._execute_request_list][BREAKDOWN] request_ids={request_ids} "
+                f"has_lora_request={has_lora_request} prepare_ms={t_prepare_ms:.3f} "
+                f"cache_refresh_ms={t_cache_ms:.3f} batch_ms={t_batch_ms:.3f} "
+                f"pipeline_forward_ms={t_pipeline_ms:.3f} normalize_ms={t_normalize_ms:.3f} "
+                f"post_ms={t_post_ms:.3f}",
+                flush=True,
+            )
 
         return self._runner_output_from_outputs(reqs, outputs)
 
