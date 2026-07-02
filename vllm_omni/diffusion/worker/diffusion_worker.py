@@ -12,6 +12,7 @@ import gc
 import multiprocessing as mp
 import os
 import signal
+import time
 import traceback
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -43,6 +44,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
+from vllm_omni.diffusion.lora.layers.base_linear import DIFFUSION_DISABLE_LORA_APPLY
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -380,57 +382,132 @@ class DiffusionWorker:
         kv_prefetch_jobs: dict | None = None,
     ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
+        t_total_start = time.perf_counter()
         assert self.model_runner is not None, "Model runner not initialized"
-        if self.lora_manager is not None:
+        lora_request = req.sampling_params.lora_request
+        lora_scale = req.sampling_params.lora_scale
+
+        if self.lora_manager is not None and not DIFFUSION_DISABLE_LORA_APPLY:
             try:
+                t_lora_start = time.perf_counter()
+                t_set_start = time.perf_counter()
                 self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
-                self.lora_manager.merge_lora_weights()
+                t_set_ms = (time.perf_counter() - t_set_start) * 1000.0
+                t_lora_ms = (time.perf_counter() - t_lora_start) * 1000.0
+                print(
+                    f"[PERF][execute_model][LoRA] rank={self.rank} request_id={getattr(req, 'request_id', None)} "
+                    f"adapter_id={getattr(lora_request, 'lora_int_id', None)} scale={lora_scale} "
+                    f"set_active_ms={t_set_ms:.3f} lora_total_ms={t_lora_ms:.3f}",
+                    flush=True,
+                )
             except Exception as exc:
                 if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
+        else:
+            print(
+                f"[PERF][execute_model][LoRA-SKIP] rank={self.rank} request_id={getattr(req, 'request_id', None)} "
+                f"has_manager={self.lora_manager is not None} disable_apply={DIFFUSION_DISABLE_LORA_APPLY} "
+                f"has_lora_request={lora_request is not None}",
+                flush=True,
+            )
+
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
+        t_model_start = time.perf_counter()
         with ctx:
             output = self.model_runner.execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+        t_model_ms = (time.perf_counter() - t_model_start) * 1000.0
         if profiler:
             profiler.step()
+
+        t_total_ms = (time.perf_counter() - t_total_start) * 1000.0
+        print(
+            f"[PERF][execute_model][TOTAL] rank={self.rank} request_id={getattr(req, 'request_id', None)} "
+            f"has_lora_request={lora_request is not None} model_ms={t_model_ms:.3f} total_ms={t_total_ms:.3f}",
+            flush=True,
+        )
         return output
 
     def execute_model_batch(
         self, scheduler_output: DiffusionSchedulerOutput, od_config: OmniDiffusionConfig
     ) -> BatchRunnerOutput:
         """Batch forward: LoRA activate once, delegate to model runner."""
+        t_total_start = time.perf_counter()
         assert self.model_runner is not None, "Model runner not initialized"
         # LoRA: same adapter/scale within batch guaranteed by SamplingParamsKey
-        if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
+        if self.lora_manager is not None and scheduler_output.scheduled_new_reqs and not DIFFUSION_DISABLE_LORA_APPLY:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
             try:
+                t_lora_start = time.perf_counter()
+                t_set_start = time.perf_counter()
                 self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
+                t_set_ms = (time.perf_counter() - t_set_start) * 1000.0
+                t_lora_ms = (time.perf_counter() - t_lora_start) * 1000.0
+                print(
+                    f"[PERF][execute_model_batch][LoRA] rank={self.rank} "
+                    f"adapter_id={getattr(sp.lora_request, 'lora_int_id', None)} scale={sp.lora_scale} "
+                    f"set_active_ms={t_set_ms:.3f} lora_total_ms={t_lora_ms:.3f}",
+                    flush=True,
+                )
             except Exception as exc:
                 if sp.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
+        else:
+            print(
+                f"[PERF][execute_model_batch][LoRA-SKIP] rank={self.rank} has_manager={self.lora_manager is not None} "
+                f"disable_apply={DIFFUSION_DISABLE_LORA_APPLY} has_new_reqs={bool(scheduler_output.scheduled_new_reqs)}",
+                flush=True,
+            )
+
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
+        t_model_start = time.perf_counter()
         with ctx:
             output = self.model_runner.execute_model_batch(scheduler_output, od_config)
+        t_model_ms = (time.perf_counter() - t_model_start) * 1000.0
         if profiler:
             profiler.step()
+
+        t_total_ms = (time.perf_counter() - t_total_start) * 1000.0
+        print(
+            f"[PERF][execute_model_batch][TOTAL] rank={self.rank} model_ms={t_model_ms:.3f} total_ms={t_total_ms:.3f}",
+            flush=True,
+        )
         return output
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
+        t_total_start = time.perf_counter()
         assert self.model_runner is not None, "Model runner not initialized"
-        self._activate_step_lora(scheduler_output)
-        if self.lora_manager is not None:
-            self.lora_manager.merge_lora_weights()
+        t_activate_start = time.perf_counter()
+        if not DIFFUSION_DISABLE_LORA_APPLY:
+            self._activate_step_lora(scheduler_output)
+        t_activate_ms = (time.perf_counter() - t_activate_start) * 1000.0
+
+        if self.lora_manager is None or DIFFUSION_DISABLE_LORA_APPLY:
+            print(
+                f"[PERF][execute_stepwise][LoRA-SKIP] rank={self.rank} has_manager={self.lora_manager is not None} "
+                f"disable_apply={DIFFUSION_DISABLE_LORA_APPLY}",
+                flush=True,
+            )
+
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
+        t_model_start = time.perf_counter()
         with ctx:
             output = self.model_runner.execute_stepwise(scheduler_output)
+        t_model_ms = (time.perf_counter() - t_model_start) * 1000.0
         if profiler:
             profiler.step()
+
+        t_total_ms = (time.perf_counter() - t_total_start) * 1000.0
+        print(
+            f"[PERF][execute_stepwise][TOTAL] rank={self.rank} activate_ms={t_activate_ms:.3f} "
+            f"model_ms={t_model_ms:.3f} total_ms={t_total_ms:.3f}",
+            flush=True,
+        )
         return output
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
@@ -464,7 +541,14 @@ class DiffusionWorker:
                 break
 
         try:
+            t_set_start = time.perf_counter()
             self.lora_manager.set_active_adapter(lora_request, lora_scale)
+            t_set_ms = (time.perf_counter() - t_set_start) * 1000.0
+            print(
+                f"[PERF][_activate_step_lora] rank={self.rank} adapter_id={getattr(lora_request, 'lora_int_id', None)} "
+                f"scale={lora_scale} set_active_ms={t_set_ms:.3f}",
+                flush=True,
+            )
         except Exception as exc:
             if lora_request is not None:
                 raise
@@ -496,11 +580,6 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
-
-        # Unmerge LoRA weights before offloading so that the offloaded (and
-        # later restored) base weights are the clean, original values.
-        if self.lora_manager is not None:
-            self.lora_manager.unmerge_lora_weights()
 
         CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()

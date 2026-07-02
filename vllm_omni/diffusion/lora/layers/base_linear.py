@@ -7,6 +7,9 @@ import torch
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 
 
+DIFFUSION_DISABLE_LORA_APPLY = True
+
+
 class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     """
     Diffusion-specific base that overrides apply() to use direct torch matmul
@@ -75,6 +78,10 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         apply LoRA per-slice using `output_slices`.
         """
         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+
+        if DIFFUSION_DISABLE_LORA_APPLY:
+            # Temporary perf testing mode: skip all LoRA delta application.
+            return output
 
         if not hasattr(self, "lora_a_stacked") or not hasattr(self, "lora_b_stacked"):
             return output

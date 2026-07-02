@@ -33,6 +33,11 @@ from vllm_omni.lora.utils import stable_lora_int_id
 logger = init_logger(__name__)
 
 
+def _lora_perf_print(message: str) -> None:
+    # Intentionally use raw print so timing is visible even when logger level filters debug/info.
+    print(message, flush=True)
+
+
 class DiffusionLoRAManager:
     """Manager for LoRA adapters in diffusion models.
 
@@ -92,9 +97,6 @@ class DiffusionLoRAManager:
         self._lora_modules: dict[str, BaseLayerWithLoRA] = {}
         # Track the maximum LoRA rank we've allocated buffers for.
         self._max_lora_rank: int = 0
-        # LoRA weight merging state
-        self._lora_merged: bool = False
-        self._lora_pre_merge_active_slices: dict[str, tuple[bool, ...]] = {}
 
         logger.info(
             "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
@@ -220,19 +222,30 @@ class DiffusionLoRAManager:
             lora_request: The LoRA request, or None to deactivate all adapters.
             lora_scale: The external scale for the LoRA adapter.
         """
+        t_start = time.perf_counter()
         if lora_request is None:
             if self._active_adapter_id is None:
                 logger.debug("No lora_request provided and adapters are already inactive")
+                _lora_perf_print("[PERF][LoRA.set_active_adapter] path=no_request_already_inactive total_ms=0.000")
                 return
             logger.debug("No lora_request provided, deactivating all LoRA adapters")
             self._deactivate_all_adapters()
+            t_ms = (time.perf_counter() - t_start) * 1000.0
+            _lora_perf_print(
+                f"[PERF][LoRA.set_active_adapter] path=no_request_deactivate active_before=True total_ms={t_ms:.3f}"
+            )
             return
         elif math.isclose(0.0, lora_scale):
             if self._active_adapter_id is None:
                 logger.debug("Received LoRA scale 0 with adapters already inactive")
+                _lora_perf_print("[PERF][LoRA.set_active_adapter] path=scale_zero_already_inactive total_ms=0.000")
                 return
             logger.warning("Received a request with LoRA scale 0; deactivating all LoRA adapters")
             self._deactivate_all_adapters()
+            t_ms = (time.perf_counter() - t_start) * 1000.0
+            _lora_perf_print(
+                f"[PERF][LoRA.set_active_adapter] path=scale_zero_deactivate active_before=True total_ms={t_ms:.3f}"
+            )
             return
 
         adapter_id = lora_request.lora_int_id
@@ -248,12 +261,23 @@ class DiffusionLoRAManager:
         if adapter_id not in self._registered_adapters:
             logger.info("Loading new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
             # Add the adapter + add to the cache
+            t_add_start = time.perf_counter()
             self.add_adapter(lora_request)
+            t_add_ms = (time.perf_counter() - t_add_start) * 1000.0
         else:
             # Just touch the cache access order
             self._touch_adapter_info(adapter_id)
+            t_add_ms = 0.0
 
+        t_activate_start = time.perf_counter()
         self._activate_adapter(adapter_id, lora_scale)
+        t_activate_ms = (time.perf_counter() - t_activate_start) * 1000.0
+        t_total_ms = (time.perf_counter() - t_start) * 1000.0
+        _lora_perf_print(
+            f"[PERF][LoRA.set_active_adapter] adapter_id={adapter_id} scale={lora_scale} "
+            f"added_new={adapter_id not in self._adapter_access_order or t_add_ms > 0.0} "
+            f"add_ms={t_add_ms:.3f} activate_ms={t_activate_ms:.3f} total_ms={t_total_ms:.3f}"
+        )
 
     def _touch_adapter_info(self, adapter_id):
         """Update the current caching ordering info."""
@@ -279,6 +303,7 @@ class DiffusionLoRAManager:
         self,
         lora_request: LoRARequest,
     ) -> tuple[LoRAModel, PEFTHelper]:
+        t_start = time.perf_counter()
         if not self._expected_lora_modules:
             raise ValueError("No supported LoRA modules found in the diffusion pipeline.")
 
@@ -322,6 +347,12 @@ class DiffusionLoRAManager:
         for lora in lora_model.loras.values():
             lora.optimize()  # ref: _create_merged_loras_inplace, internal scaling
 
+        t_total_ms = (time.perf_counter() - t_start) * 1000.0
+        _lora_perf_print(
+            f"[PERF][LoRA._load_adapter] adapter_id={lora_request.lora_int_id} modules={len(lora_model.loras)} "
+            f"total_ms={t_total_ms:.3f}"
+        )
+
         return lora_model, peft_helper
 
     def _get_packed_modules_list(self, module: nn.Module) -> list[str]:
@@ -341,6 +372,8 @@ class DiffusionLoRAManager:
         return []
 
     def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
+        t_start = time.perf_counter()
+        before_count = len(self._lora_modules)
         self._ensure_max_lora_rank(peft_helper.r)
 
         target_modules = getattr(peft_helper, "target_modules", None)
@@ -438,6 +471,13 @@ class DiffusionLoRAManager:
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
 
+        replaced_count = len(self._lora_modules) - before_count
+        t_total_ms = (time.perf_counter() - t_start) * 1000.0
+        _lora_perf_print(
+            f"[PERF][LoRA._replace_layers_with_lora] replaced_layers={replaced_count} "
+            f"total_layers={len(self._lora_modules)} total_ms={t_total_ms:.3f}"
+        )
+
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
 
@@ -467,10 +507,6 @@ class DiffusionLoRAManager:
         # Recreate per-layer buffers with the new maximum rank.
         for lora_layer in self._lora_modules.values():
             lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
-
-        # Pre-merge state is stale after buffer recreation.
-        self._lora_pre_merge_active_slices.clear()
-        self._lora_merged = False
 
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
@@ -523,14 +559,13 @@ class DiffusionLoRAManager:
         return is_active and matches_scale
 
     def _activate_adapter(self, adapter_id: int, scale: float) -> None:
+        t_start = time.perf_counter()
         if self._is_active_at_scale(adapter_id, scale):
             logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
+            _lora_perf_print(
+                f"[PERF][LoRA._activate_adapter] adapter_id={adapter_id} already_active=True total_ms=0.000"
+            )
             return
-
-        # If a previous adapter was merged into base weights, unmerge it
-        # before activating the new one so base weights are clean.
-        if self._lora_merged:
-            self.unmerge_lora_weights()
 
         logger.info("Activating adapter: id=%d", adapter_id)
         lora_model = self._registered_adapters[adapter_id]
@@ -642,14 +677,16 @@ class DiffusionLoRAManager:
 
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)
+        t_total_ms = (time.perf_counter() - t_start) * 1000.0
+        _lora_perf_print(
+            f"[PERF][LoRA._activate_adapter] adapter_id={adapter_id} scale={scale} layers={len(self._lora_modules)} "
+            f"total_ms={t_total_ms:.3f}"
+        )
 
     def _deactivate_all_adapters(self) -> None:
         if self._active_adapter_id is None:
             logger.debug("All adapters already inactive")
             return
-        # Unmerge before deactivating to restore original base weights
-        if self._lora_merged:
-            self.unmerge_lora_weights()
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)
@@ -683,6 +720,7 @@ class DiffusionLoRAManager:
         """
         Add a new adapter to the cache without activating it.
         """
+        t_start = time.perf_counter()
         adapter_id = lora_request.lora_int_id
 
         if adapter_id in self._registered_adapters:
@@ -695,15 +733,24 @@ class DiffusionLoRAManager:
         # so that we don't go over capacity on the new load
         self._evict_for_new_adapter()
 
+        t_load_start = time.perf_counter()
         lora_model, peft_helper = self._load_adapter(lora_request)
+        t_load_ms = (time.perf_counter() - t_load_start) * 1000.0
         self._touch_adapter_info(adapter_id)
 
         self._registered_adapters[adapter_id] = lora_model
 
+        t_replace_start = time.perf_counter()
         self._replace_layers_with_lora(peft_helper)
+        t_replace_ms = (time.perf_counter() - t_replace_start) * 1000.0
 
         logger.debug(
             "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters
+        )
+        t_total_ms = (time.perf_counter() - t_start) * 1000.0
+        _lora_perf_print(
+            f"[PERF][LoRA.add_adapter] adapter_id={adapter_id} cache_size={len(self._registered_adapters)} "
+            f"load_ms={t_load_ms:.3f} replace_ms={t_replace_ms:.3f} total_ms={t_total_ms:.3f}"
         )
         return True
 
@@ -730,117 +777,6 @@ class DiffusionLoRAManager:
             self.max_cached_adapters,
         )
         return True
-
-    def merge_lora_weights(self) -> None:
-        """Merge active LoRA adapter weights into base model weights.
-
-        After merging, the LoRA fast-path in
-        :meth:`DiffusionBaseLinearLayerWithLoRA.apply` skips all LoRA matmuls,
-        eliminating the per-step compute overhead during generation.
-
-        This is idempotent: calling it when already merged is a no-op.
-        Call :meth:`unmerge_lora_weights` to restore the original base weights
-        before the next training step or before offloading.
-        """
-        if self._active_adapter_id is None:
-            return
-        if self._lora_merged:
-            return
-
-        scale = self._adapter_scales.get(self._active_adapter_id, 1.0)
-
-        for full_module_name, lora_layer in self._lora_modules.items():
-            lora_a_stacked = lora_layer.lora_a_stacked  # list of (1, 1, rank, in_dim)
-            lora_b_stacked = lora_layer.lora_b_stacked  # list of (1, 1, out_dim, rank)
-            output_slices = getattr(lora_layer, "output_slices", None)
-            active_slices = getattr(lora_layer, "_diffusion_lora_active_slices", None)
-
-            if output_slices is None:
-                output_slices = (lora_b_stacked[0].shape[2],)
-
-            # Save pre-merge state for correct unmerge
-            if active_slices is not None:
-                self._lora_pre_merge_active_slices[full_module_name] = active_slices
-
-            base_weight = lora_layer.base_layer.weight
-            offset = 0
-            for slice_idx, slice_size in enumerate(output_slices):
-                if active_slices is not None and slice_idx < len(active_slices) and not active_slices[slice_idx]:
-                    offset += slice_size
-                    continue
-
-                A = lora_a_stacked[slice_idx][0, 0, :, :]  # (rank, in_dim)
-                B = lora_b_stacked[slice_idx][0, 0, :, :]  # (out_slice, rank)
-
-                if A.numel() == 0 or B.numel() == 0:
-                    offset += slice_size
-                    continue
-
-                delta = (B * scale) @ A  # (out_slice, in_dim)
-                base_weight.data[offset : offset + slice_size, :] += delta
-                offset += slice_size
-
-            # Deactivate all LoRA slices so apply() takes the fast path
-            n_slices = len(output_slices)
-            lora_layer._diffusion_lora_active_slices = (False,) * n_slices
-
-        self._lora_merged = True
-        logger.info("LoRA weights merged into base model for adapter %d", self._active_adapter_id)
-
-    def unmerge_lora_weights(self) -> None:
-        """Remove previously merged LoRA weights from base model weights.
-
-        Restores the original base weights and re-activates LoRA slices so that
-        the per-step LoRA matmuls resume.  This must be called before offloading
-        weights (sleep) or before loading a new adapter (remove_lora / add_lora).
-
-        Idempotent: calling it when not merged is a no-op.
-        """
-        if self._active_adapter_id is None:
-            return
-        if not self._lora_merged:
-            return
-
-        scale = self._adapter_scales.get(self._active_adapter_id, 1.0)
-
-        for full_module_name, lora_layer in self._lora_modules.items():
-            lora_a_stacked = lora_layer.lora_a_stacked
-            lora_b_stacked = lora_layer.lora_b_stacked
-            output_slices = getattr(lora_layer, "output_slices", None)
-            pre_merge_active = self._lora_pre_merge_active_slices.get(full_module_name)
-
-            if output_slices is None:
-                output_slices = (lora_b_stacked[0].shape[2],)
-
-            base_weight = lora_layer.base_layer.weight
-            offset = 0
-            for slice_idx, slice_size in enumerate(output_slices):
-                if (
-                    pre_merge_active is not None
-                    and slice_idx < len(pre_merge_active)
-                    and not pre_merge_active[slice_idx]
-                ):
-                    offset += slice_size
-                    continue
-
-                A = lora_a_stacked[slice_idx][0, 0, :, :]
-                B = lora_b_stacked[slice_idx][0, 0, :, :]
-
-                if A.numel() == 0 or B.numel() == 0:
-                    offset += slice_size
-                    continue
-
-                delta = (B * scale) @ A
-                base_weight.data[offset : offset + slice_size, :] -= delta
-                offset += slice_size
-
-            # Restore pre-merge active state
-            if pre_merge_active is not None:
-                lora_layer._diffusion_lora_active_slices = pre_merge_active
-
-        self._lora_pre_merge_active_slices.clear()
-        self._lora_merged = False
-        logger.info("LoRA weights unmerged from base model for adapter %d", self._active_adapter_id)
 
     def list_adapters(self) -> list[int]:
         """Return list of registered adapter ids."""
