@@ -3,6 +3,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.helpers.mark import hardware_test
@@ -21,10 +22,12 @@ async def _noop(*args, **kw):
     pass
 
 
-def get_fake_add_request(submitted_request_ids):
+def get_fake_add_request(submitted_request_ids, submitted_lora_requests=None):
     async def fake_add_request_async(*, request_id, prompt, sampling_params_list, final_stage_id, **kwargs):
         del prompt, sampling_params_list, final_stage_id, kwargs
         submitted_request_ids.append(request_id)
+        if submitted_lora_requests is not None:
+            submitted_lora_requests.append(kwargs.get("lora_request"))
 
     return fake_add_request_async
 
@@ -93,8 +96,36 @@ def test_generate_submits_randomized_id_to_engine():
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize(
-    "req_ids,cancel_prefix,expected_cancel_count",
+def test_generate_forwards_lora_request_to_engine():
+    """Ensure the lora_request passed to generate() reaches add_request_async.
+
+    Regression test for https://github.com/vllm-project/vllm-omni/issues/5369:
+    AsyncOmni.generate() accepted lora_request but silently dropped it when
+    submitting the request, so generation always used the base model.
+    """
+
+    async def run():
+        submitted_ids = []
+        submitted_loras = []
+        omni = get_async_omni_instance(
+            fake_add_request=get_fake_add_request(submitted_ids, submitted_loras)
+        )
+
+        lora = LoRARequest(lora_name="test", lora_int_id=1, lora_path="/tmp/fake")
+        async for _ in omni.generate(
+            prompt={"prompt": "test"},
+            request_id="lora-req",
+            sampling_params_list=[SimpleNamespace()],
+            output_modalities=["text"],
+            lora_request=lora,
+        ):
+            pass
+
+        assert len(submitted_ids) == 1
+        assert len(submitted_loras) == 1
+        assert submitted_loras[0] is lora
+
+    asyncio.run(run())
     [
         (["cancel-me"], "cancel-me", 1),
         (["cancel-me", "cancel-me"], "cancel-me", 2),
