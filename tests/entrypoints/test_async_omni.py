@@ -108,9 +108,7 @@ def test_generate_forwards_lora_request_to_engine():
     async def run():
         submitted_ids = []
         submitted_loras = []
-        omni = get_async_omni_instance(
-            fake_add_request=get_fake_add_request(submitted_ids, submitted_loras)
-        )
+        omni = get_async_omni_instance(fake_add_request=get_fake_add_request(submitted_ids, submitted_loras))
 
         lora = LoRARequest(lora_name="test", lora_int_id=1, lora_path="/tmp/fake")
         async for _ in omni.generate(
