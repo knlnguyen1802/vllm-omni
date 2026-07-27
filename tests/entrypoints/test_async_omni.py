@@ -24,10 +24,11 @@ async def _noop(*args, **kw):
 
 def get_fake_add_request(submitted_request_ids, submitted_lora_requests=None):
     async def fake_add_request_async(*, request_id, prompt, sampling_params_list, final_stage_id, **kwargs):
+        lora_request = kwargs.get("lora_request")
         del prompt, sampling_params_list, final_stage_id, kwargs
         submitted_request_ids.append(request_id)
         if submitted_lora_requests is not None:
-            submitted_lora_requests.append(kwargs.get("lora_request"))
+            submitted_lora_requests.append(lora_request)
 
     return fake_add_request_async
 
@@ -126,6 +127,11 @@ def test_generate_forwards_lora_request_to_engine():
         assert submitted_loras[0] is lora
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "req_ids,cancel_prefix,expected_cancel_count",
     [
         (["cancel-me"], "cancel-me", 1),
         (["cancel-me", "cancel-me"], "cancel-me", 2),
