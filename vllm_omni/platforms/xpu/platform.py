@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 from vllm.config import VllmConfig
 from vllm.config.kernel import IrOpPriorityConfig
@@ -11,6 +13,13 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
+
+
+# Use the native query; vLLM's XPU custom op reports free=0 in spawned workers.
+torch.accelerator.get_memory_info = lambda device=None: torch.xpu.mem_get_info(device)
+
+# The XPU sampler kernel is broken for omni on the current vLLM; use the native path.
+os.environ.setdefault("VLLM_XPU_USE_SAMPLER_KERNEL", "0")
 
 
 class XPUOmniPlatform(OmniPlatform, XPUPlatform):
@@ -42,6 +51,14 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                logger.warning(
+                    "HuggingFace kernels-backed FlashAttention is "
+                    "not supported on XPU. Falling back to local "
+                    "FLASH_ATTN."
+                )
+                backend_upper = "FLASH_ATTN"
+
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()

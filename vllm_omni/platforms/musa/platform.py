@@ -32,7 +32,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/model_executor/stage_configs"
+        return "vllm_omni/deploy"
 
     @classmethod
     def has_flash_attn_package(cls) -> bool:
@@ -78,6 +78,14 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                logger.warning(
+                    "HuggingFace kernels-backed FlashAttention is "
+                    "not supported on MUSA. Falling back to local "
+                    "FLASH_ATTN."
+                )
+                backend_upper = "FLASH_ATTN"
+
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
                 if not compute_supported:
                     logger.warning(

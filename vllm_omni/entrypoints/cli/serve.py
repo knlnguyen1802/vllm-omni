@@ -148,7 +148,8 @@ class OmniServeCommand(CLISubcommand):
                     "The following CLI args are not supported under --omni: "
                     f"{', '.join(offenders)}. Configure parallelism through the "
                     "per-stage YAML (`--deploy-config` / `--stage-configs-path`) "
-                    "and replica count via `--omni-dp-size-local`."
+                    "and replica count via the per-stage `num_replicas` config field "
+                    "(single-runtime) or `--omni-dp-size-local` (headless / multi-runtime)."
                 )
 
         # --omni-lb-policy is validated against the LoadBalancingPolicy enum.
@@ -253,6 +254,15 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Path to a deploy config YAML (new format with stages/engine_args). "
             "Mutually exclusive with --stage-configs-path.",
+        )
+        omni_config_group.add_argument(
+            "--strategy-config",
+            type=str,
+            default=None,
+            help="Path to a composable-parallel strategy.yaml. Only applies to "
+            "registry-based models (e.g. qwen2_5_omni): its derived parallel sizing "
+            "is overlaid onto the registry-merged stages before per-stage engine "
+            "args are built.",
         )
         omni_config_group.add_argument(
             "--stage-overrides",
@@ -414,6 +424,25 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--diffusion-compile-granularity",
+            choices=["regional", "full"],
+            default=None,
+            help=(
+                "Compilation scope for the generic diffusion model runner. "
+                "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
+                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusion-compile-dynamic",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Use dynamic shapes for the selected generic diffusion compile scope. "
+                "Disable for fixed-shape workloads with --no-diffusion-compile-dynamic."
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusers-load-kwargs",
             dest="diffusers_load_kwargs",
             type=json.loads,
@@ -464,12 +493,20 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
         omni_config_group.add_argument(
+            "--allgather-degree",
+            dest="allgather_degree",
+            type=int,
+            default=None,
+            help="AllGather-KV Sequence Parallelism degree for non-causal diffusion attention. "
+            "Equivalent to setting DiffusionParallelConfig.allgather_degree.",
+        )
+        omni_config_group.add_argument(
             "--diffusion-quantization-config",
             type=json.loads,
             default=None,
             help=(
                 "JSON string for diffusion quantization_config. "
-                'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
+                'Example: \'{"method":"fp8","activation_scheme":"dynamic"}\'.'
             ),
         )
         omni_config_group.add_argument(
@@ -766,7 +803,10 @@ def run_headless(args: TrackingNamespace) -> None:
         load_omni_transfer_config_for_model,
         prepare_engine_environment,
     )
-    from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
+    from vllm_omni.entrypoints.utils import (
+        load_and_resolve_stage_configs,
+        parse_stage_overrides,
+    )
 
     model = args.model
     stage_id: int | None = args.stage_id
@@ -802,11 +842,19 @@ def run_headless(args: TrackingNamespace) -> None:
             args.replica_id,
         )
 
-    config_path, stage_configs = load_and_resolve_stage_configs(
+    # Parse --stage-overrides (raw JSON string) exactly like the standard
+    # engine path (AsyncOmniEngine._resolve_stage_configs) so headless and
+    # standard launches resolve to the same per-stage device layout.
+    stage_overrides = parse_stage_overrides(args_dict.get("stage_overrides"))
+
+    config_path, stage_configs, _ = load_and_resolve_stage_configs(
         model,
         stage_configs_path,
         args_dict,
+        trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
         deploy_config_path=args_dict.get("deploy_config"),
+        stage_overrides=stage_overrides,
+        strategy_config_path=args_dict.get("strategy_config"),
     )
 
     # Locate the stage config that matches stage_id.

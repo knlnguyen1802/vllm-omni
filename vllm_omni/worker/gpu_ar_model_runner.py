@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import gc
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -42,11 +42,16 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    get_stage_connector_role,
+    stage_sends_async_output,
+)
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
+from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
 logger = init_logger(__name__)
 
@@ -158,6 +163,11 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         async_output_copy_stream = kwargs.pop("async_output_copy_stream")
         vocab_size = kwargs.pop("vocab_size")
         routed_experts = kwargs.pop("routed_experts", None)
+        # Upstream AsyncGPUModelRunnerOutput added check_ep_fault / _has_fault
+        # for EP all2all fault tolerance (PR #43637). Omni doesn't use this
+        # feature but must consume the kwarg to prevent TypeError from stray
+        # kwargs and initialize the attribute so super().get_output() works.
+        kwargs.pop("check_ep_fault", False)
         if kwargs:
             raise TypeError(f"Unexpected OmniAsyncGPUModelRunnerOutput kwargs: {sorted(kwargs)}")
 
@@ -169,6 +179,7 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
+        self._has_fault: torch.Tensor | None = None
 
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
@@ -219,6 +230,12 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             if background_exception is not None:
                 raise background_exception
         self._build_model_runner_output_once()
+        # Upstream AsyncGPUModelRunnerOutput.get_output() accesses
+        # self._has_fault for EP all2all fault tolerance (PR #43637).
+        # Ensure the attribute exists even when __init__ was bypassed
+        # (e.g. unit tests using object.__new__).
+        if not hasattr(self, "_has_fault"):
+            self._has_fault = None
         with record_function_or_nullcontext("omni_async_output:get_output/finalize_async_sampled_tokens"):
             return super().get_output()
 
@@ -308,13 +325,33 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
-                vllm_config=self.vllm_config,
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._duplex_sampling_hook = None
+        self._duplex_sampling_hook_resolved = False
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        self._resolve_duplex_sampling_hook(force=True)
+
+    def _resolve_duplex_sampling_hook(self, *, force: bool = False):
+        if not force and getattr(self, "_duplex_sampling_hook_resolved", False):
+            return self._duplex_sampling_hook
+        candidate = getattr(getattr(self, "model", None), "prepare_duplex_sampling", None)
+        self._duplex_sampling_hook = candidate if callable(candidate) else None
+        self._duplex_sampling_hook_resolved = True
+        if self._duplex_sampling_hook is not None and not hasattr(self, "_duplex_sampling_helper"):
+            from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingHelper
+
+            self._duplex_sampling_helper = DuplexSamplingHelper()
+        return self._duplex_sampling_hook
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -378,9 +415,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if getattr(self.model, "skips_model_sampler_output_token_history", False):
             return sampling_metadata
         output_token_ids = self._build_model_sampler_output_token_ids()
-        if output_token_ids == sampling_metadata.output_token_ids:
-            return sampling_metadata
-        return replace(sampling_metadata, output_token_ids=output_token_ids)
+        if output_token_ids != sampling_metadata.output_token_ids:
+            return replace(sampling_metadata, output_token_ids=output_token_ids)
+        return sampling_metadata
+
+    def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
+        deferred_state_corrections_fn = super()._update_states(scheduler_output)
+        if self._resolve_duplex_sampling_hook() is None:
+            return deferred_state_corrections_fn
+        helper = getattr(self, "_duplex_sampling_helper", None)
+        if helper is not None:
+            helper.update_states(self, scheduler_output)
+        return deferred_state_corrections_fn
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -507,6 +553,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._downstream_payload_cache.clear()
         if hasattr(self, "model_intermediate_buffer"):
             self.model_intermediate_buffer.clear()
+        duplex_helper = getattr(self, "_duplex_sampling_helper", None)
+        if duplex_helper is not None:
+            duplex_helper.clear()
 
         # 5. Release all CUDA graphs unconditionally (upstream only does this
         #    on ROCm; on CUDA the graphs are only freed by Python GC during
@@ -702,12 +751,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.omni_prefix_cache is not None and is_last_pp_rank:
             # If this happens, it generally means the model is not following the correct
             # interface yet and is therefore currently not compatible with prefix cache.
-            if multimodal_outputs is not None and not isinstance(multimodal_outputs, Mapping):
-                logger.warning_once(
-                    "prefix caching expects mm outputs to be a dict, but got %s",
-                    type(multimodal_outputs),
-                )
-
             hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
             # FIX: The .cpu attribute of slot_mapping is stale (not updated by the Triton
             # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
@@ -1051,7 +1094,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         output.kv_extracted_req_ids = kv_ids
                     return self.attach_omni_connector_output(output)
 
-            if not num_scheduled_tokens:
+            # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+            if num_scheduled_tokens <= 0:
                 if (
                     self.parallel_config.distributed_executor_backend == "external_launcher"
                     and self.parallel_config.data_parallel_size > 1
@@ -1308,7 +1352,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # prefix caching but the downstream pooler payload path still
                 # needs a CPU hidden-states view. Materialize it synchronously
                 # in that case; the legacy behavior is preserved.
-                if hs_for_cache is None:
+                if hs_for_cache is None and self._model_omni_pooler_payload_include_hidden():
                     hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
                 slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
                 self.omni_prefix_cache.schedule_async_write(
@@ -1423,10 +1467,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                sampler_output = model_sample(
-                    logits,
-                    self._sampling_metadata_for_model_sampler(sampling_metadata),
-                )
+                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                prepare_duplex_sampling = self._resolve_duplex_sampling_hook()
+                if prepare_duplex_sampling is not None:
+                    helper = getattr(self, "_duplex_sampling_helper", None)
+                    rows = helper.rows(self) if helper is not None and helper.active_request_ids else ()
+                    if rows or (helper is not None and helper.hook_active):
+                        prepare_duplex_sampling(logits, prepared_sampling_metadata, rows)
+                    if helper is not None:
+                        helper.hook_active = bool(rows)
+                sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output
             return self.sampler(
@@ -1798,14 +1848,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
-        if self._async_chunk:
+        if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
-            # Non-async-chunk still ships the full payload to the next stage (via
-            # accumulate_full_payload_output and the inter_stage_outputs field); only
-            # client mm keys are split out when async_chunk is enabled. #4527 set this
-            # to (None, pooler_output), which skipped accumulation and starved the
-            # downstream stage (300s connector-input timeout / empty audio). (PR #4792)
+            # Connector-less stages expose the same payload through the
+            # orchestrator bridge; non-async stages preserve legacy behavior.
             pooler_inter, pooler_client = pooler_output, pooler_output
 
         if pooler_inter and self._should_accumulate_full_payload_output():
@@ -1817,7 +1864,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
-            multimodal_outputs = self._build_multimodal_outputs(pooler_client)
+            multimodal_outputs = (
+                inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None
@@ -1891,6 +1940,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 logits_vocab = logits.shape[-1]
                 if self.input_batch.vocab_size > logits_vocab:
                     smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
+
+        # Drop min-tokens stop ids the head cannot emit (e.g. the text
+        # tokenizer EOS folded into all_stop_token_ids on a narrow codec
+        # talker head); they would index_put_ out of bounds (#4962).
+        if logits is not None:
+            sanitize_min_tokens_stop_ids(
+                self.input_batch.sampling_metadata.logitsprocs,
+                logits.shape[-1],
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
