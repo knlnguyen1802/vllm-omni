@@ -7,7 +7,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -381,3 +381,129 @@ async def test_omni_generate_request_id():
             assert output.request_id != ""
     finally:
         engine.shutdown()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.omni
+@pytest.mark.asyncio
+async def test_omni_generate_applies_lora_request(tmp_path):
+    """LoRA passed to generate() must actually steer generation (GPU correctness).
+
+    Regression test for https://github.com/vllm-project/vllm-omni/issues/5369:
+    AsyncOmni.generate() accepted lora_request but dropped it on submission, so
+    a loaded adapter never affected output. We load a deterministic random
+    rank-8 LoRA on the thinker's q_proj, then compare greedy text + logprobs
+    with and without the request-level LoRA. The adapter must change at least
+    the logprobs (token ids may coincide by chance; logprobs will not).
+    """
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+    from transformers import AutoConfig
+
+    # Thinker-only stage config with LoRA enabled on stage 0.
+    lora_stage_config = modify_stage_config(
+        OMNI_STAGE_CONFIG,
+        updates={
+            "stages": {
+                0: {
+                    "enable_lora": True,
+                    "max_lora_rank": 8,
+                    "max_loras": 1,
+                },
+            },
+        },
+    )
+
+    def _write_lora(adapter_dir):
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        config = AutoConfig.from_pretrained(OMNI_MODEL, trust_remote_code=True)
+        text = config.thinker_config.text_config
+        head_dim = getattr(text, "head_dim", text.hidden_size // text.num_attention_heads)
+        q_size = text.num_attention_heads * head_dim
+        rank = 8
+        module = "thinker.model.layers.0.self_attn.q_proj"
+        gen = torch.Generator().manual_seed(1)
+        save_file(
+            {
+                f"base_model.model.{module}.lora_A.weight": (
+                    torch.randn(rank, text.hidden_size, generator=gen) * 0.02
+                ),
+                f"base_model.model.{module}.lora_B.weight": (
+                    torch.randn(q_size, rank, generator=gen) * 0.02
+                ),
+            },
+            str(adapter_dir / "adapter_model.safetensors"),
+        )
+        (adapter_dir / "adapter_config.json").write_text(
+            json.dumps(
+                {
+                    "base_model_name_or_path": OMNI_MODEL,
+                    "bias": "none",
+                    "inference_mode": True,
+                    "lora_alpha": rank,
+                    "lora_dropout": 0.0,
+                    "peft_type": "LORA",
+                    "r": rank,
+                    "target_modules": ["q_proj"],
+                    "task_type": "CAUSAL_LM",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(adapter_dir)
+
+    async def _generate(engine, lora_request=None):
+        final = None
+        async for output in engine.generate(
+            "Calculate 17 * 23. Answer with only the number.",
+            sampling_params_list=[
+                SamplingParams(max_tokens=4, temperature=0, logprobs=1)
+            ],
+            output_modalities=["text"],
+            lora_request=lora_request,
+        ):
+            final = output
+        completion = final.request_output.outputs[0]
+        return (
+            list(completion.token_ids),
+            [
+                completion.logprobs[i][tid].logprob
+                for i, tid in enumerate(completion.token_ids)
+            ],
+        )
+
+    adapter_path = _write_lora(tmp_path / "omni_lora")
+    lora_request = LoRARequest(lora_name="test", lora_int_id=1, lora_path=adapter_path)
+
+    engine = AsyncOmni(model=OMNI_MODEL, stageconfigs_path=lora_stage_config)
+    try:
+        # Load the adapter via the native stage client. AsyncOmni.add_lora() has a
+        # separate RPC serialization bug (see issue #5369), so bypass it the same
+        # way the issue reproducer does.
+        stage_client = engine.engine.stage_clients[0]
+        if hasattr(stage_client, "add_lora_async"):
+            await stage_client.add_lora_async(lora_request)
+        else:
+            await stage_client.collective_rpc_async(
+                method="add_lora", args=(lora_request,)
+            )
+
+        if hasattr(stage_client, "list_loras_async"):
+            loaded = await stage_client.list_loras_async()
+        else:
+            loaded = await stage_client.collective_rpc_async(method="list_loras")
+        assert lora_request.lora_int_id in loaded, (
+            f"LoRA adapter {lora_request.lora_int_id} not loaded; loaded={loaded}"
+        )
+
+        baseline = await _generate(engine)
+        adapted = await _generate(engine, lora_request)
+    finally:
+        engine.shutdown()
+
+    assert baseline != adapted, (
+        "BUG: LoRA loaded, but AsyncOmni.generate ignored lora_request — "
+        "neither token ids nor logprobs changed vs the base model."
+    )
