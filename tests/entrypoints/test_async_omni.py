@@ -427,12 +427,8 @@ async def test_omni_generate_applies_lora_request(tmp_path):
         gen = torch.Generator().manual_seed(1)
         save_file(
             {
-                f"base_model.model.{module}.lora_A.weight": (
-                    torch.randn(rank, text.hidden_size, generator=gen) * 0.02
-                ),
-                f"base_model.model.{module}.lora_B.weight": (
-                    torch.randn(q_size, rank, generator=gen) * 0.02
-                ),
+                f"base_model.model.{module}.lora_A.weight": (torch.randn(rank, text.hidden_size, generator=gen) * 0.02),
+                f"base_model.model.{module}.lora_B.weight": (torch.randn(q_size, rank, generator=gen) * 0.02),
             },
             str(adapter_dir / "adapter_model.safetensors"),
         )
@@ -458,9 +454,7 @@ async def test_omni_generate_applies_lora_request(tmp_path):
         final = None
         async for output in engine.generate(
             "Calculate 17 * 23. Answer with only the number.",
-            sampling_params_list=[
-                SamplingParams(max_tokens=4, temperature=0, logprobs=1)
-            ],
+            sampling_params_list=[SamplingParams(max_tokens=4, temperature=0, logprobs=1)],
             output_modalities=["text"],
             lora_request=lora_request,
         ):
@@ -468,10 +462,7 @@ async def test_omni_generate_applies_lora_request(tmp_path):
         completion = final.request_output.outputs[0]
         return (
             list(completion.token_ids),
-            [
-                completion.logprobs[i][tid].logprob
-                for i, tid in enumerate(completion.token_ids)
-            ],
+            [completion.logprobs[i][tid].logprob for i, tid in enumerate(completion.token_ids)],
         )
 
     adapter_path = _write_lora(tmp_path / "omni_lora")
@@ -486,9 +477,7 @@ async def test_omni_generate_applies_lora_request(tmp_path):
         if hasattr(stage_client, "add_lora_async"):
             await stage_client.add_lora_async(lora_request)
         else:
-            await stage_client.collective_rpc_async(
-                method="add_lora", args=(lora_request,)
-            )
+            await stage_client.collective_rpc_async(method="add_lora", args=(lora_request,))
 
         if hasattr(stage_client, "list_loras_async"):
             loaded = await stage_client.list_loras_async()
