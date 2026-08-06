@@ -383,18 +383,22 @@ async def test_omni_generate_request_id():
         engine.shutdown()
 
 
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.omni
-@pytest.mark.asyncio
-async def test_omni_generate_applies_lora_request(tmp_path, monkeypatch):
-    """LoRA passed to generate() must actually steer generation (GPU correctness).
+def test_lora_request_steers_thinker_output_inproc(tmp_path, monkeypatch):
+    """LoRA applied to the thinker arch actually changes generation.
 
-    Regression test for https://github.com/vllm-project/vllm-omni/issues/5369:
-    AsyncOmni.generate() accepted lora_request but dropped it on submission, so
-    a loaded adapter never affected output. We load a deterministic random
-    rank-8 LoRA on the thinker's q_proj, then compare greedy text + logprobs
-    with and without the request-level LoRA. The adapter must change at least
-    the logprobs (token ids may coincide by chance; logprobs will not).
+    This is the in-process counterpart to ``test_omni_generate_applies_lora_request``.
+    The AsyncOmni E2E path forces ``mp.set_start_method("spawn")`` for the engine
+    core, so a ``monkeypatch`` in the test process can't reach the child and the
+    upstream ``Qwen2_5OmniThinkerProcessingInfo.get_hf_config`` mismatch
+    (expects ``Qwen2_5OmniConfig`` but the thinker stage holds a
+    ``Qwen2_5OmniThinkerConfig``) crashes startup. Here we load the thinker arch
+    via vllm's ``LLM`` with the V1 engine forced in-process
+    (``VLLM_ENABLE_V1_MULTIPROCESSING=0``), where the in-process monkeypatch of
+    ``get_hf_config`` applies and repairs that mismatch. Combined with the CPU
+    forwarding test, this covers issue #5369 without the subprocess path.
     """
     import json
     import os
@@ -402,38 +406,38 @@ async def test_omni_generate_applies_lora_request(tmp_path, monkeypatch):
     import torch
     from safetensors.torch import save_file
     from transformers import AutoConfig
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
 
-    monkeypatch.setenv("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
-    # Avoid sampler backend differences affecting logprob comparisons.
+    from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
+        Qwen2_5OmniConfig,
+        Qwen2_5OmniThinkerConfig,
+    )
+    from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
+        Qwen2_5OmniThinkerProcessingInfo,
+    )
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
-    # The default Omni wrapper arch does not implement SupportsLoRA, so load the
-    # LoRA-capable thinker arch instead. Materialize a thinker-only HF config so
-    # we do not need production code to unwrap thinker_config from the full Omni
-    # config.json. Keep max_model_len small so LoRA init fits on L4.
+    # Repair the thinker-config vs full-omni-config mismatch in-process.
+    def _get_hf_config(self):
+        hf_config = self.ctx.model_config.hf_config
+        if isinstance(hf_config, Qwen2_5OmniThinkerConfig):
+            return hf_config
+        if isinstance(hf_config, Qwen2_5OmniConfig):
+            return hf_config.thinker_config
+        return _orig_get_hf_config(self)
+
+    _orig_get_hf_config = Qwen2_5OmniThinkerProcessingInfo.get_hf_config
+    monkeypatch.setattr(Qwen2_5OmniThinkerProcessingInfo, "get_hf_config", _get_hf_config)
+
     omni_config = AutoConfig.from_pretrained(OMNI_MODEL, trust_remote_code=True)
     thinker_hf_dir = tmp_path / "thinker_hf_config"
     thinker_hf_dir.mkdir(parents=True, exist_ok=True)
     thinker_cfg = omni_config.thinker_config.to_dict()
     thinker_cfg["architectures"] = ["Qwen2_5OmniThinkerModel"]
     (thinker_hf_dir / "config.json").write_text(json.dumps(thinker_cfg), encoding="utf-8")
-
-    lora_stage_config = modify_stage_config(
-        OMNI_STAGE_CONFIG,
-        updates={
-            "stages": {
-                0: {
-                    "model_arch": "Qwen2_5OmniThinkerModel",
-                    "hf_config_path": str(thinker_hf_dir),
-                    "enable_lora": True,
-                    "max_lora_rank": 8,
-                    "max_loras": 1,
-                    "max_model_len": 256,
-                    "max_num_batched_tokens": 256,
-                },
-            },
-        },
-    )
 
     def _write_lora(adapter_dir):
         adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -445,8 +449,12 @@ async def test_omni_generate_applies_lora_request(tmp_path, monkeypatch):
         gen = torch.Generator().manual_seed(1)
         save_file(
             {
-                f"base_model.model.{module}.lora_A.weight": (torch.randn(rank, text.hidden_size, generator=gen) * 0.02),
-                f"base_model.model.{module}.lora_B.weight": (torch.randn(q_size, rank, generator=gen) * 0.02),
+                f"base_model.model.{module}.lora_A.weight": (
+                    torch.randn(rank, text.hidden_size, generator=gen) * 0.02
+                ),
+                f"base_model.model.{module}.lora_B.weight": (
+                    torch.randn(q_size, rank, generator=gen) * 0.02
+                ),
             },
             str(adapter_dir / "adapter_model.safetensors"),
         )
@@ -468,55 +476,45 @@ async def test_omni_generate_applies_lora_request(tmp_path, monkeypatch):
         )
         return str(adapter_dir)
 
-    async def _generate(engine, lora_request=None):
-        final = None
-        async for output in engine.generate(
-            "Calculate 17 * 23. Answer with only the number.",
-            sampling_params_list=[SamplingParams(max_tokens=4, temperature=0, logprobs=1)],
-            output_modalities=["text"],
-            lora_request=lora_request,
-        ):
-            final = output
-        completion = final.request_output.outputs[0]
-        return (
-            list(completion.token_ids),
-            [completion.logprobs[i][tid].logprob for i, tid in enumerate(completion.token_ids)],
-        )
-
     adapter_path = _write_lora(tmp_path / "omni_lora")
     lora_request = LoRARequest(lora_name="test", lora_int_id=1, lora_path=adapter_path)
 
-    engine = AsyncOmni(model=OMNI_MODEL, stage_configs_path=lora_stage_config)
+    llm = LLM(
+        model=str(thinker_hf_dir),
+        tokenizer=OMNI_MODEL,
+        load_format="dummy",
+        dtype="bfloat16",
+        enable_lora=True,
+        max_lora_rank=8,
+        max_loras=1,
+        max_model_len=256,
+        max_num_seqs=1,
+        max_num_batched_tokens=256,
+        gpu_memory_utilization=0.9,
+        enforce_eager=True,
+        trust_remote_code=True,
+    )
     try:
-        # Load the adapter via the native stage client. AsyncOmni.add_lora() has a
-        # separate RPC serialization bug (see issue #5369), so bypass it the same
-        # way the issue reproducer does.
-        stage_client = engine.engine.stage_clients[0]
-        if hasattr(stage_client, "add_lora_async"):
-            assert await stage_client.add_lora_async(lora_request)
-            loaded = await stage_client.list_loras_async()
-        else:
-            await stage_client.collective_rpc_async(method="add_lora", args=(lora_request,))
-            loaded = await stage_client.collective_rpc_async(method="list_loras")
-        # collective_rpc may nest per-worker results (e.g. [[1]]); flatten.
-        loaded_ids: set[int] = set()
-        stack = [loaded]
-        while stack:
-            item = stack.pop()
-            if isinstance(item, int):
-                loaded_ids.add(item)
-            elif isinstance(item, (list, set, tuple)):
-                stack.extend(item)
-        assert lora_request.lora_int_id in loaded_ids, (
-            f"LoRA adapter {lora_request.lora_int_id} not loaded; loaded={loaded}"
-        )
+        sp = SamplingParams(max_tokens=4, temperature=0, logprobs=1)
 
-        baseline = await _generate(engine)
-        adapted = await _generate(engine, lora_request)
+        def _generate(lora_request=None):
+            out = llm.generate(
+                ["Calculate 17 * 23. Answer with only the number."],
+                sp,
+                lora_request=lora_request,
+            )[0]
+            comp = out.outputs[0]
+            return (
+                list(comp.token_ids),
+                [comp.logprobs[i][tid].logprob for i, tid in enumerate(comp.token_ids)],
+            )
+
+        baseline = _generate()
+        adapted = _generate(lora_request)
     finally:
-        engine.shutdown()
+        del llm
 
     assert baseline != adapted, (
-        "BUG: LoRA loaded, but AsyncOmni.generate ignored lora_request — "
-        "neither token ids nor logprobs changed vs the base model."
+        "BUG: LoRA loaded but generation did not change — neither token ids nor "
+        "logprobs differ vs the base model."
     )
