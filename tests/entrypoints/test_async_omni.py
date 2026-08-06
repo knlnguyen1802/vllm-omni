@@ -439,16 +439,22 @@ def test_lora_request_steers_thinker_output_inproc(tmp_path, monkeypatch):
 
     # The thinker's HF processor (image + audio) is loaded from the model dir,
     # so populate ``thinker_hf_dir`` with the processor/tokenizer files from
-    # the omni repo (weights excluded — we use ``load_format="dummy"``), then
-    # overwrite ``config.json`` with the thinker-only config + arch.
+    # the omni checkpoint (weights excluded — we use ``load_format="dummy"``),
+    # then overwrite ``config.json`` with the thinker-only config + arch.
+    # ``OMNI_MODEL`` may be either a HuggingFace repo id or a local directory;
+    # ``snapshot_download`` rejects local paths as invalid repo ids, so resolve
+    # the source dir ourselves.
     import shutil
 
-    from huggingface_hub import snapshot_download
+    if os.path.isdir(OMNI_MODEL):
+        omni_dir = OMNI_MODEL
+    else:
+        from huggingface_hub import snapshot_download
 
-    omni_dir = snapshot_download(
-        OMNI_MODEL,
-        ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.gguf", "*.msgpack"],
-    )
+        omni_dir = snapshot_download(
+            OMNI_MODEL,
+            ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.gguf", "*.msgpack"],
+        )
     for name in os.listdir(omni_dir):
         src = os.path.join(omni_dir, name)
         if os.path.isfile(src) and name != "config.json":
