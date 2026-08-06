@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 from types import SimpleNamespace
 
@@ -14,7 +15,7 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model]
 
 DIFFUSION_MODEL = "riverclouds/qwen_image_random"
-OMNI_MODEL = "Qwen/Qwen2.5-Omni-7B"
+OMNI_MODEL = os.environ.get("OMNI_TEST_MODEL", "Qwen/Qwen2.5-Omni-7B")
 OMNI_STAGE_CONFIG = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
 
 
@@ -435,6 +436,24 @@ def test_lora_request_steers_thinker_output_inproc(tmp_path, monkeypatch):
     omni_config = AutoConfig.from_pretrained(OMNI_MODEL, trust_remote_code=True)
     thinker_hf_dir = tmp_path / "thinker_hf_config"
     thinker_hf_dir.mkdir(parents=True, exist_ok=True)
+
+    # The thinker's HF processor (image + audio) is loaded from the model dir,
+    # so populate ``thinker_hf_dir`` with the processor/tokenizer files from
+    # the omni repo (weights excluded — we use ``load_format="dummy"``), then
+    # overwrite ``config.json`` with the thinker-only config + arch.
+    import shutil
+
+    from huggingface_hub import snapshot_download
+
+    omni_dir = snapshot_download(
+        OMNI_MODEL,
+        ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.gguf", "*.msgpack"],
+    )
+    for name in os.listdir(omni_dir):
+        src = os.path.join(omni_dir, name)
+        if os.path.isfile(src) and name != "config.json":
+            shutil.copy(src, str(thinker_hf_dir / name))
+
     thinker_cfg = omni_config.thinker_config.to_dict()
     thinker_cfg["architectures"] = ["Qwen2_5OmniThinkerModel"]
     (thinker_hf_dir / "config.json").write_text(json.dumps(thinker_cfg), encoding="utf-8")
