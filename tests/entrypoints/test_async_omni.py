@@ -386,7 +386,7 @@ async def test_omni_generate_request_id():
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
-async def test_omni_generate_applies_lora_request(tmp_path):
+async def test_omni_generate_applies_lora_request(tmp_path, monkeypatch):
     """LoRA passed to generate() must actually steer generation (GPU correctness).
 
     Regression test for https://github.com/vllm-project/vllm-omni/issues/5369:
@@ -397,20 +397,39 @@ async def test_omni_generate_applies_lora_request(tmp_path):
     the logprobs (token ids may coincide by chance; logprobs will not).
     """
     import json
+    import os
 
     import torch
     from safetensors.torch import save_file
     from transformers import AutoConfig
 
-    # Thinker-only stage config with LoRA enabled on stage 0.
+    monkeypatch.setenv("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "1")
+    # Avoid sampler backend differences affecting logprob comparisons.
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+
+    # The default Omni wrapper arch does not implement SupportsLoRA, so load the
+    # LoRA-capable thinker arch instead. Materialize a thinker-only HF config so
+    # we do not need production code to unwrap thinker_config from the full Omni
+    # config.json. Keep max_model_len small so LoRA init fits on L4.
+    omni_config = AutoConfig.from_pretrained(OMNI_MODEL, trust_remote_code=True)
+    thinker_hf_dir = tmp_path / "thinker_hf_config"
+    thinker_hf_dir.mkdir(parents=True, exist_ok=True)
+    thinker_cfg = omni_config.thinker_config.to_dict()
+    thinker_cfg["architectures"] = ["Qwen2_5OmniThinkerModel"]
+    (thinker_hf_dir / "config.json").write_text(json.dumps(thinker_cfg), encoding="utf-8")
+
     lora_stage_config = modify_stage_config(
         OMNI_STAGE_CONFIG,
         updates={
             "stages": {
                 0: {
+                    "model_arch": "Qwen2_5OmniThinkerModel",
+                    "hf_config_path": str(thinker_hf_dir),
                     "enable_lora": True,
                     "max_lora_rank": 8,
                     "max_loras": 1,
+                    "max_model_len": 256,
+                    "max_num_batched_tokens": 256,
                 },
             },
         },
@@ -418,8 +437,7 @@ async def test_omni_generate_applies_lora_request(tmp_path):
 
     def _write_lora(adapter_dir):
         adapter_dir.mkdir(parents=True, exist_ok=True)
-        config = AutoConfig.from_pretrained(OMNI_MODEL, trust_remote_code=True)
-        text = config.thinker_config.text_config
+        text = omni_config.thinker_config.text_config
         head_dim = getattr(text, "head_dim", text.hidden_size // text.num_attention_heads)
         q_size = text.num_attention_heads * head_dim
         rank = 8
@@ -474,9 +492,22 @@ async def test_omni_generate_applies_lora_request(tmp_path):
         # separate RPC serialization bug (see issue #5369), so bypass it the same
         # way the issue reproducer does.
         stage_client = engine.engine.stage_clients[0]
-        await stage_client.collective_rpc_async(method="add_lora", args=(lora_request,))
-        loaded = await stage_client.collective_rpc_async(method="list_loras")
-        assert lora_request.lora_int_id in loaded, (
+        if hasattr(stage_client, "add_lora_async"):
+            assert await stage_client.add_lora_async(lora_request)
+            loaded = await stage_client.list_loras_async()
+        else:
+            await stage_client.collective_rpc_async(method="add_lora", args=(lora_request,))
+            loaded = await stage_client.collective_rpc_async(method="list_loras")
+        # collective_rpc may nest per-worker results (e.g. [[1]]); flatten.
+        loaded_ids: set[int] = set()
+        stack = [loaded]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, int):
+                loaded_ids.add(item)
+            elif isinstance(item, (list, set, tuple)):
+                stack.extend(item)
+        assert lora_request.lora_int_id in loaded_ids, (
             f"LoRA adapter {lora_request.lora_int_id} not loaded; loaded={loaded}"
         )
 
