@@ -468,21 +468,14 @@ async def test_omni_generate_applies_lora_request(tmp_path):
     adapter_path = _write_lora(tmp_path / "omni_lora")
     lora_request = LoRARequest(lora_name="test", lora_int_id=1, lora_path=adapter_path)
 
-    engine = AsyncOmni(model=OMNI_MODEL, stageconfigs_path=lora_stage_config)
+    engine = AsyncOmni(model=OMNI_MODEL, stage_configs_path=lora_stage_config)
     try:
         # Load the adapter via the native stage client. AsyncOmni.add_lora() has a
         # separate RPC serialization bug (see issue #5369), so bypass it the same
         # way the issue reproducer does.
         stage_client = engine.engine.stage_clients[0]
-        if hasattr(stage_client, "add_lora_async"):
-            await stage_client.add_lora_async(lora_request)
-        else:
-            await stage_client.collective_rpc_async(method="add_lora", args=(lora_request,))
-
-        if hasattr(stage_client, "list_loras_async"):
-            loaded = await stage_client.list_loras_async()
-        else:
-            loaded = await stage_client.collective_rpc_async(method="list_loras")
+        await stage_client.collective_rpc_async(method="add_lora", args=(lora_request,))
+        loaded = await stage_client.collective_rpc_async(method="list_loras")
         assert lora_request.lora_int_id in loaded, (
             f"LoRA adapter {lora_request.lora_int_id} not loaded; loaded={loaded}"
         )
