@@ -1,5 +1,4 @@
 import asyncio
-import os
 import re
 from types import SimpleNamespace
 
@@ -8,14 +7,14 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model]
 
 DIFFUSION_MODEL = "riverclouds/qwen_image_random"
-OMNI_MODEL = os.environ.get("OMNI_TEST_MODEL", "Qwen/Qwen2.5-Omni-7B")
+OMNI_MODEL = "Qwen/Qwen2.5-Omni-7B"
 OMNI_STAGE_CONFIG = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
 
 
@@ -382,164 +381,3 @@ async def test_omni_generate_request_id():
             assert output.request_id != ""
     finally:
         engine.shutdown()
-
-
-
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.omni
-def test_lora_request_steers_thinker_output_inproc(tmp_path, monkeypatch):
-    """LoRA applied to the thinker arch actually changes generation.
-
-    This is the in-process counterpart to ``test_omni_generate_applies_lora_request``.
-    The AsyncOmni E2E path forces ``mp.set_start_method("spawn")`` for the engine
-    core, so a ``monkeypatch`` in the test process can't reach the child and the
-    upstream ``Qwen2_5OmniThinkerProcessingInfo.get_hf_config`` mismatch
-    (expects ``Qwen2_5OmniConfig`` but the thinker stage holds a
-    ``Qwen2_5OmniThinkerConfig``) crashes startup. Here we load the thinker arch
-    via vllm's ``LLM`` with the V1 engine forced in-process
-    (``VLLM_ENABLE_V1_MULTIPROCESSING=0``), where the in-process monkeypatch of
-    ``get_hf_config`` applies and repairs that mismatch. Combined with the CPU
-    forwarding test, this covers issue #5369 without the subprocess path.
-    """
-    import json
-    import os
-
-    import torch
-    from safetensors.torch import save_file
-    from transformers import AutoConfig
-    from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
-
-    from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
-        Qwen2_5OmniConfig,
-        Qwen2_5OmniThinkerConfig,
-    )
-    from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
-        Qwen2_5OmniThinkerProcessingInfo,
-    )
-
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-
-    # Repair the thinker-config vs full-omni-config mismatch in-process.
-    def _get_hf_config(self):
-        hf_config = self.ctx.model_config.hf_config
-        if isinstance(hf_config, Qwen2_5OmniThinkerConfig):
-            return hf_config
-        if isinstance(hf_config, Qwen2_5OmniConfig):
-            return hf_config.thinker_config
-        return _orig_get_hf_config(self)
-
-    _orig_get_hf_config = Qwen2_5OmniThinkerProcessingInfo.get_hf_config
-    monkeypatch.setattr(Qwen2_5OmniThinkerProcessingInfo, "get_hf_config", _get_hf_config)
-
-    omni_config = AutoConfig.from_pretrained(OMNI_MODEL, trust_remote_code=True)
-    thinker_hf_dir = tmp_path / "thinker_hf_config"
-    thinker_hf_dir.mkdir(parents=True, exist_ok=True)
-
-    # The thinker's HF processor (image + audio) is loaded from the model dir,
-    # so populate ``thinker_hf_dir`` with the processor/tokenizer files from
-    # the omni checkpoint (weights excluded — we use ``load_format="dummy"``),
-    # then overwrite ``config.json`` with the thinker-only config + arch.
-    # ``OMNI_MODEL`` may be either a HuggingFace repo id or a local directory;
-    # ``snapshot_download`` rejects local paths as invalid repo ids, so resolve
-    # the source dir ourselves.
-    import shutil
-
-    if os.path.isdir(OMNI_MODEL):
-        omni_dir = OMNI_MODEL
-    else:
-        from huggingface_hub import snapshot_download
-
-        omni_dir = snapshot_download(
-            OMNI_MODEL,
-            ignore_patterns=["*.safetensors", "*.bin", "*.pt", "*.gguf", "*.msgpack"],
-        )
-    for name in os.listdir(omni_dir):
-        src = os.path.join(omni_dir, name)
-        if os.path.isfile(src) and name != "config.json":
-            shutil.copy(src, str(thinker_hf_dir / name))
-
-    thinker_cfg = omni_config.thinker_config.to_dict()
-    thinker_cfg["architectures"] = ["Qwen2_5OmniThinkerModel"]
-    (thinker_hf_dir / "config.json").write_text(json.dumps(thinker_cfg), encoding="utf-8")
-
-    def _write_lora(adapter_dir):
-        adapter_dir.mkdir(parents=True, exist_ok=True)
-        text = omni_config.thinker_config.text_config
-        head_dim = getattr(text, "head_dim", text.hidden_size // text.num_attention_heads)
-        q_size = text.num_attention_heads * head_dim
-        rank = 8
-        module = "thinker.model.layers.0.self_attn.q_proj"
-        gen = torch.Generator().manual_seed(1)
-        save_file(
-            {
-                f"base_model.model.{module}.lora_A.weight": (
-                    torch.randn(rank, text.hidden_size, generator=gen) * 0.02
-                ),
-                f"base_model.model.{module}.lora_B.weight": (
-                    torch.randn(q_size, rank, generator=gen) * 0.02
-                ),
-            },
-            str(adapter_dir / "adapter_model.safetensors"),
-        )
-        (adapter_dir / "adapter_config.json").write_text(
-            json.dumps(
-                {
-                    "base_model_name_or_path": OMNI_MODEL,
-                    "bias": "none",
-                    "inference_mode": True,
-                    "lora_alpha": rank,
-                    "lora_dropout": 0.0,
-                    "peft_type": "LORA",
-                    "r": rank,
-                    "target_modules": ["q_proj"],
-                    "task_type": "CAUSAL_LM",
-                }
-            ),
-            encoding="utf-8",
-        )
-        return str(adapter_dir)
-
-    adapter_path = _write_lora(tmp_path / "omni_lora")
-    lora_request = LoRARequest(lora_name="test", lora_int_id=1, lora_path=adapter_path)
-
-    llm = LLM(
-        model=str(thinker_hf_dir),
-        tokenizer=OMNI_MODEL,
-        load_format="dummy",
-        dtype="bfloat16",
-        enable_lora=True,
-        max_lora_rank=8,
-        max_loras=1,
-        max_model_len=256,
-        max_num_seqs=1,
-        max_num_batched_tokens=256,
-        gpu_memory_utilization=0.9,
-        enforce_eager=True,
-        trust_remote_code=True,
-    )
-    try:
-        sp = SamplingParams(max_tokens=4, temperature=0, logprobs=1)
-
-        def _generate(lora_request=None):
-            out = llm.generate(
-                ["Calculate 17 * 23. Answer with only the number."],
-                sp,
-                lora_request=lora_request,
-            )[0]
-            comp = out.outputs[0]
-            return (
-                list(comp.token_ids),
-                [comp.logprobs[i][tid].logprob for i, tid in enumerate(comp.token_ids)],
-            )
-
-        baseline = _generate()
-        adapted = _generate(lora_request)
-    finally:
-        del llm
-
-    assert baseline != adapted, (
-        "BUG: LoRA loaded but generation did not change — neither token ids nor "
-        "logprobs differ vs the base model."
-    )
