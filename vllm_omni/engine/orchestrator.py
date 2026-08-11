@@ -38,8 +38,6 @@ from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
-    EngineCoreControlRequestMessage,
-    EngineCoreControlResultMessage,
     EngineQueueMessage,
     ErrorMessage,
     InteractionMessage,
@@ -596,8 +594,6 @@ class Orchestrator:
                 await self._handle_interaction(msg)
             elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
-            elif msg_type == "engine_core_control":
-                await self._handle_engine_core_control(msg)
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
@@ -895,80 +891,6 @@ class Orchestrator:
             CollectiveRPCResultMessage(
                 rpc_id=rpc_id,
                 method=method,
-                stage_ids=stage_ids,
-                results=results,
-            )
-        )
-
-    async def _handle_engine_core_control(self, msg: EngineCoreControlRequestMessage) -> None:
-        """Run EngineCore pause/sleep/wake on the orchestrator event loop.
-
-        Must stay on this loop because StageEngineCoreClient / AsyncMPClient ZMQ
-        sockets were created here. Diffusion stages are skipped — they have no
-        EngineCore scheduler and keep the worker-level sleep RPC path.
-        """
-        rpc_id = msg.rpc_id
-        op = msg.op
-        requested_stage_ids = msg.stage_ids
-
-        target_pools: list[StagePool] = []
-        if requested_stage_ids is None:
-            target_pools.extend(self.stage_pools)
-        else:
-            for lid in requested_stage_ids:
-                if not (0 <= lid < self.num_stages):
-                    logger.warning("[Orchestrator] engine_core_control: ignoring invalid stage_id %s", lid)
-                    continue
-                target_pools.append(self.stage_pools[lid])
-
-        results: list[Any] = []
-        stage_ids: list[int] = []
-        try:
-            for pool in target_pools:
-                if pool.stage_type == "diffusion":
-                    logger.debug(
-                        "[Orchestrator] engine_core_control(%s): skipping diffusion stage-%s",
-                        op,
-                        pool.stage_id,
-                    )
-                    continue
-                if op == "pause_scheduler":
-                    await pool.pause_scheduler_async(mode=msg.mode, clear_cache=msg.clear_cache)
-                    result: Any = True
-                elif op == "resume_scheduler":
-                    await pool.resume_scheduler_async()
-                    result = True
-                elif op == "sleep":
-                    await pool.sleep_async(level=msg.level, mode=msg.mode)
-                    result = True
-                elif op == "wake_up":
-                    await pool.wake_up_async(tags=msg.tags)
-                    result = True
-                elif op == "is_scheduler_paused":
-                    result = await pool.is_scheduler_paused_async()
-                elif op == "is_sleeping":
-                    result = await pool.is_sleeping_async()
-                else:
-                    raise ValueError(f"unsupported engine_core_control op: {op}")
-                stage_ids.append(pool.stage_id)
-                results.append(result)
-        except Exception as exc:
-            logger.exception("[Orchestrator] engine_core_control(%s) failed", op)
-            # Always reply with a correlated result so the caller unblocks.
-            await self.rpc_async_queue.put(
-                EngineCoreControlResultMessage(
-                    rpc_id=rpc_id,
-                    op=op,
-                    stage_ids=stage_ids,
-                    results=[{"error": str(exc)}],
-                )
-            )
-            return
-
-        await self.rpc_async_queue.put(
-            EngineCoreControlResultMessage(
-                rpc_id=rpc_id,
-                op=op,
                 stage_ids=stage_ids,
                 results=results,
             )

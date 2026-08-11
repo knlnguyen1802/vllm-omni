@@ -60,32 +60,6 @@ class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     stage_ids: list[int] | None
 
 
-class EngineCoreControlRequestMessage(EngineQueueMessage, kw_only=True):
-    """Control-plane ops that must run on StageEngineCoreClient (orchestrator loop).
-
-    Unlike :class:`CollectiveRPCRequestMessage`, these call AsyncMPClient
-    helpers such as ``sleep_async`` / ``pause_scheduler_async`` rather than
-    worker ``collective_rpc``. Diffusion stages must not receive these ops.
-    """
-
-    type: Literal["engine_core_control"] = "engine_core_control"
-    rpc_id: str
-    op: Literal[
-        "pause_scheduler",
-        "resume_scheduler",
-        "sleep",
-        "wake_up",
-        "is_scheduler_paused",
-        "is_sleeping",
-    ]
-    stage_ids: list[int] | None = None
-    timeout: float | None = None
-    level: int = 1
-    mode: str = "abort"
-    clear_cache: bool = True
-    tags: list[str] | None = None
-
-
 class ShutdownRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["shutdown"] = "shutdown"
 
@@ -143,15 +117,3 @@ class CollectiveRPCResultMessage(EngineQueueMessage, kw_only=True):
     @property
     def rpc_correlation_key(self) -> tuple[str, str]:
         return ("collective", self.rpc_id)
-
-
-class EngineCoreControlResultMessage(EngineQueueMessage, kw_only=True):
-    type: Literal["engine_core_control_result"] = "engine_core_control_result"
-    rpc_id: str
-    op: str
-    stage_ids: list[int]
-    results: list[object]
-
-    @property
-    def rpc_correlation_key(self) -> tuple[str, str]:
-        return ("engine_core_control", self.rpc_id)

@@ -1010,6 +1010,31 @@ class AsyncOmni(EngineClient, OmniBase):
 
         return results
 
+    async def _engine_core_rpc(
+        self,
+        method: str,
+        *,
+        stage_ids: list[int],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> list[Any]:
+        """Call an AR EngineCore helper via collective_rpc (orchestrator loop).
+
+        StagePool maps these method names to vLLM AsyncMPClient APIs
+        (``sleep_async``, ``pause_scheduler_async``, ...). Raises if any
+        replica reports failure.
+        """
+        results = await self.collective_rpc(
+            method=method,
+            args=args,
+            kwargs=kwargs,
+            stage_ids=stage_ids,
+        )
+        for result in results:
+            if isinstance(result, dict) and result.get("error"):
+                raise RuntimeError(f"{method} failed: {result['error']}")
+        return results
+
     @staticmethod
     def _coerce_stage_bool(result: Any) -> bool:
         """Reduce a stage RPC result to a boolean.
@@ -1142,10 +1167,12 @@ class AsyncOmni(EngineClient, OmniBase):
                 ar_stage_ids,
                 mode,
             )
-            await self.engine.pause_scheduler_async(
+            # Same API name as vLLM AsyncMPClient.pause_scheduler_async; routed
+            # through collective_rpc so it runs on the orchestrator event loop.
+            await self._engine_core_rpc(
+                "pause_scheduler",
                 stage_ids=ar_stage_ids,
-                mode=mode,
-                clear_cache=clear_cache,
+                kwargs={"mode": mode, "clear_cache": clear_cache},
             )
 
         # Frontend / sender-side cache clear (P0). EngineCore.pause_scheduler
@@ -1163,7 +1190,7 @@ class AsyncOmni(EngineClient, OmniBase):
         ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         if ar_stage_ids:
             logger.info("[%s] Resuming AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
-            await self.engine.resume_scheduler_async(stage_ids=ar_stage_ids)
+            await self._engine_core_rpc("resume_scheduler", stage_ids=ar_stage_ids)
 
         async with self._pause_cond:
             self._paused = False
@@ -1248,7 +1275,11 @@ class AsyncOmni(EngineClient, OmniBase):
                 level,
                 mode,
             )
-            await self.engine.sleep_async(stage_ids=ar_stage_ids, level=level, mode=mode)
+            await self._engine_core_rpc(
+                "sleep",
+                stage_ids=ar_stage_ids,
+                args=(level, mode),
+            )
             # EngineCore.sleep has no OmniACK handshake; emit stage-level SUCCESS
             # markers so callers/tests that count ACKs keep a stable API.
             task_id = f"engine_core-sleep-{uuid.uuid4().hex[:8]}"
@@ -1320,7 +1351,11 @@ class AsyncOmni(EngineClient, OmniBase):
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
             logger.info("[%s] Waking AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
-            await self.engine.wake_up_async(stage_ids=ar_stage_ids, tags=requested_tags)
+            await self._engine_core_rpc(
+                "wake_up",
+                stage_ids=ar_stage_ids,
+                kwargs={"tags": requested_tags},
+            )
             task_id = f"engine_core-wake-{uuid.uuid4().hex[:8]}"
             final_acks.extend(
                 OmniACK(
