@@ -801,14 +801,19 @@ class Orchestrator:
         When ``msg.rpc_id`` is set, emit :class:`AbortResultMessage` after
         stage aborts, binding release, and request cleanup complete so the
         caller can await acknowledgment. Fire-and-forget aborts omit rpc_id.
+
+        AR final-stage abort outputs (partial tokens) are attached to the
+        result message when ``rpc_id`` is set, or enqueued on
+        ``output_async_queue`` for fire-and-forget aborts.
         """
         request_ids = msg.request_ids
         error: str | None = None
+        abort_outputs: list[OutputMessage] = []
         try:
             # _cleanup_request_ids is CFG-aware: it expands aborted parents to
             # their companions and fails a deferred parent whose companion is
             # aborted before its output arrived.
-            await self._cleanup_request_ids(list(request_ids), abort=True)
+            abort_outputs = await self._cleanup_request_ids(list(request_ids), abort=True)
             logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
         except Exception as exc:
             error = str(exc)
@@ -823,8 +828,12 @@ class Orchestrator:
                     rpc_id=msg.rpc_id,
                     success=error is None,
                     error=error,
+                    abort_outputs=abort_outputs or None,
                 )
             )
+        elif abort_outputs:
+            for output_msg in abort_outputs:
+                await self.output_async_queue.put(output_msg)
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
         """Handle a midway interaction for an active streaming diffusion request."""
@@ -864,13 +873,55 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
+    async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
+        """Forward abort requests to all stage pools.
+
+        Collects final-stage AR abort outputs (partial tokens) while request
+        state is still available for stage-id filtering. Diffusion pools do
+        not contribute abort outputs.
+        """
         if not request_ids:
-            return
+            return []
+        abort_outputs: list[OutputMessage] = []
         for pool in self.stage_pools:
-            await pool.abort_requests(request_ids)
+            stage_outputs = await pool.abort_requests(request_ids) or []
+            if pool.final_output and pool.stage_type != "diffusion":
+                final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
+                for request_output in stage_outputs:
+                    req_id = getattr(request_output, "request_id", None)
+                    if req_id is None:
+                        continue
+                    req_state = self.request_states.get(req_id)
+                    if req_state is None:
+                        continue
+                    final_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+                    if pool.stage_id not in final_stage_ids:
+                        continue
+                    # Ensure RequestOutput.finished is set for terminal abort.
+                    if not getattr(request_output, "finished", False):
+                        try:
+                            request_output.finished = True
+                        except Exception:
+                            pass
+                    engine_output = OmniRequestOutput.from_pipeline(
+                        stage_id=pool.stage_id,
+                        final_output_type=final_output_type,
+                        request_output=request_output,
+                        replica_id=pool.get_bound_replica_id(req_id),
+                    )
+                    abort_outputs.append(
+                        OutputMessage(
+                            request_id=req_id,
+                            stage_id=pool.stage_id,
+                            replica_id=pool.get_bound_replica_id(req_id),
+                            engine_outputs=engine_output,
+                            metrics=None,
+                            finished=True,
+                            stage_submit_ts=req_state.stage_submit_ts.get(pool.stage_id),
+                        )
+                    )
             pool.release_bindings(request_ids)
+        return abort_outputs
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -1224,7 +1275,7 @@ class Orchestrator:
         *,
         abort: bool = False,
         close_duplex_sessions: bool = False,
-    ) -> None:
+    ) -> list[OutputMessage]:
         """Release pool bindings and logical request state for the given ids.
 
         CFG-aware: cleaning a parent releases its tracker state and pulls its
@@ -1233,9 +1284,13 @@ class Orchestrator:
         can never complete). Every teardown path (stage error, abort, replica
         loss, membership unregister) funnels through here, so tracker state
         cannot outlive its requests.
+
+        Returns:
+            Final-stage AR abort ``OutputMessage`` list when ``abort=True``;
+            otherwise an empty list.
         """
         if not request_ids:
-            return
+            return []
 
         cleanup_ids = list(dict.fromkeys(request_ids))
         batch = set(cleanup_ids)
@@ -1277,9 +1332,10 @@ class Orchestrator:
                 cleanup_ids.extend(stale_request_ids)
             cleanup_ids = list(dict.fromkeys(cleanup_ids))
 
+        abort_outputs: list[OutputMessage] = []
         try:
             if abort:
-                await self._abort_request_ids(cleanup_ids)
+                abort_outputs = await self._abort_request_ids(cleanup_ids)
             self._release_request_bindings(cleanup_ids)
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
@@ -1293,6 +1349,7 @@ class Orchestrator:
             raise
         if closing_session_ids and self.duplex_control_plane is not None:
             self.duplex_control_plane.finalize_closed_sessions(closing_session_ids)
+        return abort_outputs
 
     async def _apply_raw_terminal_stage_finish(
         self,

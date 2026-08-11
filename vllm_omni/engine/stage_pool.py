@@ -1175,14 +1175,23 @@ class StagePool:
 
     # ---- Stage-local control plane ----
 
-    async def abort_requests(self, request_ids: list[str]) -> None:
+    async def abort_requests(self, request_ids: list[str]) -> list[Any]:
         """Abort the given requests in this stage pool.
 
         Request-bound abort routing stays inside the pool because route affinity
         (``request_id -> replica_id``) is pool-owned.
+
+        For LLM (AR) stages, builds terminal abort ``RequestOutput`` objects from
+        output-processor state *before* EngineCore abort / OP cleanup so partial
+        tokens generated so far are preserved. Diffusion stages return no abort
+        outputs (whole-sample retry remains the diffusion recovery path).
+
+        Returns:
+            Abort ``RequestOutput`` list for AR stages (possibly empty); always
+            an empty list for diffusion.
         """
         if not request_ids:
-            return
+            return []
 
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
@@ -1192,18 +1201,29 @@ class StagePool:
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
+        abort_outputs: list[Any] = []
+        # Orchestrator / binding keys are external request IDs. InputProcessor
+        # assigns a distinct internal EngineCore request_id, so OP lookup must
+        # use internal=False. Collect abort outputs before EngineCore abort so
+        # partial tokens remain available (mirror upstream OutputProcessor).
+        is_diffusion = self.stage_type == "diffusion"
         for replica_id, replica_request_ids in request_ids_by_replica.items():
+            engine_abort_ids = list(replica_request_ids)
+            if not is_diffusion and self._output_processor is not None:
+                collect = getattr(self._output_processor, "abort_requests_collecting_outputs", None)
+                if collect is not None:
+                    engine_abort_ids, stage_outputs = collect(replica_request_ids, internal=False)
+                    abort_outputs.extend(stage_outputs)
+                else:
+                    aborted = self._output_processor.abort_requests(replica_request_ids, internal=False)
+                    if aborted:
+                        engine_abort_ids = list(aborted)
             client = self.clients[replica_id]
-            if client is None:
+            if client is None or not engine_abort_ids:
                 continue
-            await client.abort_requests_async(replica_request_ids)
+            await client.abort_requests_async(engine_abort_ids)
 
-        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
-        # would otherwise leak — aborted requests never produce a final
-        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
-        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
-        if all_aborted and self._output_processor is not None:
-            self._output_processor.abort_requests(all_aborted, internal=True)
+        return abort_outputs
 
     async def collective_rpc(
         self,
