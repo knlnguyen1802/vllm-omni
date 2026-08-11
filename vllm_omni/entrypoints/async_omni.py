@@ -1114,9 +1114,7 @@ class AsyncOmni(EngineClient, OmniBase):
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
-    def _split_stage_ids_by_type(
-        self, stage_ids: list[int] | None = None
-    ) -> tuple[list[int], list[int]]:
+    def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
         if stage_ids is None:
             stage_ids = list(range(len(self.engine.stage_clients)))
