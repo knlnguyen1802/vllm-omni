@@ -11,6 +11,8 @@ import pytest
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
+pytestmark = [pytest.mark.core_model]
+
 
 def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
@@ -133,9 +135,7 @@ def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
 def test_sleep_diffusion_only_skips_engine_core_collective_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["diffusion"])
-        omni._sleep_diffusion = AsyncMock(
-            return_value=[OmniACK(task_id="d", status="SUCCESS", stage_id=0, rank=0)]
-        )
+        omni._sleep_diffusion = AsyncMock(return_value=[OmniACK(task_id="d", status="SUCCESS", stage_id=0, rank=0)])
 
         await omni.sleep(level=1)
 
