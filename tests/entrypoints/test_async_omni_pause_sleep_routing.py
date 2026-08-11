@@ -101,6 +101,34 @@ def test_sleep_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
         assert any(ack.metadata.get("path") == "engine_core" for ack in acks if ack.stage_id == 0)
         assert CuMemTag.WEIGHTS.value in omni._sleeping_tags
         assert CuMemTag.KV_CACHE.value in omni._sleeping_tags
+        # Sleep gates frontend admission for the trainer resume contract.
+        assert omni._paused is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_blocks_admission_before_engine_core_rpc():
+    """Problem 3: _paused must be set before awaiting sleep RPC."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        paused_at_rpc: list[bool] = []
+
+        async def rpc_side_effect(**kwargs):
+            if kwargs.get("method") == "sleep":
+                paused_at_rpc.append(omni._paused)
+            return [True]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc_side_effect)
+
+        assert omni._paused is False
+        await omni.sleep(level=1, mode="abort")
+
+        assert paused_at_rpc == [True]
+        assert omni._paused is True
+        # Sleep must not also call pause_scheduler (EngineCore.sleep pauses).
+        assert all(c.kwargs.get("method") != "pause_scheduler" for c in omni.collective_rpc.await_args_list)
 
     asyncio.run(run())
 
@@ -109,6 +137,7 @@ def test_sleep_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
 def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
+        omni._paused = True
         omni._sleeping_tags = {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}
         diffusion_ack = OmniACK(task_id="diff", status="SUCCESS", stage_id=1, rank=0)
         omni._wake_diffusion = AsyncMock(return_value=[diffusion_ack])
@@ -126,6 +155,26 @@ def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
         omni._wake_diffusion.assert_awaited_once()
         assert {ack.stage_id for ack in acks} == {0, 1}
         assert not omni._sleeping_tags
+        # wake_up restores memory but does not resume frontend admission.
+        assert omni._paused is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_wake_up_does_not_resume_frontend_admission():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._paused = True
+        omni._sleeping_tags = {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}
+
+        await omni.wake_up()
+
+        assert omni._paused is True
+        assert not omni._sleeping_tags
+        # Explicit resume is required after sleep/wake.
+        await omni.resume_generation()
+        assert omni._paused is False
 
     asyncio.run(run())
 
@@ -143,5 +192,6 @@ def test_sleep_diffusion_only_skips_engine_core_collective_rpc():
             omni.collective_rpc.await_args_list
         )
         omni._sleep_diffusion.assert_awaited_once_with([0], 1)
+        assert omni._paused is True
 
     asyncio.run(run())
