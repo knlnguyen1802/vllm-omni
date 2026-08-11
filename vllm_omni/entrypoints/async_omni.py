@@ -1020,9 +1020,8 @@ class AsyncOmni(EngineClient, OmniBase):
     ) -> list[Any]:
         """Call an AR EngineCore helper via collective_rpc (orchestrator loop).
 
-        StagePool maps these method names to vLLM AsyncMPClient APIs
-        (``sleep_async``, ``pause_scheduler_async``, ...). Raises if any
-        replica reports failure.
+        StagePool resolves ``{method}_async`` on the AR client when present
+        (vLLM AsyncMPClient convention). Raises if any replica reports failure.
         """
         results = await self.collective_rpc(
             method=method,
