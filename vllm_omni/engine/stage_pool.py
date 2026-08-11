@@ -1213,7 +1213,16 @@ class StagePool:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
-        """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        """Dispatch a stage-scoped control-plane RPC to one physical route.
+
+        For AR/LLM stages, prefer the vLLM AsyncMPClient helper ``{method}_async``
+        when it exists (e.g. ``sleep`` → ``sleep_async`` → EngineCore.sleep).
+        That matches how AsyncLLM calls EngineCore, without maintaining a method
+        allowlist here.
+
+        Diffusion stages (and methods without a client ``*_async`` helper) keep
+        the worker ``collective_rpc_async`` path.
+        """
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
@@ -1222,6 +1231,17 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            # Avoid resolving collective_rpc → collective_rpc_async here; that
+            # helper is the worker fan-out entrypoint used in the fallback below.
+            if self.stage_type != "diffusion" and method != "collective_rpc":
+                client_method = getattr(client, f"{method}_async", None)
+                if callable(client_method):
+                    if args and kwargs:
+                        return await client_method(*args, **kwargs)
+                    if kwargs:
+                        return await client_method(**kwargs)
+                    return await client_method(*args)
+
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,
