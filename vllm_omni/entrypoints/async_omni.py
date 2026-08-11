@@ -1090,23 +1090,67 @@ class AsyncOmni(EngineClient, OmniBase):
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
+    def _split_stage_ids_by_type(
+        self, stage_ids: list[int] | None = None
+    ) -> tuple[list[int], list[int]]:
+        """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
+        if stage_ids is None:
+            stage_ids = list(range(len(self.engine.stage_clients)))
+        ar_stage_ids: list[int] = []
+        diffusion_stage_ids: list[int] = []
+        for sid in stage_ids:
+            client = self.engine.stage_clients[sid]
+            if getattr(client, "stage_type", "llm") == "diffusion":
+                diffusion_stage_ids.append(sid)
+            else:
+                ar_stage_ids.append(sid)
+        return ar_stage_ids, diffusion_stage_ids
+
     async def pause_generation(
         self,
         *,
         mode: PauseMode = "abort",
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
+        stage_ids: list[int] | None = None,
     ) -> None:
-        """Pause generation."""
+        """Pause generation, mirroring vLLM AsyncLLM.pause_generation.
+
+        1. Stop frontend admission (``_paused``).
+        2. For AR/LLM stages, call EngineCore.pause_scheduler via the
+           Orchestrator loop (abort/wait/keep + optional cache clear).
+        3. Diffusion stages have no EngineCore scheduler — only frontend
+           admission is paused for them.
+
+        Note: ``sleep()`` already pauses the AR scheduler internally (same as
+        vLLM EngineCore.sleep). Call this API when you need pause *without*
+        freeing GPU memory (e.g. weight sync).
+        """
+        if wait_for_inflight_requests:
+            mode = "wait"
+
         async with self._pause_cond:
             if self._paused:
                 return
             self._paused = True
 
-        # TODO: Implement request draining if wait_for_inflight_requests
+        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        if ar_stage_ids:
+            logger.info(
+                "[%s] Pausing AR stage(s) %s via EngineCore.pause_scheduler(mode=%s)",
+                self._name,
+                ar_stage_ids,
+                mode,
+            )
+            await self.engine.pause_scheduler_async(
+                stage_ids=ar_stage_ids,
+                mode=mode,
+                clear_cache=clear_cache,
+            )
 
+        # Frontend / sender-side cache clear (P0). EngineCore.pause_scheduler
+        # already clears AR-side caches when clear_cache=True.
         if clear_cache:
-            # Clear caches for all stages.
             await self.reset_prefix_cache(
                 reset_running_requests=not wait_for_inflight_requests,
                 reset_connector=True,
@@ -1114,14 +1158,19 @@ class AsyncOmni(EngineClient, OmniBase):
             await self.reset_mm_cache()
             await self.reset_encoder_cache()
 
-    async def resume_generation(self) -> None:
-        """Resume generation."""
+    async def resume_generation(self, stage_ids: list[int] | None = None) -> None:
+        """Resume generation after :meth:`pause_generation`."""
+        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        if ar_stage_ids:
+            logger.info("[%s] Resuming AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
+            await self.engine.resume_scheduler_async(stage_ids=ar_stage_ids)
+
         async with self._pause_cond:
             self._paused = False
             self._pause_cond.notify_all()
 
     async def is_paused(self) -> bool:
-        """Check if paused."""
+        """Check if frontend admission is paused."""
         async with self._pause_cond:
             return self._paused
 
@@ -1179,33 +1228,44 @@ class AsyncOmni(EngineClient, OmniBase):
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
     ) -> list[OmniACK]:
-        self._final_output_handler()
-        if stage_ids is None:
-            stage_ids = list(range(len(self.engine.stage_clients)))
-        total_workers = 0
-        for sid in stage_ids:
-            client = self.engine.stage_clients[sid]
-            # During the Diffusion phase, regardless of the TP amount,
-            # currently only a summary ACK is reported at Rank 0.
-            if getattr(client, "stage_type", "") == "diffusion":
-                total_workers += 1
-            else:
-                config = self.engine.stage_vllm_configs[sid]
-                actual_tp = config.parallel_config.tensor_parallel_size if config else 1
-                total_workers += actual_tp
+        """Put stages to sleep.
 
-        task_id = str(uuid.uuid4())
-        self.event_resolver.watch_task(task_id, expected_count=total_workers)
-        logger.info(f"[{self._name}] Sleep initiated (Task: {task_id}). Awaiting {total_workers} ACKs...")
-        task = OmniSleepTask(level=level, task_id=task_id)
-        rpc_results = await self.collective_rpc(method="handle_sleep_task", args=(task,), stage_ids=stage_ids)
-        final_acks = []
-        for stage_res in rpc_results:
-            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
-            for ack in worker_acks:
-                if ack is not None:
-                    await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
+        AR/LLM stages use EngineCore.sleep (pause scheduler, wait idle, then
+        offload/discard memory) — matching vLLM AsyncLLM.sleep.
+
+        Diffusion stages keep the existing worker-level handle_sleep_task RPC
+        because StageDiffusionProc does not expose EngineCore.pause_scheduler.
+        """
+        self._final_output_handler()
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+
+        final_acks: list[OmniACK] = []
+        if ar_stage_ids:
+            logger.info(
+                "[%s] Sleeping AR stage(s) %s via EngineCore.sleep(level=%s, mode=%s)",
+                self._name,
+                ar_stage_ids,
+                level,
+                mode,
+            )
+            await self.engine.sleep_async(stage_ids=ar_stage_ids, level=level, mode=mode)
+            # EngineCore.sleep has no OmniACK handshake; emit stage-level SUCCESS
+            # markers so callers/tests that count ACKs keep a stable API.
+            task_id = f"engine_core-sleep-{uuid.uuid4().hex[:8]}"
+            final_acks.extend(
+                OmniACK(
+                    task_id=task_id,
+                    status="SUCCESS",
+                    stage_id=sid,
+                    rank=0,
+                    metadata={"path": "engine_core", "level": level, "mode": mode},
+                )
+                for sid in ar_stage_ids
+            )
+
+        if diffusion_stage_ids:
+            final_acks.extend(await self._sleep_diffusion(diffusion_stage_ids, level))
+
         if not hasattr(self, "_sleeping_tags"):
             self._sleeping_tags = set()
         self._sleeping_tags.update([CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value])
@@ -1213,7 +1273,30 @@ class AsyncOmni(EngineClient, OmniBase):
             self._level2_sleeping = True
         return final_acks
 
+    async def _sleep_diffusion(self, stage_ids: list[int], level: int) -> list[OmniACK]:
+        """Worker-level sleep RPC for diffusion stages only."""
+        # Diffusion reports one summary ACK at rank 0 regardless of TP.
+        total_workers = len(stage_ids)
+        task_id = str(uuid.uuid4())
+        self.event_resolver.watch_task(task_id, expected_count=total_workers)
+        logger.info("[%s] Sleep (diffusion) initiated (Task: %s).", self._name, task_id)
+        task = OmniSleepTask(level=level, task_id=task_id)
+        rpc_results = await self.collective_rpc(method="handle_sleep_task", args=(task,), stage_ids=stage_ids)
+        final_acks: list[OmniACK] = []
+        for stage_res in rpc_results:
+            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
+            for ack in worker_acks:
+                if ack is not None:
+                    await self.event_resolver.resolve(ack)
+                    final_acks.append(ack)
+        return final_acks
+
     async def wake_up(self, stage_ids: list[int] | None = None, tags: list[str] | None = None) -> list[OmniACK]:
+        """Wake stages after sleep.
+
+        AR/LLM stages use EngineCore.wake_up (restore memory, auto-resume
+        scheduler). Diffusion stages keep the worker-level wake RPC.
+        """
         self._final_output_handler()
 
         if getattr(self, "_level2_sleeping", False):
@@ -1232,30 +1315,26 @@ class AsyncOmni(EngineClient, OmniBase):
             logger.info(f"[{self._name}] Requested tags {tags} are already warm. Skipping wake_up.")
             return []
 
-        if stage_ids is None:
-            stage_ids = list(range(len(self.engine.stage_clients)))
-        total_workers = 0
-        for sid in stage_ids:
-            client = self.engine.stage_clients[sid]
-            if getattr(client, "stage_type", "") == "diffusion":
-                total_workers += 1
-            else:
-                config = self.engine.stage_vllm_configs[sid]
-                total_workers += config.parallel_config.tensor_parallel_size if config else 1
-        task_id = str(uuid.uuid4())
-        self.event_resolver.watch_task(task_id, expected_count=total_workers)
-        logger.info(f"[{self._name}] Wake-up initiated (Task: {task_id}). Awaiting {total_workers} ACKs...")
-        task = OmniWakeTask(tags=requested_tags, task_id=task_id)
-        rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
-        final_acks = []
-        for stage_res in rpc_results:
-            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
-            for ack in worker_acks:
-                if ack is not None:
-                    await self.event_resolver.resolve(ack)
-                    final_acks.append(ack)
-        current_omni_platform.synchronize()
-        await asyncio.sleep(0.1)
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+
+        final_acks: list[OmniACK] = []
+        if ar_stage_ids:
+            logger.info("[%s] Waking AR stage(s) %s via EngineCore", self._name, ar_stage_ids)
+            await self.engine.wake_up_async(stage_ids=ar_stage_ids, tags=requested_tags)
+            task_id = f"engine_core-wake-{uuid.uuid4().hex[:8]}"
+            final_acks.extend(
+                OmniACK(
+                    task_id=task_id,
+                    status="SUCCESS",
+                    stage_id=sid,
+                    rank=0,
+                    metadata={"path": "engine_core", "tags": list(requested_tags)},
+                )
+                for sid in ar_stage_ids
+            )
+
+        if diffusion_stage_ids:
+            final_acks.extend(await self._wake_diffusion(diffusion_stage_ids, requested_tags))
 
         for t in requested_tags:
             if hasattr(self, "_sleeping_tags"):
@@ -1264,7 +1343,26 @@ class AsyncOmni(EngineClient, OmniBase):
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
         if not getattr(self, "_sleeping_tags", None):
             self._level2_sleeping = False
-        logger.info(f"[{self._name}] All {len(final_acks)}/{total_workers} workers reported WARM for task {task_id}.")
+        logger.info("[%s] Wake-up complete for stage(s) %s.", self._name, stage_ids)
+        return final_acks
+
+    async def _wake_diffusion(self, stage_ids: list[int], requested_tags: list[str]) -> list[OmniACK]:
+        """Worker-level wake RPC for diffusion stages only."""
+        total_workers = len(stage_ids)
+        task_id = str(uuid.uuid4())
+        self.event_resolver.watch_task(task_id, expected_count=total_workers)
+        logger.info("[%s] Wake-up (diffusion) initiated (Task: %s).", self._name, task_id)
+        task = OmniWakeTask(tags=requested_tags, task_id=task_id)
+        rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
+        final_acks: list[OmniACK] = []
+        for stage_res in rpc_results:
+            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
+            for ack in worker_acks:
+                if ack is not None:
+                    await self.event_resolver.resolve(ack)
+                    final_acks.append(ack)
+        current_omni_platform.synchronize()
+        await asyncio.sleep(0.1)
         return final_acks
 
     async def is_sleeping(self) -> bool:
