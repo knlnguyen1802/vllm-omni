@@ -1259,7 +1259,20 @@ class AsyncOmni(EngineClient, OmniBase):
 
         Diffusion stages keep the existing worker-level handle_sleep_task RPC
         because StageDiffusionProc does not expose EngineCore.pause_scheduler.
+
+        Frontend admission is blocked at the start of this call (``_paused``)
+        so pipelined :meth:`generate` cannot race into stages while sleep is
+        in flight. This does **not** invoke EngineCore.pause_scheduler again
+        (sleep already pauses the AR scheduler). ``wake_up`` does **not** clear
+        ``_paused``; callers must :meth:`resume_generation` when ready
+        (typical trainer order: pause → abort → sleep → train → wake → resume).
         """
+        # Block admission before any sleep RPC so generate() waits on
+        # _pause_cond during the drain/offload window. EngineCore.sleep will
+        # pause the AR scheduler itself; avoid a second pause_scheduler here.
+        async with self._pause_cond:
+            self._paused = True
+
         self._final_output_handler()
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
 
@@ -1324,6 +1337,10 @@ class AsyncOmni(EngineClient, OmniBase):
 
         AR/LLM stages use EngineCore.wake_up (restore memory, auto-resume
         scheduler). Diffusion stages keep the worker-level wake RPC.
+
+        Does **not** clear the frontend ``_paused`` admission gate set by
+        :meth:`sleep` / :meth:`pause_generation`. Call :meth:`resume_generation`
+        when the trainer is ready to admit new requests.
         """
         self._final_output_handler()
 
