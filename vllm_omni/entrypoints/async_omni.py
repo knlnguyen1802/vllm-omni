@@ -1080,7 +1080,12 @@ class AsyncOmni(EngineClient, OmniBase):
         await self._abort(internal_req_ids)
 
     async def _abort(self, request_ids: list[str]) -> None:
-        """Submit request IDs to be aborted to the engine."""
+        """Abort request IDs via the engine and clean frontend state after ack.
+
+        Waits for orchestrator abort acknowledgment before popping
+        ``request_states`` so generate() cleanup stays consistent with
+        backend binding/request teardown. Orchestrator abort errors propagate.
+        """
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
             state = self.request_states.pop(rid, None)
