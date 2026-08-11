@@ -1240,6 +1240,57 @@ class StagePool:
                 "error": str(exc),
             }
 
+    def _require_engine_core_client(self, replica_id: int) -> Any:
+        """Return a live EngineCore-backed client, or raise for diffusion/missing."""
+        if self.stage_type == "diffusion":
+            raise RuntimeError(
+                f"stage {self.stage_id} is diffusion and has no EngineCore pause/sleep path"
+            )
+        client = self.clients[replica_id]
+        if client is None:
+            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        return client
+
+    async def pause_scheduler_async(self, mode: str = "abort", clear_cache: bool = True) -> None:
+        """Pause EngineCore schedulers for every live AR replica in this pool."""
+        for replica_id in self.live_replica_ids():
+            client = self._require_engine_core_client(replica_id)
+            await client.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+
+    async def resume_scheduler_async(self) -> None:
+        """Resume EngineCore schedulers for every live AR replica in this pool."""
+        for replica_id in self.live_replica_ids():
+            client = self._require_engine_core_client(replica_id)
+            await client.resume_scheduler_async()
+
+    async def sleep_async(self, level: int = 1, mode: str = "abort") -> None:
+        """Sleep via EngineCore.sleep (pause scheduler, then offload/discard memory)."""
+        for replica_id in self.live_replica_ids():
+            client = self._require_engine_core_client(replica_id)
+            await client.sleep_async(level, mode)
+
+    async def wake_up_async(self, tags: list[str] | None = None) -> None:
+        """Wake via EngineCore.wake_up (restore memory, resume scheduler when ready)."""
+        for replica_id in self.live_replica_ids():
+            client = self._require_engine_core_client(replica_id)
+            await client.wake_up_async(tags)
+
+    async def is_scheduler_paused_async(self) -> bool:
+        """True if any live AR replica reports a paused EngineCore scheduler."""
+        paused = False
+        for replica_id in self.live_replica_ids():
+            client = self._require_engine_core_client(replica_id)
+            paused = paused or bool(await client.is_scheduler_paused_async())
+        return paused
+
+    async def is_sleeping_async(self) -> bool:
+        """True if any live AR replica reports EngineCore sleeping."""
+        sleeping = False
+        for replica_id in self.live_replica_ids():
+            client = self._require_engine_core_client(replica_id)
+            sleeping = sleeping or bool(await client.is_sleeping_async())
+        return sleeping
+
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""
         if replica_id >= len(self.clients):
