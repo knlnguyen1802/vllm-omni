@@ -1205,6 +1205,20 @@ class StagePool:
         if all_aborted and self._output_processor is not None:
             self._output_processor.abort_requests(all_aborted, internal=True)
 
+    # vLLM AsyncMPClient helpers that must run against EngineCore (not workers).
+    # For AR stages, collective_rpc(method=...) maps to these client APIs.
+    # Diffusion stages keep the normal worker collective_rpc path.
+    _ENGINE_CORE_CLIENT_METHODS = frozenset(
+        {
+            "sleep",
+            "wake_up",
+            "pause_scheduler",
+            "resume_scheduler",
+            "is_scheduler_paused",
+            "is_sleeping",
+        }
+    )
+
     async def collective_rpc(
         self,
         replica_id: int,
@@ -1213,7 +1227,13 @@ class StagePool:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
-        """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        """Dispatch a stage-scoped control-plane RPC to one physical route.
+
+        For AR/LLM stages, methods matching vLLM AsyncMPClient helpers
+        (``sleep``, ``pause_scheduler``, ...) call ``client.sleep_async`` /
+        ``pause_scheduler_async`` etc. so EngineCore can pause before offload.
+        All other methods (and all diffusion methods) use worker collective_rpc.
+        """
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
@@ -1222,6 +1242,8 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            if self.stage_type != "diffusion" and method in self._ENGINE_CORE_CLIENT_METHODS:
+                return await self._call_engine_core_client(client, method, args, kwargs)
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,
@@ -1240,56 +1262,36 @@ class StagePool:
                 "error": str(exc),
             }
 
-    def _require_engine_core_client(self, replica_id: int) -> Any:
-        """Return a live EngineCore-backed client, or raise for diffusion/missing."""
-        if self.stage_type == "diffusion":
-            raise RuntimeError(
-                f"stage {self.stage_id} is diffusion and has no EngineCore pause/sleep path"
-            )
-        client = self.clients[replica_id]
-        if client is None:
-            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
-        return client
-
-    async def pause_scheduler_async(self, mode: str = "abort", clear_cache: bool = True) -> None:
-        """Pause EngineCore schedulers for every live AR replica in this pool."""
-        for replica_id in self.live_replica_ids():
-            client = self._require_engine_core_client(replica_id)
-            await client.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
-
-    async def resume_scheduler_async(self) -> None:
-        """Resume EngineCore schedulers for every live AR replica in this pool."""
-        for replica_id in self.live_replica_ids():
-            client = self._require_engine_core_client(replica_id)
-            await client.resume_scheduler_async()
-
-    async def sleep_async(self, level: int = 1, mode: str = "abort") -> None:
-        """Sleep via EngineCore.sleep (pause scheduler, then offload/discard memory)."""
-        for replica_id in self.live_replica_ids():
-            client = self._require_engine_core_client(replica_id)
+    @staticmethod
+    async def _call_engine_core_client(
+        client: Any,
+        method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Map collective_rpc method names to vLLM AsyncMPClient EngineCore APIs."""
+        if method == "sleep":
+            level = args[0] if args else kwargs.get("level", 1)
+            mode = args[1] if len(args) > 1 else kwargs.get("mode", "abort")
             await client.sleep_async(level, mode)
-
-    async def wake_up_async(self, tags: list[str] | None = None) -> None:
-        """Wake via EngineCore.wake_up (restore memory, resume scheduler when ready)."""
-        for replica_id in self.live_replica_ids():
-            client = self._require_engine_core_client(replica_id)
+            return True
+        if method == "wake_up":
+            tags = args[0] if args else kwargs.get("tags")
             await client.wake_up_async(tags)
-
-    async def is_scheduler_paused_async(self) -> bool:
-        """True if any live AR replica reports a paused EngineCore scheduler."""
-        paused = False
-        for replica_id in self.live_replica_ids():
-            client = self._require_engine_core_client(replica_id)
-            paused = paused or bool(await client.is_scheduler_paused_async())
-        return paused
-
-    async def is_sleeping_async(self) -> bool:
-        """True if any live AR replica reports EngineCore sleeping."""
-        sleeping = False
-        for replica_id in self.live_replica_ids():
-            client = self._require_engine_core_client(replica_id)
-            sleeping = sleeping or bool(await client.is_sleeping_async())
-        return sleeping
+            return True
+        if method == "pause_scheduler":
+            mode = kwargs.get("mode", args[0] if args else "abort")
+            clear_cache = kwargs.get("clear_cache", args[1] if len(args) > 1 else True)
+            await client.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
+            return True
+        if method == "resume_scheduler":
+            await client.resume_scheduler_async()
+            return True
+        if method == "is_scheduler_paused":
+            return await client.is_scheduler_paused_async()
+        if method == "is_sleeping":
+            return await client.is_sleeping_async()
+        raise ValueError(f"unsupported EngineCore client method: {method}")
 
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""

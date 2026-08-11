@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -26,12 +26,9 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni.engine = SimpleNamespace(
         stage_clients=stage_clients,
         stage_vllm_configs=[None] * len(stage_types),
-        pause_scheduler_async=AsyncMock(),
-        resume_scheduler_async=AsyncMock(),
-        sleep_async=AsyncMock(),
-        wake_up_async=AsyncMock(),
+        collective_rpc_async=AsyncMock(return_value=[True]),
     )
-    omni.collective_rpc = AsyncMock(return_value=[])
+    omni.collective_rpc = AsyncMock(return_value=[True])
     return omni
 
 
@@ -44,7 +41,7 @@ def test_split_stage_ids_by_type():
 
 
 @pytest.mark.cpu
-def test_pause_generation_routes_ar_to_engine_core():
+def test_pause_generation_routes_ar_via_collective_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
         omni.reset_prefix_cache = AsyncMock(return_value=True)
@@ -54,13 +51,12 @@ def test_pause_generation_routes_ar_to_engine_core():
         await omni.pause_generation(mode="abort", clear_cache=True)
 
         assert omni._paused is True
-        omni.engine.pause_scheduler_async.assert_awaited_once_with(
+        omni.collective_rpc.assert_awaited_once_with(
+            method="pause_scheduler",
+            args=(),
+            kwargs={"mode": "abort", "clear_cache": True},
             stage_ids=[0],
-            mode="abort",
-            clear_cache=True,
         )
-        # Diffusion has no EngineCore pause path; only frontend gate applies.
-        assert omni.engine.pause_scheduler_async.await_args.kwargs["stage_ids"] == [0]
 
     asyncio.run(run())
 
@@ -73,14 +69,19 @@ def test_resume_generation_resumes_ar_then_clears_frontend_pause():
 
         await omni.resume_generation()
 
-        omni.engine.resume_scheduler_async.assert_awaited_once_with(stage_ids=[0])
+        omni.collective_rpc.assert_awaited_once_with(
+            method="resume_scheduler",
+            args=(),
+            kwargs=None,
+            stage_ids=[0],
+        )
         assert omni._paused is False
 
     asyncio.run(run())
 
 
 @pytest.mark.cpu
-def test_sleep_routes_ar_to_engine_core_and_diffusion_to_worker_rpc():
+def test_sleep_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
         diffusion_ack = OmniACK(task_id="diff", status="SUCCESS", stage_id=1, rank=0)
@@ -88,7 +89,12 @@ def test_sleep_routes_ar_to_engine_core_and_diffusion_to_worker_rpc():
 
         acks = await omni.sleep(stage_ids=[0, 1], level=1, mode="abort")
 
-        omni.engine.sleep_async.assert_awaited_once_with(stage_ids=[0], level=1, mode="abort")
+        omni.collective_rpc.assert_awaited_once_with(
+            method="sleep",
+            args=(1, "abort"),
+            kwargs=None,
+            stage_ids=[0],
+        )
         omni._sleep_diffusion.assert_awaited_once_with([1], 1)
         assert {ack.stage_id for ack in acks} == {0, 1}
         assert any(ack.metadata.get("path") == "engine_core" for ack in acks if ack.stage_id == 0)
@@ -99,7 +105,7 @@ def test_sleep_routes_ar_to_engine_core_and_diffusion_to_worker_rpc():
 
 
 @pytest.mark.cpu
-def test_wake_up_routes_ar_to_engine_core_and_diffusion_to_worker_rpc():
+def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
         omni._sleeping_tags = {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}
@@ -108,8 +114,14 @@ def test_wake_up_routes_ar_to_engine_core_and_diffusion_to_worker_rpc():
 
         acks = await omni.wake_up(stage_ids=[0, 1])
 
-        omni.engine.wake_up_async.assert_awaited_once()
-        assert omni.engine.wake_up_async.await_args.kwargs["stage_ids"] == [0]
+        omni.collective_rpc.assert_awaited_once()
+        wake_kwargs = omni.collective_rpc.await_args.kwargs
+        assert wake_kwargs["method"] == "wake_up"
+        assert wake_kwargs["stage_ids"] == [0]
+        assert set(wake_kwargs["kwargs"]["tags"]) == {
+            CuMemTag.WEIGHTS.value,
+            CuMemTag.KV_CACHE.value,
+        }
         omni._wake_diffusion.assert_awaited_once()
         assert {ack.stage_id for ack in acks} == {0, 1}
         assert not omni._sleeping_tags
@@ -118,7 +130,7 @@ def test_wake_up_routes_ar_to_engine_core_and_diffusion_to_worker_rpc():
 
 
 @pytest.mark.cpu
-def test_sleep_diffusion_only_skips_engine_core():
+def test_sleep_diffusion_only_skips_engine_core_collective_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["diffusion"])
         omni._sleep_diffusion = AsyncMock(
@@ -127,7 +139,10 @@ def test_sleep_diffusion_only_skips_engine_core():
 
         await omni.sleep(level=1)
 
-        omni.engine.sleep_async.assert_not_awaited()
+        # AR EngineCore sleep path must not run for diffusion-only.
+        assert call(method="sleep", args=(1, "abort"), kwargs=None, stage_ids=[0]) not in (
+            omni.collective_rpc.await_args_list
+        )
         omni._sleep_diffusion.assert_awaited_once_with([0], 1)
 
     asyncio.run(run())
