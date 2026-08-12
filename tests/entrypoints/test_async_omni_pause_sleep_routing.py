@@ -16,7 +16,6 @@ pytestmark = [pytest.mark.core_model]
 
 def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
-    omni._name = "AsyncOmni"
     omni._pause_cond = asyncio.Condition()
     omni._paused = False
     omni._sleeping_tags = set()
