@@ -22,19 +22,24 @@ from vllm_omni.diffusion.models.schedulers import FlowMatchEulerDiscreteSchedule
 MARKER_ENV_VAR = "VLLM_OMNI_CUSTOM_SCHEDULER_MARKER"
 
 
+def mark_scheduler_event(event: str) -> None:
+    """Append ``event`` to the marker file named by ``MARKER_ENV_VAR``.
+
+    No-op when the env var is unset, so instrumented schedulers can be reused
+    by tests that do not care about the marker file.
+    """
+    path = os.environ.get(MARKER_ENV_VAR)
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{event}\n")
+
+
 class FlowMatchEulerDiscreteSchedulerForTest(FlowMatchEulerDiscreteScheduler):
     """Stock flow-match Euler scheduler that proves it was used via a marker file."""
 
-    @staticmethod
-    def _mark(event: str) -> None:
-        path = os.environ.get(MARKER_ENV_VAR)
-        if path:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(f"{event}\n")
-
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        cls._mark("constructed")
+        mark_scheduler_event("constructed")
         return super().from_pretrained(*args, **kwargs)
 
     # Keep the parent parameter names. Qwen-Image / Flux / SD3 call
@@ -42,10 +47,10 @@ class FlowMatchEulerDiscreteSchedulerForTest(FlowMatchEulerDiscreteScheduler):
     # signature is only (*args, **kwargs) — they look for a named ``sigmas``.
     @wraps(FlowMatchEulerDiscreteScheduler.set_timesteps)
     def set_timesteps(self, *args, **kwargs):
-        type(self)._mark("set_timesteps")
+        mark_scheduler_event("set_timesteps")
         return super().set_timesteps(*args, **kwargs)
 
     @wraps(FlowMatchEulerDiscreteScheduler.step)
     def step(self, *args, **kwargs):
-        type(self)._mark("stepped")
+        mark_scheduler_event("stepped")
         return super().step(*args, **kwargs)

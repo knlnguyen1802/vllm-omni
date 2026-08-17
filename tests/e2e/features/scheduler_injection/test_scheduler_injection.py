@@ -4,9 +4,10 @@
 """E2E tests for diffusion scheduler injection (``OmniDiffusionConfig.scheduler``).
 
 Validates that setting ``scheduler`` to a dotted scheduler class path injects
-that scheduler into the stock pipeline — no ``custom_pipeline_args`` needed —
-and that omitting it keeps the pipeline's default scheduler (the default
-construction path must stay bit-identical).
+that scheduler (here, the verl-omni SDE sampler) into the stock pipeline —
+no ``custom_pipeline_args`` needed — and that omitting it keeps the
+pipeline's default scheduler (the default construction path must stay
+bit-identical).
 """
 
 from __future__ import annotations
@@ -23,7 +24,9 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
-INJECTED_SCHEDULER = "tests.e2e.features.helpers.custom_scheduler.FlowMatchEulerDiscreteSchedulerForTest"
+# verl-omni-style SDE sampler (log-probs in step). Injection must use this
+# class on the stock Qwen-Image pipeline — no custom_pipeline_args.
+INJECTED_SCHEDULER = "tests.e2e.features.helpers.custom_pipeline.FlowMatchSDEDiscreteSchedulerForTest"
 
 # Same tiny random model as the custom_pipeline e2e tests.
 MODEL = "tiny-random/Qwen-Image"
@@ -77,7 +80,7 @@ def _assert_valid_image_output(output: OmniRequestOutput) -> None:
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_scheduler_injection_uses_injected_scheduler(tmp_path, monkeypatch):
-    """``scheduler=<dotted path>`` must construct and step the injected class."""
+    """``scheduler=<dotted path>`` must construct and step the injected SDE class."""
     marker = tmp_path / "scheduler_events.txt"
     monkeypatch.setenv(MARKER_ENV_VAR, str(marker))
 
