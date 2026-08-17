@@ -15,6 +15,7 @@ a cross-process observable.
 from __future__ import annotations
 
 import os
+from functools import wraps
 
 from vllm_omni.diffusion.models.schedulers import FlowMatchEulerDiscreteScheduler
 
@@ -36,10 +37,15 @@ class FlowMatchEulerDiscreteSchedulerForTest(FlowMatchEulerDiscreteScheduler):
         cls._mark("constructed")
         return super().from_pretrained(*args, **kwargs)
 
+    # Keep the parent parameter names. Qwen-Image / Flux / SD3 call
+    # inspect.signature(scheduler.set_timesteps) and reject wrappers whose
+    # signature is only (*args, **kwargs) — they look for a named ``sigmas``.
+    @wraps(FlowMatchEulerDiscreteScheduler.set_timesteps)
     def set_timesteps(self, *args, **kwargs):
         type(self)._mark("set_timesteps")
         return super().set_timesteps(*args, **kwargs)
 
+    @wraps(FlowMatchEulerDiscreteScheduler.step)
     def step(self, *args, **kwargs):
         type(self)._mark("stepped")
         return super().step(*args, **kwargs)

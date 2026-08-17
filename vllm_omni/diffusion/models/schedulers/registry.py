@@ -19,7 +19,12 @@ pipelines already rely on (diffusers-style):
   with ``return_dict=False`` it must return a tuple whose first element is
   the stepped latents. ``generator`` is only passed when not ``None``.
 * ``set_timesteps(num_inference_steps, device=...)`` and expose
-  ``.timesteps`` afterwards.
+  ``.timesteps`` afterwards. Named parameters must be preserved:
+  Qwen-Image / Flux / SD3 (and other ``retrieve_timesteps`` pipelines)
+  inspect ``scheduler.set_timesteps`` for ``sigmas`` / ``timesteps``.
+  Overriding with ``def set_timesteps(self, *args, **kwargs)`` hides
+  those names and fails dummy warmup with "does not support custom
+  sigmas schedules".
 * ``set_begin_index(...)`` for pipeline-parallel timestep slicing.
 * a ``.config`` attribute (diffusers ``ConfigMixin``-style) carrying at
   least ``num_train_timesteps``.

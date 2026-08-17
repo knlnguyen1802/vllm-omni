@@ -266,3 +266,17 @@ class TestSchedulerContract:
         # injected schedulers are held to (it is deep-copied per request in
         # step-wise execution).
         assert_scheduler_contract(FlowMatchEulerDiscreteScheduler())
+
+    def test_set_timesteps_advertises_sigmas_for_retrieve_timesteps(self):
+        # Qwen-Image always synthesizes a custom sigma schedule, then
+        # retrieve_timesteps inspects set_timesteps for a named ``sigmas``.
+        scheduler = FlowMatchEulerDiscreteScheduler()
+        assert "sigmas" in inspect.signature(scheduler.set_timesteps).parameters
+
+    def test_e2e_helper_preserves_sigmas_on_set_timesteps(self):
+        from tests.e2e.features.helpers.custom_scheduler import FlowMatchEulerDiscreteSchedulerForTest
+
+        scheduler = FlowMatchEulerDiscreteSchedulerForTest()
+        params = inspect.signature(scheduler.set_timesteps).parameters
+        assert "sigmas" in params
+        assert "timesteps" in params
