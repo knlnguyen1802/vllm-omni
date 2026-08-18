@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -1175,14 +1175,98 @@ class StagePool:
 
     # ---- Stage-local control plane ----
 
-    async def abort_requests(self, request_ids: list[str]) -> None:
+    def _abort_output_processor_requests(self, request_ids: list[str]) -> list[Any]:
+        """Create terminal abort outputs for OutputProcessor-tracked requests.
+
+        Upstream ``OutputProcessor.abort_requests`` only enqueues a client abort
+        output when ``RequestState.queue`` is set. Omni registers AR requests
+        with ``queue=None`` and routes through ``process_outputs()``, so abort
+        must synthesize ``FinishReason.ABORT`` EngineCoreOutputs here. That
+        preserves cumulative generated tokens even when no replica binding
+        exists yet.
+        """
+        processor = self._output_processor
+        if processor is None:
+            return []
+        request_states = getattr(processor, "request_states", None)
+        if not request_states:
+            return []
+
+        op_ids = [request_id for request_id in request_ids if request_id in request_states]
+        if not op_ids:
+            return []
+
+        abort_core_outputs = [
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ABORT,
+            )
+            for request_id in op_ids
+        ]
+        processed = processor.process_outputs(abort_core_outputs)
+        return list(getattr(processed, "request_outputs", None) or [])
+
+    async def _pause_live_replicas(self, replica_ids: list[int]) -> None:
+        """Pause AR EngineCore schedulers on the given replicas.
+
+        Mirrors the ``{method}_async`` helper resolution used by
+        :meth:`collective_rpc` for AR stages (vLLM AsyncMPClient convention).
+        Diffusion stages have no EngineCore scheduler and never reach here.
+        """
+        for replica_id in replica_ids:
+            client = self.clients[replica_id] if replica_id < len(self.clients) else None
+            if client is None:
+                continue
+            pause = getattr(client, "pause_scheduler_async", None)
+            if not callable(pause):
+                logger.warning(
+                    "[StagePool] pause: stage-%s replica-%s client has no pause_scheduler_async; skipping",
+                    self.stage_id,
+                    replica_id,
+                )
+                continue
+            await pause(mode="abort", clear_cache=False)
+
+    async def abort_requests(self, request_ids: list[str], *, pause: bool = False) -> list[Any]:
         """Abort the given requests in this stage pool.
 
         Request-bound abort routing stays inside the pool because route affinity
-        (``request_id -> replica_id``) is pool-owned.
+        (``request_id -> replica_id``) is pool-owned. Backend engine abort RPCs
+        stay limited to requests with a live replica binding. Abort outputs are
+        still created for every requested ID that has OutputProcessor state,
+        including requests whose route binding has not been installed yet.
+
+        For LLM (AR) stages, builds terminal abort ``RequestOutput`` objects from
+        output-processor state *before* EngineCore abort / OP cleanup so partial
+        tokens generated so far are preserved. Diffusion stages return no abort
+        outputs (whole-sample retry remains the diffusion recovery path).
+
+        When ``pause`` is set, AR EngineCore schedulers are paused with
+        ``mode="abort", clear_cache=False`` after the aborts: every live
+        replica for an empty request list (bulk abort + pause), or the
+        replicas bound to the aborted requests otherwise. Diffusion stages
+        have no EngineCore scheduler and are never paused.
+
+        Returns:
+            Abort ``RequestOutput`` list for AR stages (possibly empty); always
+            an empty list for diffusion.
         """
-        if not request_ids:
-            return
+        if not request_ids and not pause:
+            return []
+
+        stage_client = self.stage_client
+        is_diffusion = getattr(stage_client, "stage_type", None) == "diffusion"
+
+        # Orchestrator / binding keys are external request IDs. InputProcessor
+        # may assign a distinct internal EngineCore request_id; the direct
+        # OP-state sweep below covers IDs registered under their own key
+        # (including requests with no replica binding yet), while the
+        # per-replica ``abort_requests_collecting_outputs`` call maps external
+        # IDs to internal EngineCore IDs via ``internal=False``. Both collect
+        # abort outputs *before* the EngineCore abort so partial tokens remain
+        # available (mirror upstream OutputProcessor).
+        abort_outputs: list[Any] = [] if is_diffusion else self._abort_output_processor_requests(request_ids)
 
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
@@ -1193,17 +1277,22 @@ class StagePool:
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
         for replica_id, replica_request_ids in request_ids_by_replica.items():
+            engine_abort_ids = list(replica_request_ids)
+            if not is_diffusion and self._output_processor is not None:
+                collect = getattr(self._output_processor, "abort_requests_collecting_outputs", None)
+                if collect is not None:
+                    engine_abort_ids, stage_outputs = collect(replica_request_ids, internal=False)
+                    abort_outputs.extend(stage_outputs)
             client = self.clients[replica_id]
-            if client is None:
+            if client is None or not engine_abort_ids:
                 continue
-            await client.abort_requests_async(replica_request_ids)
+            await client.abort_requests_async(engine_abort_ids)
 
-        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
-        # would otherwise leak — aborted requests never produce a final
-        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
-        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
-        if all_aborted and self._output_processor is not None:
-            self._output_processor.abort_requests(all_aborted, internal=True)
+        if pause and not is_diffusion:
+            replica_ids = sorted(request_ids_by_replica) if request_ids else self.live_replica_ids()
+            await self._pause_live_replicas(replica_ids)
+
+        return abort_outputs
 
     async def collective_rpc(
         self,
@@ -1222,6 +1311,15 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            if self.stage_type != "diffusion" and method != "collective_rpc":
+                client_method = getattr(client, f"{method}_async", None)
+                if callable(client_method):
+                    if args and kwargs:
+                        return await client_method(*args, **kwargs)
+                    if kwargs:
+                        return await client_method(**kwargs)
+                    return await client_method(*args)
+
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,

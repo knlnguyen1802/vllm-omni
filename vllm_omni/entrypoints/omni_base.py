@@ -218,6 +218,10 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
+        # Abort pops frontend request_states before generate() consumes the
+        # terminal OutputMessage. Keep the ClientRequestState so the output
+        # loop can still unblock the waiting generate() coroutine.
+        self._orphaned_abort_states: dict[str, ClientRequestState] = {}
         self._consumed_metric_messages: dict[str, set[int]] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
@@ -376,6 +380,9 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
+            orphaned = getattr(self, "_orphaned_abort_states", None)
+            if orphaned is not None:
+                orphaned.pop(request_id, None)
             consumed_by_request = getattr(self, "_consumed_metric_messages", None)
             if consumed_by_request is not None:
                 consumed_by_request.pop(request_id, None)
@@ -408,9 +415,21 @@ class OmniBase(PDDisaggregationMixin):
             if getattr(stage, "final_output", False) and stage.final_output_type in requested_modalities
         ]
 
+    def _lookup_request_state(self, request_id: str) -> ClientRequestState | None:
+        """Return live or abort-orphaned frontend request state."""
+        state = self.request_states.get(request_id)
+        if state is not None:
+            return state
+        return getattr(self, "_orphaned_abort_states", {}).get(request_id)
+
+    def _release_orphaned_abort_state(self, request_id: str) -> None:
+        orphaned = getattr(self, "_orphaned_abort_states", None)
+        if orphaned is not None:
+            orphaned.pop(request_id, None)
+
     def _process_stage_metrics_message(self, msg: StageMetricsMessage) -> None:
         req_id = msg.request_id
-        req_state = self.request_states.get(req_id)
+        req_state = self._lookup_request_state(req_id)
         if req_state is None or req_state.metrics is None:
             return
         _m = msg.metrics
@@ -450,7 +469,7 @@ class OmniBase(PDDisaggregationMixin):
         req_id = msg.request_id
         stage_id = msg.stage_id
 
-        req_state = self.request_states.get(req_id)
+        req_state = self._lookup_request_state(req_id)
         if req_state is None:
             logger.debug(
                 "[%s] dropping output for unknown req %s",
