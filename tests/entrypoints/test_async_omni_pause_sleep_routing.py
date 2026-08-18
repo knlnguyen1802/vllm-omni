@@ -42,6 +42,15 @@ def test_split_stage_ids_by_type():
 
 
 @pytest.mark.cpu
+def test_split_stage_ids_by_type_rejects_out_of_range():
+    omni = _make_omni(stage_types=["llm", "diffusion"])
+    with pytest.raises(ValueError, match=r"Invalid stage_ids \[2\].*0\.\.1"):
+        omni._split_stage_ids_by_type([0, 2])
+    with pytest.raises(ValueError, match=r"Invalid stage_ids \[-1\]"):
+        omni._split_stage_ids_by_type([-1])
+
+
+@pytest.mark.cpu
 def test_pause_generation_routes_ar_via_collective_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
@@ -58,6 +67,30 @@ def test_pause_generation_routes_ar_via_collective_rpc():
             kwargs={"mode": "abort", "clear_cache": True},
             stage_ids=[0],
         )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_pause_generation_still_rpcs_when_already_paused():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        omni.reset_prefix_cache = AsyncMock(return_value=True)
+        omni.reset_mm_cache = AsyncMock()
+        omni.reset_encoder_cache = AsyncMock()
+        omni._paused = True
+
+        await omni.pause_generation(mode="abort", clear_cache=True, stage_ids=[0])
+
+        omni.collective_rpc.assert_awaited_once_with(
+            method="pause_scheduler",
+            args=(),
+            kwargs={"mode": "abort", "clear_cache": True},
+            stage_ids=[0],
+        )
+        omni.reset_prefix_cache.assert_awaited_once()
+        omni.reset_mm_cache.assert_awaited_once()
+        omni.reset_encoder_cache.assert_awaited_once()
 
     asyncio.run(run())
 
@@ -175,6 +208,23 @@ def test_wake_up_does_not_resume_frontend_admission():
         # Explicit resume is required after sleep/wake.
         await omni.resume_generation()
         assert omni._paused is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_level1_wake_without_tags_clears_all_sleeping_tags():
+    """sleep(level=1) tracks WEIGHTS+KV; untagged wake_up must clear both."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+
+        await omni.sleep(level=1, mode="abort")
+        assert CuMemTag.WEIGHTS.value in omni._sleeping_tags
+        assert CuMemTag.KV_CACHE.value in omni._sleeping_tags
+
+        await omni.wake_up()
+        assert not omni._sleeping_tags
 
     asyncio.run(run())
 

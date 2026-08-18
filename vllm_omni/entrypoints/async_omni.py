@@ -1121,8 +1121,17 @@ class AsyncOmni(EngineClient, OmniBase):
 
     def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
+        n_stages = len(self.engine.stage_clients)
         if stage_ids is None:
-            stage_ids = list(range(len(self.engine.stage_clients)))
+            stage_ids = list(range(n_stages))
+        else:
+            invalid = [sid for sid in stage_ids if not isinstance(sid, int) or sid < 0 or sid >= n_stages]
+            if invalid:
+                raise ValueError(
+                    f"Invalid stage_ids {invalid}; valid range is 0..{n_stages - 1}"
+                    if n_stages
+                    else f"Invalid stage_ids {invalid}; this engine has no stages"
+                )
         ar_stage_ids: list[int] = []
         diffusion_stage_ids: list[int] = []
         for sid in stage_ids:
@@ -1157,8 +1166,8 @@ class AsyncOmni(EngineClient, OmniBase):
             mode = "wait"
 
         async with self._pause_cond:
-            if self._paused:
-                return
+            # Keep running EngineCore pause + cache clear even when frontend
+            # admission is already paused (sleep or a prior pause_generation).
             self._paused = True
 
         ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
@@ -1397,7 +1406,11 @@ class AsyncOmni(EngineClient, OmniBase):
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
         if not getattr(self, "_sleeping_tags", None):
             self._level2_sleeping = False
-        logger.info("[%s] Wake-up complete for stage(s) %s.", self._name, stage_ids)
+        logger.info(
+            "[%s] Wake-up complete for stage(s) %s.",
+            self._name,
+            ar_stage_ids + diffusion_stage_ids,
+        )
         return final_acks
 
     async def _wake_diffusion(self, stage_ids: list[int], requested_tags: list[str]) -> list[OmniACK]:
