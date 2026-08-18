@@ -209,6 +209,10 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
+        # Abort pops frontend request_states before generate() consumes the
+        # terminal OutputMessage. Keep the ClientRequestState so the output
+        # loop can still unblock the waiting generate() coroutine.
+        self._orphaned_abort_states: dict[str, ClientRequestState] = {}
         self._consumed_metric_messages: dict[str, set[int]] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
         self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
@@ -367,6 +371,9 @@ class OmniBase(PDDisaggregationMixin):
             )
         finally:
             self.request_states.pop(request_id, None)
+            orphaned = getattr(self, "_orphaned_abort_states", None)
+            if orphaned is not None:
+                orphaned.pop(request_id, None)
             consumed_by_request = getattr(self, "_consumed_metric_messages", None)
             if consumed_by_request is not None:
                 consumed_by_request.pop(request_id, None)
@@ -399,9 +406,21 @@ class OmniBase(PDDisaggregationMixin):
             if getattr(stage, "final_output", False) and stage.final_output_type in requested_modalities
         ]
 
+    def _lookup_request_state(self, request_id: str) -> ClientRequestState | None:
+        """Return live or abort-orphaned frontend request state."""
+        state = self.request_states.get(request_id)
+        if state is not None:
+            return state
+        return getattr(self, "_orphaned_abort_states", {}).get(request_id)
+
+    def _release_orphaned_abort_state(self, request_id: str) -> None:
+        orphaned = getattr(self, "_orphaned_abort_states", None)
+        if orphaned is not None:
+            orphaned.pop(request_id, None)
+
     def _process_stage_metrics_message(self, msg: StageMetricsMessage) -> None:
         req_id = msg.request_id
-        req_state = self.request_states.get(req_id)
+        req_state = self._lookup_request_state(req_id)
         if req_state is None or req_state.metrics is None:
             return
         _m = msg.metrics
@@ -441,7 +460,7 @@ class OmniBase(PDDisaggregationMixin):
         req_id = msg.request_id
         stage_id = msg.stage_id
 
-        req_state = self.request_states.get(req_id)
+        req_state = self._lookup_request_state(req_id)
         if req_state is None:
             logger.debug(
                 "[%s] dropping output for unknown req %s",
@@ -628,7 +647,6 @@ class OmniBase(PDDisaggregationMixin):
         self.prom_metrics.set_running(running)
         self.prom_metrics.set_waiting(max(0, total - running))
 
-        images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         response_metrics: dict[str, Any] = {}
         stage_metrics: dict[str, dict[str, Any]] = {}
         rid_key = str(req_id)
@@ -653,19 +671,16 @@ class OmniBase(PDDisaggregationMixin):
                 response_metrics["final_output_type"] = current_stage_metrics["final_output_type"]
                 response_metrics["num_tokens_in"] = current_stage_metrics["num_tokens_in"]
                 response_metrics["num_tokens_out"] = current_stage_metrics["num_tokens_out"]
-        return OmniRequestOutput(
+        # Generation content (outputs, prompt, images, trajectory_*, ...) is
+        # copied from engine_outputs onto the returned object by
+        # OmniRequestOutput.from_stage_output().
+        return OmniRequestOutput.from_stage_output(
+            engine_outputs,
             request_id=req_id or "",
             finished=finished,
             stage_id=stage_id,
             replica_id=result.replica_id,
             final_output_type=output_type,
-            request_output=engine_outputs,
-            images=images,
-            trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),
-            trajectory_timesteps=getattr(engine_outputs, "trajectory_timesteps", None),
-            trajectory_log_probs=getattr(engine_outputs, "trajectory_log_probs", None),
-            trajectory_decoded=getattr(engine_outputs, "trajectory_decoded", None),
-            _custom_output=getattr(engine_outputs, "_custom_output", {}),
             metrics=response_metrics,
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,

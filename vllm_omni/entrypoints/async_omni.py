@@ -915,9 +915,10 @@ class AsyncOmni(EngineClient, OmniBase):
                         # error without a request_id is a genuine engine-wide
                         # death and falls through to the except handler below.
                         if msg.request_id is not None:
-                            req_state = self.request_states.get(msg.request_id)
+                            req_state = self._lookup_request_state(msg.request_id)
                             if req_state is not None:
                                 await req_state.queue.put(msg)
+                                self._release_orphaned_abort_state(msg.request_id)
                             else:
                                 logger.warning(
                                     "[%s] dropping error for unknown req %s",
@@ -936,6 +937,8 @@ class AsyncOmni(EngineClient, OmniBase):
 
                     # Route to the per-request queue
                     await req_state.queue.put(msg)
+                    if getattr(msg, "finished", False):
+                        self._release_orphaned_abort_state(msg.request_id)
 
             except asyncio.CancelledError:
                 raise
@@ -1054,6 +1057,31 @@ class AsyncOmni(EngineClient, OmniBase):
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
         await self._abort(internal_ids)
 
+    async def abort_with_output_ids(self, request_ids: list[str], *, pause: bool = False) -> list[str]:
+        """Abort external request IDs and report which ones delivered outputs.
+
+        Used by RL trainers (e.g. verl-omni) that need the partial tokens of
+        aborted AR requests. External request IDs are mapped to internal IDs
+        via ``request_states`` (same mapping as :meth:`abort`), then the
+        acknowledged abort path runs so terminal abort outputs are delivered
+        into each request's queue before frontend state is popped.
+
+        When ``pause=True``, the pause is forwarded to every live AR
+        EngineCore scheduler (``mode="abort", clear_cache=False``) even when
+        no internal IDs map — an empty frontend request list does not prove
+        the backend is idle (upstream ``AsyncLLM.pause_generation`` forwards
+        unconditionally). The pause rides on the abort message itself, so the
+        schedulers are not paused twice.
+
+        Returns:
+            Internal request IDs that received a real abort output (partial
+            tokens). Empty for requests with no OutputProcessor state and for
+            diffusion requests.
+        """
+        external_ids = set(request_ids)
+        internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in external_ids]
+        return await self._abort(internal_ids, pause=pause)
+
     async def submit_interaction_async(
         self,
         request_id: str,
@@ -1101,19 +1129,38 @@ class AsyncOmni(EngineClient, OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         # Request IDs are already internal, so we just need to get the matching states.
         internal_req_ids = [rid for rid in request_ids if rid in self.request_states]
-        await self._abort(internal_req_ids)
+        await self._abort(internal_req_ids, keep_queue=False)
 
-    async def _abort(self, request_ids: list[str]) -> None:
+    async def _abort(self, request_ids: list[str], *, keep_queue: bool = True, pause: bool = False) -> list[str]:
         """Abort request IDs via the engine and clean frontend state after ack.
 
         Waits for orchestrator abort acknowledgment, enqueues any AR terminal
         abort outputs (partial tokens) into each request's asyncio queue, then
         pops ``request_states`` so generate() can observe the abort output
         before frontend teardown. Orchestrator abort errors propagate.
+
+        ``keep_queue=True`` is the external abort() path: generate() is still
+        waiting on the per-request queue, so the ClientRequestState is retained
+        in ``_orphaned_abort_states`` until a terminal OutputMessage arrives.
+        ``keep_queue=False`` is the generate() cancel/error path, which will not
+        consume that queue.
+
+        ``pause=True`` additionally pauses every live AR EngineCore scheduler
+        (``mode="abort", clear_cache=False``), even when ``request_ids`` is
+        empty — matching upstream ``AsyncLLM.pause_generation`` semantics where
+        an empty frontend request list does not prove the backend is idle.
+
+        Returns the internal request IDs that received a real abort output.
         """
-        abort_outputs = await self.engine.abort_async(request_ids)
+        if not request_ids and not pause:
+            return []
+        if pause:
+            abort_outputs = await self.engine.abort_async(request_ids, pause=True) or []
+        else:
+            abort_outputs = await self.engine.abort_async(request_ids) or []
         # Deliver abort outputs before removing frontend request state so
         # generate() / FullyAsyncLLMServerClient can read partial tokens.
+        delivered: list[str] = []
         for output_msg in abort_outputs:
             req_id = getattr(output_msg, "request_id", None)
             if req_id is None:
@@ -1126,13 +1173,23 @@ class AsyncOmni(EngineClient, OmniBase):
                 )
                 continue
             await state.queue.put(output_msg)
+            delivered.append(req_id)
         for rid in request_ids:
             state = self.request_states.pop(rid, None)
+            if state is None:
+                continue
+            if keep_queue:
+                orphaned = getattr(self, "_orphaned_abort_states", None)
+                if orphaned is None:
+                    orphaned = {}
+                    self._orphaned_abort_states = orphaned
+                orphaned[rid] = state
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
+        return list(dict.fromkeys(delivered))
 
     def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""

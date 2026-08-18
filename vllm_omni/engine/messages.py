@@ -45,6 +45,10 @@ class AbortRequestMessage(EngineQueueMessage, kw_only=True):
     # When set, Orchestrator emits AbortResultMessage on rpc_async_queue so
     # callers can await acknowledgment. Omit for fire-and-forget abort().
     rpc_id: str | None = None
+    # When set, every live AR EngineCore scheduler is paused (mode="abort",
+    # clear_cache=False) even when request_ids is empty — bulk abort + pause
+    # semantics matching upstream AsyncLLM.pause_generation.
+    pause: bool = False
 
 
 class InteractionMessage(EngineQueueMessage, kw_only=True):

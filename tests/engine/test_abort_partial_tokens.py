@@ -301,10 +301,8 @@ async def test_async_omni_abort_enqueues_output_before_state_removal():
     abort_msg = OutputMessage(
         request_id="req-1",
         stage_id=0,
-        engine_outputs=OmniRequestOutput.from_pipeline(
-            stage_id=0,
-            final_output_type="text",
-            request_output=RequestOutput(
+        engine_outputs=OmniRequestOutput.from_stage_output(
+            RequestOutput(
                 request_id="req-1",
                 prompt=None,
                 prompt_token_ids=[1],
@@ -321,6 +319,10 @@ async def test_async_omni_abort_enqueues_output_before_state_removal():
                 ],
                 finished=True,
             ),
+            request_id="req-1",
+            stage_id=0,
+            final_output_type="text",
+            finished=True,
         ),
         finished=True,
     )

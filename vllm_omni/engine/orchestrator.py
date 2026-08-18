@@ -807,13 +807,18 @@ class Orchestrator:
         ``output_async_queue`` for fire-and-forget aborts.
         """
         request_ids = msg.request_ids
+        pause = getattr(msg, "pause", False)
         error: str | None = None
         abort_outputs: list[OutputMessage] = []
         try:
             # _cleanup_request_ids is CFG-aware: it expands aborted parents to
             # their companions and fails a deferred parent whose companion is
-            # aborted before its output arrived.
-            abort_outputs = await self._cleanup_request_ids(list(request_ids), abort=True)
+            # aborted before its output arrived. Pass pause only when set so
+            # duck-typed cleanups with the legacy signature keep working.
+            if pause:
+                abort_outputs = await self._cleanup_request_ids(list(request_ids), abort=True, pause=True)
+            else:
+                abort_outputs = await self._cleanup_request_ids(list(request_ids), abort=True)
             logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
         except Exception as exc:
             error = str(exc)
@@ -873,55 +878,112 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
-        """Forward abort requests to all stage pools.
+    def _abort_engine_output(
+        self,
+        output: Any,
+        *,
+        stage_id: int | None = None,
+        final_output_type: str | None = None,
+        replica_id: int | None = None,
+    ) -> OmniRequestOutput:
+        """Normalize a stage abort RequestOutput into an OmniRequestOutput."""
+        if isinstance(output, OmniRequestOutput):
+            output.finished = True
+            return output
+        kwargs: dict[str, Any] = {
+            "request_id": getattr(output, "request_id", ""),
+            "finished": True,
+        }
+        if stage_id is not None:
+            kwargs["stage_id"] = stage_id
+        if final_output_type is not None:
+            kwargs["final_output_type"] = final_output_type
+        if replica_id is not None:
+            kwargs["replica_id"] = replica_id
+        return OmniRequestOutput.from_stage_output(output, **kwargs)
+
+    async def _collect_abort_output_messages(
+        self,
+        request_ids: list[str],
+        *,
+        pause: bool = False,
+    ) -> list[OutputMessage]:
+        """Abort the given requests in all stage pools and wrap terminal outputs.
 
         Collects final-stage AR abort outputs (partial tokens) while request
         state is still available for stage-id filtering. Diffusion pools do
-        not contribute abort outputs.
+        not contribute abort outputs. When ``pause`` is set, each AR pool also
+        pauses its live EngineCore schedulers even for an empty request list.
         """
-        if not request_ids:
+        if not request_ids and not pause:
             return []
         abort_outputs: list[OutputMessage] = []
+        request_states = getattr(self, "request_states", None)
         for pool in self.stage_pools:
-            stage_outputs = await pool.abort_requests(request_ids) or []
-            if pool.final_output and pool.stage_type != "diffusion":
-                final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
-                for request_output in stage_outputs:
-                    req_id = getattr(request_output, "request_id", None)
-                    if req_id is None:
-                        continue
-                    req_state = self.request_states.get(req_id)
-                    if req_state is None:
+            # Pass pause only when set so duck-typed pools with the legacy
+            # abort_requests(request_ids) signature keep working.
+            if pause:
+                stage_outputs = await pool.abort_requests(request_ids, pause=True) or []
+            else:
+                stage_outputs = await pool.abort_requests(request_ids) or []
+            final_output = getattr(pool, "final_output", True)
+            stage_type = getattr(pool, "stage_type", None)
+            final_output_type = getattr(getattr(pool, "stage_client", None), "final_output_type", None) or "text"
+            for request_output in stage_outputs:
+                req_id = getattr(request_output, "request_id", None)
+                if req_id is None:
+                    continue
+                req_state = request_states.get(req_id) if request_states is not None else None
+                if request_states is not None:
+                    # Only final-stage, non-diffusion outputs are
+                    # frontend-visible; skip when the request is unknown here.
+                    if not final_output or stage_type == "diffusion" or req_state is None:
                         continue
                     final_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
                     if pool.stage_id not in final_stage_ids:
                         continue
-                    # Ensure RequestOutput.finished is set for terminal abort.
-                    if not getattr(request_output, "finished", False):
-                        try:
-                            request_output.finished = True
-                        except Exception:
-                            pass
-                    engine_output = OmniRequestOutput.from_pipeline(
+                # Ensure RequestOutput.finished is set for terminal abort.
+                if not getattr(request_output, "finished", False):
+                    try:
+                        request_output.finished = True
+                    except Exception:
+                        pass
+                replica_id = pool.get_bound_replica_id(req_id)
+                abort_outputs.append(
+                    OutputMessage(
+                        request_id=req_id,
                         stage_id=pool.stage_id,
-                        final_output_type=final_output_type,
-                        request_output=request_output,
-                        replica_id=pool.get_bound_replica_id(req_id),
-                    )
-                    abort_outputs.append(
-                        OutputMessage(
-                            request_id=req_id,
+                        replica_id=replica_id,
+                        engine_outputs=self._abort_engine_output(
+                            request_output,
                             stage_id=pool.stage_id,
-                            replica_id=pool.get_bound_replica_id(req_id),
-                            engine_outputs=engine_output,
-                            metrics=None,
-                            finished=True,
-                            stage_submit_ts=req_state.stage_submit_ts.get(pool.stage_id),
-                        )
+                            final_output_type=final_output_type,
+                            replica_id=replica_id,
+                        ),
+                        metrics=None,
+                        finished=True,
+                        stage_submit_ts=(req_state.stage_submit_ts.get(pool.stage_id) if req_state else None),
                     )
+                )
             pool.release_bindings(request_ids)
         return abort_outputs
+
+    async def _abort_request_ids(self, request_ids: list[str], *, pause: bool = False) -> list[str]:
+        """Forward abort requests to all stage pools and emit terminal outputs.
+
+        Terminal abort outputs are enqueued on ``output_async_queue`` so the
+        frontend output loop can unblock waiting ``generate()`` coroutines.
+        Returns the internal request IDs for which this abort produced a
+        frontend-visible OutputProcessor abort output.
+        """
+        messages = await self._collect_abort_output_messages(request_ids, pause=pause)
+        delivered: list[str] = []
+        output_queue = getattr(self, "output_async_queue", None)
+        for msg in messages:
+            if output_queue is not None:
+                await output_queue.put(msg)
+            delivered.append(msg.request_id)
+        return list(dict.fromkeys(delivered))
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -1275,6 +1337,7 @@ class Orchestrator:
         *,
         abort: bool = False,
         close_duplex_sessions: bool = False,
+        pause: bool = False,
     ) -> list[OutputMessage]:
         """Release pool bindings and logical request state for the given ids.
 
@@ -1285,11 +1348,17 @@ class Orchestrator:
         loss, membership unregister) funnels through here, so tracker state
         cannot outlive its requests.
 
+        When ``pause`` is set (bulk AR abort + pause, mirroring upstream
+        ``AsyncLLM.pause_generation`` semantics), the pool abort/pause path
+        runs even for an empty request-id list so the EngineCore pause still
+        happens; ordinary empty per-request aborts (``pause=False``) remain
+        no-ops.
+
         Returns:
             Final-stage AR abort ``OutputMessage`` list when ``abort=True``;
             otherwise an empty list.
         """
-        if not request_ids:
+        if not request_ids and not pause:
             return []
 
         cleanup_ids = list(dict.fromkeys(request_ids))
@@ -1334,8 +1403,8 @@ class Orchestrator:
 
         abort_outputs: list[OutputMessage] = []
         try:
-            if abort:
-                abort_outputs = await self._abort_request_ids(cleanup_ids)
+            if abort or pause:
+                abort_outputs = await self._collect_abort_output_messages(cleanup_ids, pause=pause)
             self._release_request_bindings(cleanup_ids)
             for request_id in cleanup_ids:
                 self._pd_kv_params.pop(request_id, None)
@@ -1623,11 +1692,19 @@ class Orchestrator:
             return request
 
         processor = self._get_stage_input_processor(next_stage_id)
+        # A pooling stage is driven by PoolingParams; vLLM validates them against
+        # the stage's supported tasks, so advertise the model's pooling tasks (or
+        # the configured task) instead of generate.
+        if isinstance(params, PoolingParams):
+            model_cfg = next_pool.stage_vllm_config.model_config
+            supported_tasks = tuple(getattr(model_cfg, "supported_tasks", ()) or ()) or (params.task,)
+        else:
+            supported_tasks = ("generate",)
         request = processor.process_inputs(
             request_id=req_id,
             prompt=next_input,
             params=params,
-            supported_tasks=("generate",),
+            supported_tasks=supported_tasks,
             arrival_time=_time.time(),
             resumable=resumable,
         )
@@ -1705,12 +1782,12 @@ class Orchestrator:
         from vllm_omni.experimental.fullduplex.output import attach_duplex_output_decision
 
         engine_output = attach_duplex_output_decision(
-            OmniRequestOutput(
+            OmniRequestOutput.from_stage_output(
+                output,
                 request_id=req_id,
                 finished=True,
                 stage_id=stage_id,
                 final_output_type=decision.final_output_type,
-                request_output=output,
             ),
             decision,
         )
