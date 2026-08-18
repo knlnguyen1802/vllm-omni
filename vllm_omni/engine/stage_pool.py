@@ -1222,6 +1222,15 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            if self.stage_type != "diffusion" and method != "collective_rpc":
+                client_method = getattr(client, f"{method}_async", None)
+                if callable(client_method):
+                    if args and kwargs:
+                        return await client_method(*args, **kwargs)
+                    if kwargs:
+                        return await client_method(**kwargs)
+                    return await client_method(*args)
+
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,
