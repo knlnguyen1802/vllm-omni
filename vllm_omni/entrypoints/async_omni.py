@@ -1079,8 +1079,28 @@ class AsyncOmni(EngineClient, OmniBase):
         await self._abort(internal_req_ids)
 
     async def _abort(self, request_ids: list[str]) -> None:
-        """Submit request IDs to be aborted to the engine."""
-        await self.engine.abort_async(request_ids)
+        """Abort request IDs via the engine and clean frontend state after ack.
+
+        Waits for orchestrator abort acknowledgment, enqueues any AR terminal
+        abort outputs (partial tokens) into each request's asyncio queue, then
+        pops ``request_states`` so generate() can observe the abort output
+        before frontend teardown. Orchestrator abort errors propagate.
+        """
+        abort_outputs = await self.engine.abort_async(request_ids)
+        # Deliver abort outputs before removing frontend request state so
+        # generate() / FullyAsyncLLMServerClient can read partial tokens.
+        for output_msg in abort_outputs:
+            req_id = getattr(output_msg, "request_id", None)
+            if req_id is None:
+                continue
+            state = self.request_states.get(req_id)
+            if state is None:
+                logger.debug(
+                    "[AsyncOmni] Dropping abort output for unknown req %s",
+                    req_id,
+                )
+                continue
+            await state.queue.put(output_msg)
         for rid in request_ids:
             state = self.request_states.pop(rid, None)
             input_stream_task = getattr(state, "input_stream_task", None)

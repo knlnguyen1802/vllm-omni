@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
@@ -416,6 +417,25 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         return self._native_text_metrics_by_request.pop(request_id, {})
 
     def abort_requests(self, request_ids, internal: bool) -> list[str]:
+        aborted_ids, _outputs = self.abort_requests_collecting_outputs(request_ids, internal=internal)
+        return aborted_ids
+
+    def abort_requests_collecting_outputs(
+        self,
+        request_ids: Iterable[str],
+        *,
+        internal: bool,
+    ) -> tuple[list[str], list[RequestOutput | PoolingRequestOutput]]:
+        """Abort requests and return terminal abort outputs with partial tokens.
+
+        Mirrors upstream ``OutputProcessor.abort_requests``, but also returns
+        abort ``RequestOutput`` objects when ``queue`` is ``None`` (Omni stage
+        pools register OP state without a collector queue).
+
+        Terminal abort outputs use ``RequestOutputKind.CUMULATIVE`` so DELTA
+        streaming requests still surface the full prefix generated so far
+        (token_ids + aligned logprobs), matching AR resume needs.
+        """
         request_ids = list(request_ids)
         for request_id in request_ids:
             if internal:
@@ -424,7 +444,60 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     self._native_text_metrics_by_request.pop(req_state.external_req_id, None)
             else:
                 self._native_text_metrics_by_request.pop(request_id, None)
-        return super().abort_requests(request_ids, internal)
+
+        internal_req_ids: list[str] = []
+        for request_id in request_ids:
+            if internal:
+                internal_req_ids.append(request_id)
+                if req_state := self.request_states.get(request_id):
+                    external_req_id = req_state.external_req_id
+                    internal_ids = self.external_req_ids[external_req_id]
+                    internal_ids.remove(request_id)
+                    if not internal_ids:
+                        del self.external_req_ids[external_req_id]
+            elif internal_ids := self.external_req_ids.pop(request_id, []):
+                internal_req_ids.extend(internal_ids)
+
+        request_ids_to_abort: list[str] = []
+        abort_outputs: list[RequestOutput | PoolingRequestOutput] = []
+        for request_id in internal_req_ids:
+            req_state = self.request_states.pop(request_id, None)
+            if req_state is not None:
+                self.lora_states.request_finished(request_id, req_state.lora_name)
+                request_ids_to_abort.append(request_id)
+                original_kind = req_state.output_kind
+                # Force cumulative view so abort carries the full generated
+                # prefix even when the live stream used DELTA.
+                req_state.output_kind = RequestOutputKind.CUMULATIVE
+                try:
+                    # OmniRequestState.make_request_output builds a completion
+                    # output even without a detokenizer when pooling_output is
+                    # None (generation stages). Do not pass the upstream pooling
+                    # sentinel here — that would force a PoolingRequestOutput.
+                    request_output = req_state.make_request_output(
+                        new_token_ids=[],
+                        pooling_output=None,
+                        finish_reason=FinishReason.ABORT,
+                        stop_reason=None,
+                        kv_transfer_params=None,
+                    )
+                finally:
+                    req_state.output_kind = original_kind
+                if request_output is not None:
+                    abort_outputs.append(request_output)
+                    if req_state.queue is not None:
+                        req_state.queue.put(request_output)
+            elif parent := self.parent_requests.get(request_id):
+                if parent.child_requests:
+                    child_reqs = list(parent.child_requests)
+                    child_aborted, child_outputs = self.abort_requests_collecting_outputs(
+                        child_reqs,
+                        internal=True,
+                    )
+                    request_ids_to_abort.extend(child_aborted)
+                    abort_outputs.extend(child_outputs)
+                self.parent_requests.pop(request_id, None)
+        return request_ids_to_abort, abort_outputs
 
     def add_request(
         self,
