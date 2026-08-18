@@ -914,9 +914,10 @@ class AsyncOmni(EngineClient, OmniBase):
                         # error without a request_id is a genuine engine-wide
                         # death and falls through to the except handler below.
                         if msg.request_id is not None:
-                            req_state = self.request_states.get(msg.request_id)
+                            req_state = self._lookup_request_state(msg.request_id)
                             if req_state is not None:
                                 await req_state.queue.put(msg)
+                                self._release_orphaned_abort_state(msg.request_id)
                             else:
                                 logger.warning(
                                     "[%s] dropping error for unknown req %s",
@@ -935,6 +936,8 @@ class AsyncOmni(EngineClient, OmniBase):
 
                     # Route to the per-request queue
                     await req_state.queue.put(msg)
+                    if getattr(msg, "finished", False):
+                        self._release_orphaned_abort_state(msg.request_id)
 
             except asyncio.CancelledError:
                 raise
@@ -1076,13 +1079,28 @@ class AsyncOmni(EngineClient, OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         # Request IDs are already internal, so we just need to get the matching states.
         internal_req_ids = [rid for rid in request_ids if rid in self.request_states]
-        await self._abort(internal_req_ids)
+        await self._abort(internal_req_ids, keep_queue=False)
 
-    async def _abort(self, request_ids: list[str]) -> None:
-        """Submit request IDs to be aborted to the engine."""
+    async def _abort(self, request_ids: list[str], *, keep_queue: bool = True) -> None:
+        """Submit request IDs to be aborted to the engine.
+
+        ``keep_queue=True`` is the external abort() path: generate() is still
+        waiting on the per-request queue, so the ClientRequestState is retained
+        in ``_orphaned_abort_states`` until a terminal OutputMessage arrives.
+        ``keep_queue=False`` is the generate() cancel/error path, which will not
+        consume that queue.
+        """
         await self.engine.abort_async(request_ids)
         for rid in request_ids:
             state = self.request_states.pop(rid, None)
+            if state is None:
+                continue
+            if keep_queue:
+                orphaned = getattr(self, "_orphaned_abort_states", None)
+                if orphaned is None:
+                    orphaned = {}
+                    self._orphaned_abort_states = orphaned
+                orphaned[rid] = state
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()

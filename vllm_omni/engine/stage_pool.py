@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_coordinator import (
@@ -1175,14 +1175,53 @@ class StagePool:
 
     # ---- Stage-local control plane ----
 
-    async def abort_requests(self, request_ids: list[str]) -> None:
+    def _abort_output_processor_requests(self, request_ids: list[str]) -> list[Any]:
+        """Create terminal abort outputs for OutputProcessor-tracked requests.
+
+        Upstream ``OutputProcessor.abort_requests`` only enqueues a client abort
+        output when ``RequestState.queue`` is set. Omni registers AR requests
+        with ``queue=None`` and routes through ``process_outputs()``, so abort
+        must synthesize ``FinishReason.ABORT`` EngineCoreOutputs here. That
+        preserves cumulative generated tokens even when no replica binding
+        exists yet.
+        """
+        processor = self._output_processor
+        if processor is None:
+            return []
+        request_states = getattr(processor, "request_states", None)
+        if not request_states:
+            return []
+
+        op_ids = [request_id for request_id in request_ids if request_id in request_states]
+        if not op_ids:
+            return []
+
+        abort_core_outputs = [
+            EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ABORT,
+            )
+            for request_id in op_ids
+        ]
+        processed = processor.process_outputs(abort_core_outputs)
+        return list(getattr(processed, "request_outputs", None) or [])
+
+    async def abort_requests(self, request_ids: list[str]) -> list[Any]:
         """Abort the given requests in this stage pool.
 
         Request-bound abort routing stays inside the pool because route affinity
-        (``request_id -> replica_id``) is pool-owned.
+        (``request_id -> replica_id``) is pool-owned. Backend engine abort RPCs
+        stay limited to requests with a live replica binding. Abort outputs are
+        still created for every requested ID that has OutputProcessor state,
+        including requests whose route binding has not been installed yet.
+
+        Returns the abort RequestOutputs produced from OutputProcessor state.
         """
         if not request_ids:
-            return
+            return []
+
+        abort_outputs = self._abort_output_processor_requests(request_ids)
 
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
@@ -1198,12 +1237,7 @@ class StagePool:
                 continue
             await client.abort_requests_async(replica_request_ids)
 
-        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
-        # would otherwise leak — aborted requests never produce a final
-        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
-        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
-        if all_aborted and self._output_processor is not None:
-            self._output_processor.abort_requests(all_aborted, internal=True)
+        return abort_outputs
 
     async def collective_rpc(
         self,

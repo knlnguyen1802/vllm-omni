@@ -855,13 +855,48 @@ class Orchestrator:
                 )
             )
 
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
+    def _abort_engine_output(self, output: Any) -> OmniRequestOutput:
+        """Normalize a stage abort RequestOutput into an OmniRequestOutput."""
+        if isinstance(output, OmniRequestOutput):
+            output.finished = True
+            return output
+        return OmniRequestOutput.from_stage_output(
+            output,
+            request_id=getattr(output, "request_id", ""),
+            finished=True,
+        )
+
+    async def _abort_request_ids(self, request_ids: list[str]) -> list[str]:
+        """Forward abort requests to all stage pools and emit terminal outputs.
+
+        Returns the internal request IDs for which this abort produced a
+        frontend-visible OutputProcessor abort output.
+        """
         if not request_ids:
-            return
+            return []
+
+        delivered: list[str] = []
+        output_queue = getattr(self, "output_async_queue", None)
         for pool in self.stage_pools:
-            await pool.abort_requests(request_ids)
+            abort_outputs = await pool.abort_requests(request_ids) or []
+            for output in abort_outputs:
+                request_id = getattr(output, "request_id", None)
+                if not request_id:
+                    continue
+                if output_queue is not None:
+                    await output_queue.put(
+                        OutputMessage(
+                            request_id=request_id,
+                            stage_id=pool.stage_id,
+                            replica_id=pool.get_bound_replica_id(request_id),
+                            engine_outputs=self._abort_engine_output(output),
+                            metrics=None,
+                            finished=True,
+                        )
+                    )
+                delivered.append(request_id)
             pool.release_bindings(request_ids)
+        return list(dict.fromkeys(delivered))
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
