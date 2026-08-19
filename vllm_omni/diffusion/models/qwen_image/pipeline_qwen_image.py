@@ -316,6 +316,7 @@ class QwenImagePipeline(
             default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
                 model, subfolder="scheduler", local_files_only=local_files_only
             ),
+            local_files_only=local_files_only,
         )
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
         # half-written cache (missing-shard ``OSError`` and the default

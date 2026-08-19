@@ -203,6 +203,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
                 model, subfolder="scheduler", local_files_only=local_files_only
             ),
+            local_files_only=local_files_only,
         )
         self.tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.tokenizer_2 = CLIPTokenizer.from_pretrained(

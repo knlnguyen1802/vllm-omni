@@ -46,6 +46,17 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
 
+    # OmniEngineArgs / deploy YAML use diffusion_scheduler so users can
+    # distinguish it from stage scheduler_cls (request batching).
+    if normalized.get("diffusion_scheduler") is not None:
+        normalized["scheduler"] = normalized.pop("diffusion_scheduler")
+    else:
+        normalized.pop("diffusion_scheduler", None)
+    if normalized.get("diffusion_scheduler_kwargs") is not None:
+        normalized["scheduler_kwargs"] = normalized.pop("diffusion_scheduler_kwargs")
+    else:
+        normalized.pop("diffusion_scheduler_kwargs", None)
+
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
     if "static_lora_scale" in normalized:
@@ -758,9 +769,11 @@ class OmniDiffusionConfig:
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
 
-    # Scheduler injection: registry name (see vllm_omni.diffusion.models.schedulers)
-    # or dotted class path of a scheduler class to use instead of the pipeline's
-    # default scheduler. Constructed via cls.from_pretrained(model, subfolder="scheduler").
+    # Diffusion sampling-scheduler injection (not the request scheduler).
+    # Registry name (see vllm_omni.diffusion.models.schedulers) or dotted
+    # class path. Constructed via build_pipeline_scheduler / from_pretrained.
+    # Set from OmniEngineArgs.diffusion_scheduler. Pipelines that do not
+    # consume this field fail at load (ensure_scheduler_consumed).
     scheduler: str | None = None
     # Extra kwargs forwarded to the injected scheduler's from_pretrained().
     scheduler_kwargs: dict[str, Any] | None = None

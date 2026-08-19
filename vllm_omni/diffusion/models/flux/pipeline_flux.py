@@ -112,6 +112,7 @@ class FluxPipeline(
             default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
                 model, subfolder="scheduler", local_files_only=local_files_only
             ),
+            local_files_only=local_files_only,
         )
         self.text_encoder = CLIPTextModel.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only

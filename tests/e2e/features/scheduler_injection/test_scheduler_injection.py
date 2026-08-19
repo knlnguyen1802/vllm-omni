@@ -80,14 +80,14 @@ def _assert_valid_image_output(output: OmniRequestOutput) -> None:
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_scheduler_injection_uses_injected_scheduler(tmp_path, monkeypatch):
-    """``scheduler=<dotted path>`` must construct and step the injected SDE class."""
+    """``diffusion_scheduler=<dotted path>`` must construct and step the injected SDE class."""
     marker = tmp_path / "scheduler_events.txt"
     monkeypatch.setenv(MARKER_ENV_VAR, str(marker))
 
     with ExitStack() as after:
         engine = AsyncOmni(
             model=MODEL,
-            scheduler=INJECTED_SCHEDULER,
+            diffusion_scheduler=INJECTED_SCHEDULER,
             enforce_eager=True,
             max_num_seqs=1,
         )

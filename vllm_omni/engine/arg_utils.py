@@ -174,10 +174,11 @@ class OmniEngineArgs(EngineArgs):
         custom_pipeline_args: Dictionary of arguments for custom pipeline
             initialization (e.g., ``{"pipeline_class": "my.Module"}``).
             Passed through to the diffusion stage engine.
-        scheduler: Optional registry name or dotted class path of a diffusion
-            scheduler class to inject instead of the pipeline default.
-        scheduler_kwargs: Optional extra kwargs forwarded to the injected
-            scheduler's ``from_pretrained()``.
+        diffusion_scheduler: Optional registry name or dotted class path of a
+            diffusion *sampling* scheduler class (not the request
+            ``scheduler_cls``) to inject instead of the pipeline default.
+        diffusion_scheduler_kwargs: Optional extra kwargs forwarded to the
+            injected diffusion scheduler's ``from_pretrained()``.
     """
 
     stage_id: int = 0
@@ -235,11 +236,12 @@ class OmniEngineArgs(EngineArgs):
     output_modalities: list[str] | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
-    # Diffusion scheduler injection (forwarded to OmniDiffusionConfig). No CLI
-    # flags are added for these (same as custom_pipeline_args); set them via
-    # the Python API or a deploy YAML's engine args.
-    scheduler: str | None = None
-    scheduler_kwargs: dict[str, Any] | None = None
+    # Diffusion sampling-scheduler injection (forwarded to
+    # OmniDiffusionConfig.scheduler). Distinct from stage ``scheduler_cls``
+    # (request batching). No CLI flags (same as custom_pipeline_args); set
+    # via the Python API or a deploy YAML's engine args.
+    diffusion_scheduler: str | None = None
+    diffusion_scheduler_kwargs: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
 
     def __post_init__(self) -> None:

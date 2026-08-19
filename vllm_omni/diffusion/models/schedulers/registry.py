@@ -31,11 +31,20 @@ pipelines already rely on (diffusers-style):
 * deepcopy-safe: step-wise execution deep-copies the scheduler per request.
 
 Injected classes are constructed with
-``cls.from_pretrained(od_config.model, subfolder="scheduler",
-local_files_only=od_config.local_files_only, **scheduler_kwargs)``,
-matching how the stock schedulers are loaded. When no scheduler is
-configured, :func:`build_pipeline_scheduler` falls through to the calling
-pipeline's own ``default_builder`` so the default path stays bit-identical.
+``cls.from_pretrained(od_config.model, subfolder=...,
+local_files_only=..., revision=..., **scheduler_kwargs)``.
+``local_files_only`` and ``revision`` are the values the calling pipeline
+already resolved (typically ``os.path.exists(model)`` and the pipeline
+revision). They are not fields on ``OmniDiffusionConfig``. When omitted,
+``local_files_only`` defaults to ``os.path.exists(od_config.model)`` and
+``revision`` is not passed. When no scheduler is configured,
+:func:`build_pipeline_scheduler` falls through to the calling pipeline's
+own ``default_builder`` so the default path stays bit-identical.
+
+Pipelines that construct a scheduler without this factory must fail when
+``od_config.scheduler`` is set. Call :func:`ensure_scheduler_consumed`
+after pipeline construction so an accepted config field is never silently
+ignored.
 
 This module must stay importable without torch/diffusers and must not
 import ``OmniDiffusionConfig`` at runtime (duck typing only) to avoid
@@ -44,6 +53,7 @@ import cycles.
 
 import importlib
 import importlib.metadata
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -54,6 +64,7 @@ SCHEDULER_ENTRY_POINT_GROUP = "vllm_omni.schedulers"
 
 _SCHEDULER_REGISTRY: dict[str, type] = {}
 _entry_points_loaded = False
+_consumed_scheduler_config_ids: set[int] = set()
 
 
 def register_scheduler(name: str, cls: type | None = None):
@@ -98,11 +109,40 @@ def resolve_scheduler_cls(ref: str | type | None) -> type | None:
     return getattr(importlib.import_module(module), attr)
 
 
+def is_injected_scheduler(od_config: "OmniDiffusionConfig") -> bool:
+    """True when ``od_config.scheduler`` selects a class other than the pipeline default."""
+    return getattr(od_config, "scheduler", None) is not None
+
+
+def mark_scheduler_consumed(od_config: "OmniDiffusionConfig") -> None:
+    """Record that this config's ``scheduler`` field was handled by a construction site."""
+    _consumed_scheduler_config_ids.add(id(od_config))
+
+
+def ensure_scheduler_consumed(od_config: "OmniDiffusionConfig", pipeline: Any) -> None:
+    """Fail if ``od_config.scheduler`` was set but no construction site consumed it."""
+    if not is_injected_scheduler(od_config):
+        return
+    if id(od_config) in _consumed_scheduler_config_ids:
+        return
+    pipeline_name = type(pipeline).__name__ if pipeline is not None else "pipeline"
+    raise ValueError(
+        f"{pipeline_name} does not consume OmniDiffusionConfig.scheduler="
+        f"{od_config.scheduler!r}. Wire the construction site through "
+        "build_pipeline_scheduler or reject the option explicitly. "
+        "See docs/features/scheduler_injection.md."
+    )
+
+
 def build_pipeline_scheduler(
     od_config: "OmniDiffusionConfig",
     scheduler_cls: str | type | None = None,
     scheduler_kwargs: dict[str, Any] | None = None,
     default_builder: Callable[[], Any] | None = None,
+    *,
+    local_files_only: bool | None = None,
+    revision: str | None = None,
+    subfolder: str = "scheduler",
 ):
     """Single construction seam replacing hardcoded scheduler ``from_pretrained`` sites.
 
@@ -110,16 +150,29 @@ def build_pipeline_scheduler(
     > pipeline default. When no scheduler is configured, ``default_builder``
     is invoked and its return value is passed through untouched, preserving
     the pipeline's existing construction bit-for-bit.
+
+    ``local_files_only`` and ``revision`` must be the pipeline-resolved values
+    (not ``getattr(od_config, "local_files_only")`` — that field does not exist
+    on ``OmniDiffusionConfig``).
     """
+    mark_scheduler_consumed(od_config)
     cls = resolve_scheduler_cls(scheduler_cls) or resolve_scheduler_cls(getattr(od_config, "scheduler", None))
     if cls is None:
-        assert default_builder is not None
+        if default_builder is None:
+            raise ValueError(
+                "No scheduler configured and no default_builder provided. "
+                "Set OmniDiffusionConfig.scheduler or pass default_builder."
+            )
         return default_builder()
     kwargs = dict(getattr(od_config, "scheduler_kwargs", None) or {})
     kwargs.update(scheduler_kwargs or {})
+    if local_files_only is None:
+        local_files_only = os.path.exists(od_config.model)
+    if revision is not None:
+        kwargs.setdefault("revision", revision)
     return cls.from_pretrained(
         od_config.model,
-        subfolder="scheduler",
-        local_files_only=getattr(od_config, "local_files_only", False),
+        subfolder=subfolder,
+        local_files_only=local_files_only,
         **kwargs,
     )

@@ -830,6 +830,8 @@ _STAGE_DEPLOY_ENGINE_FIELDS: tuple[str, ...] = tuple(_STAGE_DEPLOY_FIELDS)
 _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
     {
         "diffusion_attention_backend",
+        "diffusion_scheduler",
+        "diffusion_scheduler_kwargs",
         "kv_cache_dtype",
         "kv_cache_skip_layers",
         "kv_cache_skip_steps",

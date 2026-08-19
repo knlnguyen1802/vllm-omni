@@ -30,7 +30,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import Dis
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler, is_injected_scheduler
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 
 if TYPE_CHECKING:
@@ -679,13 +679,22 @@ def initialize_pipeline_components(pipeline: Any, od_config: Any) -> None:
             local_files_only=local_files_only,
             revision=revision,
         ),
+        local_files_only=local_files_only,
+        revision=revision,
     )
     if profile.scheduler_use_dynamic_shifting:
-        pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-            pipeline.scheduler.config,
-            use_dynamic_shifting=True,
-            shift_terminal=profile.scheduler_shift_terminal,
-        )
+        if is_injected_scheduler(od_config):
+            logger.warning(
+                "Skipping LTx2 dynamic-shifting overwrite: an injected scheduler "
+                "(od_config.scheduler=%r) is active and is left untouched.",
+                od_config.scheduler,
+            )
+        else:
+            pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+                pipeline.scheduler.config,
+                use_dynamic_shifting=True,
+                shift_terminal=profile.scheduler_shift_terminal,
+            )
     validate_ltx_checkpoint(
         pipeline.scheduler.config,
         expected_kind=resolve_ltx_checkpoint_kind(pipeline.pipeline_kind),

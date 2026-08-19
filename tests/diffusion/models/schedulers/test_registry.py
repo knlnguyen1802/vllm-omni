@@ -22,6 +22,8 @@ import vllm_omni.diffusion.models.schedulers.registry as registry_mod
 from vllm_omni.diffusion.models.schedulers import (
     FlowMatchEulerDiscreteScheduler,
     build_pipeline_scheduler,
+    ensure_scheduler_consumed,
+    is_injected_scheduler,
     register_scheduler,
     resolve_scheduler_cls,
 )
@@ -80,6 +82,7 @@ def _isolate_registry(monkeypatch):
     """Snapshot the module-global registry and skip real entry-point scans."""
     snapshot = dict(registry_mod._SCHEDULER_REGISTRY)
     monkeypatch.setattr(registry_mod, "_entry_points_loaded", True)
+    monkeypatch.setattr(registry_mod, "_consumed_scheduler_config_ids", set())
     RecordingMockScheduler.constructed.clear()
     yield
     registry_mod._SCHEDULER_REGISTRY.clear()
@@ -210,16 +213,41 @@ class TestBuildPipelineScheduler:
 
     def test_construction_args_match_stock_sites(self):
         register_scheduler("config_sched", RecordingMockScheduler)
-        od_config = _od_config(scheduler="config_sched", model="/local/model", local_files_only=True)
-        build_pipeline_scheduler(od_config)
+        od_config = _od_config(scheduler="config_sched", model="/local/model")
+        build_pipeline_scheduler(od_config, local_files_only=True, revision="abc123")
         assert RecordingMockScheduler.constructed == [
             {
                 "model": "/local/model",
                 "subfolder": "scheduler",
                 "local_files_only": True,
-                "kwargs": {},
+                "kwargs": {"revision": "abc123"},
             }
         ]
+
+    def test_missing_default_builder_raises_valueerror(self):
+        with pytest.raises(ValueError, match="No scheduler configured"):
+            build_pipeline_scheduler(_od_config())
+
+    def test_od_config_local_files_only_attr_is_ignored(self):
+        register_scheduler("config_sched", RecordingMockScheduler)
+        od_config = _od_config(scheduler="config_sched", model="hub/model", local_files_only=True)
+        build_pipeline_scheduler(od_config, local_files_only=False)
+        assert RecordingMockScheduler.constructed[-1]["local_files_only"] is False
+
+    def test_ensure_scheduler_consumed_raises_when_unwired(self):
+        od_config = _od_config(scheduler="config_sched")
+        with pytest.raises(ValueError, match="does not consume"):
+            ensure_scheduler_consumed(od_config, object())
+
+    def test_ensure_scheduler_consumed_passes_after_factory(self):
+        register_scheduler("config_sched", RecordingMockScheduler)
+        od_config = _od_config(scheduler="config_sched")
+        build_pipeline_scheduler(od_config, local_files_only=False)
+        ensure_scheduler_consumed(od_config, object())
+
+    def test_is_injected_scheduler(self):
+        assert is_injected_scheduler(_od_config(scheduler="x"))
+        assert not is_injected_scheduler(_od_config())
 
     def test_kwargs_merging_explicit_over_config(self):
         register_scheduler("config_sched", RecordingMockScheduler)

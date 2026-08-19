@@ -3,6 +3,8 @@
 
 from vllm_omni.diffusion.models.schedulers.registry import (
     build_pipeline_scheduler,
+    ensure_scheduler_consumed,
+    is_injected_scheduler,
     register_scheduler,
     resolve_scheduler_cls,
 )
@@ -19,6 +21,8 @@ __all__ = [
     "FlowMatchEulerDiscreteScheduler",
     "FlowUniPCMultistepScheduler",
     "build_pipeline_scheduler",
+    "ensure_scheduler_consumed",
+    "is_injected_scheduler",
     "register_scheduler",
     "resolve_scheduler_cls",
 ]
