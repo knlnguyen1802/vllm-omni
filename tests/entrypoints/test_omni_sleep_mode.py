@@ -109,11 +109,15 @@ def get_dynamic_devices(stage_idx: int, num_stages: int, tp_size: int) -> str:
 
 
 async def _ensure_awake(engine: AsyncOmni, stage_ids: list[int]) -> None:
-    """Best-effort full wake so the next shared-engine test starts active."""
+    """Best-effort full wake + resume so the next shared-engine test starts active."""
     try:
         await engine.wake_up(stage_ids=stage_ids)
     except Exception as e:
         logger.warning("ensure_awake failed (stage_ids=%s): %s", stage_ids, e)
+    try:
+        await engine.resume_generation(stage_ids=stage_ids)
+    except Exception as e:
+        logger.warning("ensure_resume failed (stage_ids=%s): %s", stage_ids, e)
 
 
 def _build_llm_stages() -> tuple[list[dict], list[dict]]:
@@ -240,6 +244,7 @@ class TestOmniLlmSleepMode:
         try:
             await llm_engine.sleep(stage_ids=[0], level=1)
             await llm_engine.wake_up(stage_ids=[0], tags=["weights"])
+            await llm_engine.resume_generation(stage_ids=[0])
             with pytest.raises(RuntimeError, match="partially or fully asleep"):
                 async for _ in llm_engine.generate("test", sampling_params=SamplingParams(max_tokens=4)):
                     pass
@@ -365,6 +370,7 @@ class TestOmniDiffusionSleepMode:
             logger.info("Waking up (Reloading Weights)...")
             await diffusion_engine.wake_up(stage_ids=[0])
             await asyncio.sleep(2.0)
+            await diffusion_engine.resume_generation(stage_ids=[0])
             gc.collect()
             get_vram_info(device_id)
             torch.accelerator.empty_cache()
@@ -490,6 +496,7 @@ async def test_multistage_llm_diffusion_sleep_wake(tp_size: int):
         assert len(acks) == 2
 
         await engine.wake_up(stage_ids=[0, 1])
+        await engine.resume_generation(stage_ids=[0, 1])
         async for _ in engine.generate("verify", sampling_params_list=[SamplingParams(), sp]):
             pass
     finally:
@@ -522,6 +529,7 @@ async def test_pure_diffusion_sleep_wake():
     try:
         await engine.sleep(level=1)
         await engine.wake_up()
+        await engine.resume_generation()
         async for _ in engine.generate(
             "test",
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256),

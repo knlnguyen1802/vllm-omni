@@ -18,6 +18,7 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
     omni._pause_cond = asyncio.Condition()
     omni._paused = False
+    omni._admitting = 0
     omni._sleeping_tags = set()
     omni._level2_sleeping = False
     omni.event_resolver = SimpleNamespace(watch_task=lambda *a, **k: None, resolve=AsyncMock())
@@ -162,6 +163,33 @@ def test_sleep_blocks_admission_before_engine_core_rpc():
         assert omni._paused is True
         # Sleep must not also call pause_scheduler (EngineCore.sleep pauses).
         assert all(c.kwargs.get("method") != "pause_scheduler" for c in omni.collective_rpc.await_args_list)
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_waits_for_in_flight_generate_admission():
+    """Sleep must not offload while generate() is still in add_request."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._admitting = 1
+        rpc_started = asyncio.Event()
+
+        async def rpc_side_effect(**kwargs):
+            if kwargs.get("method") == "sleep":
+                rpc_started.set()
+            return [True]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc_side_effect)
+        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
+        await asyncio.sleep(0.05)
+        assert not sleep_task.done()
+        assert not rpc_started.is_set()
+        await omni._release_generate_admission()
+        await asyncio.wait_for(sleep_task, timeout=1)
+        assert rpc_started.is_set()
+        assert omni._admitting == 0
 
     asyncio.run(run())
 

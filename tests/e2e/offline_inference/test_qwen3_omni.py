@@ -2,15 +2,20 @@
 E2E offline tests for Omni model with video input and audio output.
 """
 
+import asyncio
 import os
+from contextlib import ExitStack
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
+from vllm import SamplingParams
+from vllm.inputs import TokensPrompt
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_video
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
@@ -77,3 +82,129 @@ def test_thinker_only_model_request(omni_runner, omni_runner_handler) -> None:
 
     # Test single completion
     omni_runner_handler.send_omni_request(request_config)
+
+
+def _output_token_ids(output) -> list[int]:
+    if not getattr(output, "outputs", None):
+        return []
+    completion = output.outputs[0]
+    token_ids = list(completion.token_ids or [])
+    if token_ids:
+        return token_ids
+    return list(getattr(completion, "cumulative_token_ids", None) or [])
+
+
+def _finish_reason(output) -> str | None:
+    if not getattr(output, "outputs", None):
+        return None
+    return getattr(output.outputs[0], "finish_reason", None)
+
+
+def _colocate_async_deploy() -> str:
+    """CI Qwen3-Omni deploy with sleep mode enabled on every stage."""
+    return modify_stage_config(
+        get_cuda_graph_config(),
+        updates={
+            "stages": {
+                0: {"enable_sleep_mode": True, "enforce_eager": True},
+                1: {"enable_sleep_mode": True, "enforce_eager": True},
+                2: {"enable_sleep_mode": True, "enforce_eager": True},
+            },
+        },
+    )
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.asyncio
+async def test_colocate_async_abort_tokens_and_sleep_admission() -> None:
+    """Prove the two remaining zhtmike/vllm-omni#1 bugs are fixed.
+
+    **required** regression. Control-plane APIs (``abort`` / ``sleep`` /
+    ``wake_up`` / ``resume_generation``) are not in ``send_omni_request``.
+
+    On ``origin/main`` this test fails:
+    - abort: ``generate()`` never yields ``finish_reason="abort"`` with the
+      tokens produced so far, so resume has an empty prefix (or the stream
+      hangs after frontend state is dropped).
+    - sleep: ``generate()`` is admitted into EngineCore while weights/KV are
+      offloaded, so the task errors (asleep / corrupted ADD frame) instead of
+      waiting for ``resume_generation()``.
+
+    On this PR both legs pass: abort returns a resumeable prefix, and sleep
+    holds ``generate()`` until wake + resume.
+    """
+    prompt = "What color is the sky? Write a long, detailed explanation."
+    with ExitStack() as after:
+        engine = AsyncOmni(
+            model=models[0],
+            deploy_config=_colocate_async_deploy(),
+            enable_sleep_mode=True,
+        )
+        after.callback(engine.shutdown)
+
+        request_id = "qwen3-abort-partial"
+        outputs: list = []
+
+        async def _generate(max_tokens: int, req_id: str, gen_prompt) -> None:
+            async for output in engine.generate(
+                prompt=gen_prompt,
+                request_id=req_id,
+                sampling_params=SamplingParams(temperature=0.0, max_tokens=max_tokens),
+                output_modalities=["text"],
+            ):
+                outputs.append(output)
+
+        abort_task = asyncio.create_task(_generate(256, request_id, prompt))
+        prefix: list[int] = []
+        prompt_token_ids: list[int] = []
+        for _ in range(600):
+            if abort_task.done():
+                break
+            if outputs:
+                latest = outputs[-1]
+                prefix = _output_token_ids(latest)
+                prompt_token_ids = list(getattr(latest, "prompt_token_ids", None) or [])
+                if prefix:
+                    break
+            await asyncio.sleep(0.1)
+
+        assert prefix, "generate produced no tokens before abort"
+        assert not abort_task.done(), "generate finished before abort; raise max_tokens"
+        await engine.abort(request_id)
+        await asyncio.wait_for(abort_task, timeout=90)
+
+        final = outputs[-1]
+        assert final.finished
+        assert _finish_reason(final) == "abort"
+        abort_prefix = _output_token_ids(final)
+        assert abort_prefix, "abort dropped the generated prefix (main-branch behavior)"
+
+        resume_prompt: str | TokensPrompt = (
+            TokensPrompt(prompt_token_ids=prompt_token_ids + abort_prefix) if prompt_token_ids else prompt
+        )
+        outputs.clear()
+        async for output in engine.generate(
+            prompt=resume_prompt,
+            request_id="qwen3-abort-resume",
+            sampling_params=SamplingParams(temperature=0.0, max_tokens=8),
+            output_modalities=["text"],
+        ):
+            outputs.append(output)
+        assert outputs
+        assert any(_output_token_ids(out) for out in outputs)
+
+        await engine.sleep(level=1)
+        outputs.clear()
+        sleep_task = asyncio.create_task(_generate(8, "qwen3-sleep-admission", prompt))
+        await asyncio.sleep(1.0)
+        assert not sleep_task.done(), "generate() ran while EngineCore was sleeping (main-branch admission race)"
+        await engine.wake_up()
+        await asyncio.sleep(0.5)
+        assert not sleep_task.done(), "generate() resumed before resume_generation()"
+        await engine.resume_generation()
+        await asyncio.wait_for(sleep_task, timeout=180)
+        assert outputs
+        assert _finish_reason(outputs[-1]) != "abort"
+    await asyncio.sleep(5)

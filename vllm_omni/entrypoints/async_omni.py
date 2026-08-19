@@ -146,6 +146,10 @@ class AsyncOmni(EngineClient, OmniBase):
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
+        # generate() coroutines that passed the pause wait but have not yet
+        # submitted to EngineCore. sleep() waits for this to hit zero so a
+        # pipelined request cannot race into EngineCore during drain/offload.
+        self._admitting: int = 0
         self._sleeping_tags: set[str] = set()
         self._level2_sleeping: bool = False
         self._duplex_request_client: DuplexRequestClient | None = None
@@ -504,31 +508,35 @@ class AsyncOmni(EngineClient, OmniBase):
         external_request_id = request_id
         request_id = self._get_unique_request_id(external_request_id)
 
-        # Wait until generation is resumed if the engine is paused
+        # Wait until generation is resumed if the engine is paused, then hold
+        # an admission slot until add_request completes so sleep() cannot
+        # race a just-unblocked generate into EngineCore during offload.
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
+            self._admitting = getattr(self, "_admitting", 0) + 1
+        admitting = True
 
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
 
-        _sleeping_tags = getattr(self, "_sleeping_tags", None)
-        if _sleeping_tags:
-            raise RuntimeError(
-                f"Generation rejected: Engine is partially or fully asleep. "
-                f"Currently sleeping tags: {list(_sleeping_tags)}. "
-                f"Please perform a full wake_up before generating."
-            )
-
-        # Reject diffusion list-prompt early with a clear API error.
-        if isinstance(prompt, list) and any(
-            getattr(client, "stage_type", "") == "diffusion" for client in getattr(self.engine, "stage_clients", [])
-        ):
-            raise ValueError(
-                "Diffusion stages accept only a single prompt per request. "
-                "Submit multiple independent requests to use scheduler batching."
-            )
-
         input_stream_task: asyncio.Task | None = None
         try:
+            _sleeping_tags = getattr(self, "_sleeping_tags", None)
+            if _sleeping_tags:
+                raise RuntimeError(
+                    f"Generation rejected: Engine is partially or fully asleep. "
+                    f"Currently sleeping tags: {list(_sleeping_tags)}. "
+                    f"Please perform a full wake_up before generating."
+                )
+
+            # Reject diffusion list-prompt early with a clear API error.
+            if isinstance(prompt, list) and any(
+                getattr(client, "stage_type", "") == "diffusion" for client in getattr(self.engine, "stage_clients", [])
+            ):
+                raise ValueError(
+                    "Diffusion stages accept only a single prompt per request. "
+                    "Submit multiple independent requests to use scheduler batching."
+                )
+
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
 
@@ -613,6 +621,8 @@ class AsyncOmni(EngineClient, OmniBase):
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
+            await self._release_generate_admission()
+            admitting = False
 
             # Process results based on mode
             # Both sequential and async_chunk modes read the same message stream
@@ -650,6 +660,15 @@ class AsyncOmni(EngineClient, OmniBase):
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
+        finally:
+            if admitting:
+                await self._release_generate_admission()
+
+    async def _release_generate_admission(self) -> None:
+        """Drop one in-flight generate admission slot held across add_request."""
+        async with self._pause_cond:
+            self._admitting = max(getattr(self, "_admitting", 1) - 1, 0)
+            self._pause_cond.notify_all()
 
     async def _add_streaming_input_request(
         self,
@@ -1105,11 +1124,21 @@ class AsyncOmni(EngineClient, OmniBase):
     async def _abort(self, request_ids: list[str]) -> None:
         """Abort request IDs via the engine and clean frontend state after ack.
 
-        Waits for orchestrator abort acknowledgment before popping
-        ``request_states`` so generate() cleanup stays consistent with
-        backend binding/request teardown. Orchestrator abort errors propagate.
+        Waits for orchestrator abort acknowledgment, enqueues any AR terminal
+        abort outputs (partial tokens) into each request's asyncio queue, then
+        pops ``request_states`` so generate() can observe the abort output
+        before frontend teardown. Orchestrator abort errors propagate.
         """
-        await self.engine.abort_async(request_ids)
+        abort_outputs = await self.engine.abort_async(request_ids) or []
+        for output_msg in abort_outputs:
+            req_id = getattr(output_msg, "request_id", None)
+            if req_id is None:
+                continue
+            state = self.request_states.get(req_id)
+            if state is None:
+                logger.debug("[AsyncOmni] Dropping abort output for unknown req %s", req_id)
+                continue
+            await state.queue.put(output_msg)
         for rid in request_ids:
             state = self.request_states.pop(rid, None)
             input_stream_task = getattr(state, "input_stream_task", None)
@@ -1237,11 +1266,24 @@ class AsyncOmni(EngineClient, OmniBase):
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
-        """Reset the multi-modal cache for all stages.
+        """Reset the frontend (P0) multimodal processor cache.
 
-        TODO: Forward to Orchestrator process via message.
+        ``EngineCore.sleep(level>=1)`` already clears the P1 receiver cache.
+        Clearing P0 avoids hash-only follow-up requests after that reset.
         """
-        logger.warning("[AsyncOmni] reset_mm_cache not yet supported with Orchestrator process")
+        processor = getattr(self, "input_processor", None)
+        if processor is None:
+            processor = getattr(self.engine, "input_processor", None)
+        cache = getattr(processor, "mm_processor_cache", None)
+        if cache is None:
+            logger.debug("[AsyncOmni] reset_mm_cache: no frontend mm_processor_cache")
+            return
+        for name in ("clear", "reset", "clear_cache"):
+            fn = getattr(cache, name, None)
+            if callable(fn):
+                fn()
+                return
+        logger.debug("[AsyncOmni] reset_mm_cache: cache has no clear/reset method")
 
     async def reset_encoder_cache(self) -> None:
         """Reset the encoder cache for all stages.
@@ -1281,10 +1323,15 @@ class AsyncOmni(EngineClient, OmniBase):
         (typical trainer order: pause → abort → sleep → train → wake → resume).
         """
         # Block admission before any sleep RPC so generate() waits on
-        # _pause_cond during the drain/offload window. EngineCore.sleep will
-        # pause the AR scheduler itself; avoid a second pause_scheduler here.
+        # _pause_cond during the drain/offload window. Wait until generate()
+        # coroutines that already passed the pause check have submitted (or
+        # failed) so EngineCore does not see ADD frames while sleeping.
         async with self._pause_cond:
             self._paused = True
+            await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
+
+        # P0 sender cache must drop hashes before EngineCore.sleep clears P1.
+        await self.reset_mm_cache()
 
         self._final_output_handler()
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
