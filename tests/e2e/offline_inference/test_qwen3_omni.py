@@ -195,6 +195,9 @@ async def test_colocate_async_abort_tokens_and_sleep_admission() -> None:
         assert outputs
         assert any(_output_token_ids(out) for out in outputs)
 
+        # Trainer order is pause → abort → sleep. Pause here after the
+        # resume generate so EngineCore is idle before CuMem offload.
+        await engine.pause_generation(mode="abort", clear_cache=True)
         await engine.sleep(level=1)
         outputs.clear()
         sleep_task = asyncio.create_task(_generate(8, "qwen3-sleep-admission", prompt))
