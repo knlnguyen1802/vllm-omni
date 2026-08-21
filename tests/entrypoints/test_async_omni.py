@@ -186,6 +186,145 @@ def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefi
 
 
 @pytest.mark.cpu
+def test_abort_pops_request_states_only_after_ack():
+    async def run():
+        release = asyncio.Event()
+        seen_during_wait: list[int] = []
+
+        async def slow_abort_async(request_ids):
+            del request_ids
+            seen_during_wait.append(len(omni.request_states))
+            await release.wait()
+
+        omni = get_async_omni_instance(fake_abort_request=slow_abort_async)
+        omni.request_states["req-1-aaaa"] = SimpleNamespace(
+            request_id="req-1-aaaa",
+            external_request_id="req-1",
+            input_stream_task=None,
+        )
+
+        task = asyncio.create_task(omni.abort("req-1"))
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert "req-1-aaaa" in omni.request_states
+        assert seen_during_wait == [1]
+
+        release.set()
+        await task
+        assert "req-1-aaaa" not in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_propagates_engine_errors_without_popping_state():
+    async def run():
+        async def failing_abort_async(request_ids):
+            del request_ids
+            raise RuntimeError("orchestrator abort failed")
+
+        omni = get_async_omni_instance(fake_abort_request=failing_abort_async)
+        omni.request_states["req-1-bbbb"] = SimpleNamespace(
+            request_id="req-1-bbbb",
+            external_request_id="req-1",
+            input_stream_task=None,
+        )
+
+        with pytest.raises(RuntimeError, match="orchestrator abort failed"):
+            await omni.abort("req-1")
+        assert "req-1-bbbb" in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_enqueues_prefix_tokens_from_engine():
+    """AR abort must deliver the generated prefix on the request queue (CPU)."""
+
+    async def run():
+        from vllm.outputs import CompletionOutput
+
+        from vllm_omni.engine.messages import OutputMessage
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def abort_with_prefix(request_ids):
+            rid = request_ids[0]
+            engine_output = OmniRequestOutput(
+                request_id=rid,
+                finished=True,
+                stage_id=0,
+                final_output_type="text",
+                outputs=[
+                    CompletionOutput(
+                        index=0,
+                        text="partial",
+                        token_ids=[7, 8, 9],
+                        cumulative_logprob=None,
+                        logprobs=None,
+                        finish_reason="abort",
+                        stop_reason=None,
+                    )
+                ],
+            )
+            return [
+                OutputMessage(
+                    request_id=rid,
+                    stage_id=0,
+                    replica_id=None,
+                    engine_outputs=engine_output,
+                    metrics=None,
+                    finished=True,
+                    stage_submit_ts=None,
+                )
+            ]
+
+        omni = get_async_omni_instance(fake_abort_request=abort_with_prefix)
+        omni.request_states["req-1-cccc"] = SimpleNamespace(
+            request_id="req-1-cccc",
+            external_request_id="req-1",
+            input_stream_task=None,
+            queue=queue,
+        )
+        await omni._abort(["req-1-cccc"])
+        msg = queue.get_nowait()
+        assert msg.finished is True
+        assert list(msg.engine_outputs.outputs[0].token_ids) == [7, 8, 9]
+        assert msg.engine_outputs.outputs[0].finish_reason == "abort"
+        assert "req-1-cccc" not in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
+    """Empty abort_async must still unblock generate() with finish_reason=abort."""
+
+    async def run():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def empty_abort_async(request_ids):
+            del request_ids
+            return []
+
+        omni = get_async_omni_instance(fake_abort_request=empty_abort_async)
+        omni.request_states["req-1-dddd"] = SimpleNamespace(
+            request_id="req-1-dddd",
+            external_request_id="req-1",
+            input_stream_task=None,
+            queue=queue,
+        )
+        await omni._abort(["req-1-dddd"])
+        msg = queue.get_nowait()
+        assert msg.finished is True
+        assert msg.request_id == "req-1-dddd"
+        assert msg.engine_outputs.outputs[0].finish_reason == "abort"
+        assert "req-1-dddd" not in omni.request_states
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_accepts_request_after_repeated_cancellations():
     async def run_test():
         submitted_request_ids = []

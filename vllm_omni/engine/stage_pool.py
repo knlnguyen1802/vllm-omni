@@ -94,6 +94,16 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    # Only these EngineCore helpers may skip collective_rpc_async. A generic
+    # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
+    _ENGINE_CORE_CONTROL_ASYNC_METHODS = frozenset(
+        {
+            "pause_scheduler",
+            "resume_scheduler",
+            "sleep",
+            "wake_up",
+        }
+    )
 
     def __init__(
         self,
@@ -1175,14 +1185,19 @@ class StagePool:
 
     # ---- Stage-local control plane ----
 
-    async def abort_requests(self, request_ids: list[str]) -> None:
+    async def abort_requests(self, request_ids: list[str]) -> list[tuple[str, Any]]:
         """Abort the given requests in this stage pool.
 
         Request-bound abort routing stays inside the pool because route affinity
         (``request_id -> replica_id``) is pool-owned.
+
+        For AR stages, collect terminal abort ``RequestOutput`` objects from
+        output-processor state *before* EngineCore abort so partial tokens
+        generated so far are preserved. Diffusion stages return no abort
+        outputs (whole-sample retry remains the recovery path).
         """
         if not request_ids:
-            return
+            return []
 
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
@@ -1192,18 +1207,37 @@ class StagePool:
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
+        abort_outputs: list[tuple[str, Any]] = []
+        is_diffusion = self.stage_type == "diffusion"
         for replica_id, replica_request_ids in request_ids_by_replica.items():
+            # Orchestrator ids are OP external ids; EngineCore may use a
+            # different internal request_id assigned by InputProcessor.
+            # Always key collected outputs by the orchestrator id we passed
+            # (internal=False), never by RequestOutput.request_id — some stages
+            # still surface EngineCore/internal ids and would drop the prefix.
+            engine_abort_ids = list(replica_request_ids)
+            if not is_diffusion and self._output_processor is not None:
+                collect = getattr(self._output_processor, "abort_requests_collecting_outputs", None)
+                if collect is not None:
+                    engine_abort_ids = []
+                    for orch_req_id in replica_request_ids:
+                        collected_ids, stage_outputs = collect([orch_req_id], internal=False)
+                        for req_out in stage_outputs:
+                            abort_outputs.append((orch_req_id, req_out))
+                        if collected_ids:
+                            engine_abort_ids.extend(collected_ids)
+                        else:
+                            engine_abort_ids.append(orch_req_id)
+                else:
+                    aborted = self._output_processor.abort_requests(replica_request_ids, internal=False)
+                    if aborted:
+                        engine_abort_ids = list(aborted)
             client = self.clients[replica_id]
             if client is None:
                 continue
-            await client.abort_requests_async(replica_request_ids)
+            await client.abort_requests_async(engine_abort_ids)
 
-        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
-        # would otherwise leak — aborted requests never produce a final
-        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
-        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
-        if all_aborted and self._output_processor is not None:
-            self._output_processor.abort_requests(all_aborted, internal=True)
+        return abort_outputs
 
     async def collective_rpc(
         self,
@@ -1214,6 +1248,7 @@ class StagePool:
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
         """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
         if client is None:
@@ -1222,6 +1257,14 @@ class StagePool:
                 "error": f"stage {self.stage_id} replica {replica_id} is not attached",
             }
         try:
+            if self.stage_type != "diffusion" and method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+                client_method = getattr(client, f"{method}_async", None)
+                if callable(client_method):
+                    result = client_method(*args, **kwargs)
+                    if timeout is not None:
+                        return await asyncio.wait_for(result, timeout=timeout)
+                    return await result
+
             return await client.collective_rpc_async(
                 method=method,
                 timeout=timeout,
@@ -1235,9 +1278,13 @@ class StagePool:
                 replica_id,
                 method,
             )
+            if isinstance(exc, TimeoutError):
+                error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
+            else:
+                error = str(exc) or repr(exc)
             return {
                 "supported": False,
-                "error": str(exc),
+                "error": error,
             }
 
     def shutdown_replica(self, replica_id: int) -> None:

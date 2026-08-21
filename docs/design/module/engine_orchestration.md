@@ -37,6 +37,7 @@ validation_paths:
   - tests/engine/test_async_omni_engine_input.py
   - tests/engine/test_async_omni_engine_outputs.py
   - tests/engine/test_async_omni_engine_abort.py
+  - tests/e2e/offline_inference/test_qwen3_omni.py
   - tests/engine/test_async_omni_engine_stage_init.py
   - tests/engine/test_orchestrator.py
   - tests/engine/test_orchestrator_error_handling.py
@@ -107,6 +108,9 @@ Numbers become append-only after normative promotion.
 
 Test routing, output ordering, queue correlation, cancellation, failure
 propagation, shutdown ordering, and representative multi-stage execution.
+AR abort of a final-stage LLM request must deliver a terminal output with
+`finish_reason="abort"` and the generated prefix so collocated training can
+resume; diffusion abort remains whole-sample retry.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 

@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
 from typing import Any
 
@@ -416,6 +417,26 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         return self._native_text_metrics_by_request.pop(request_id, {})
 
     def abort_requests(self, request_ids, internal: bool) -> list[str]:
+        aborted_ids, _outputs = self.abort_requests_collecting_outputs(request_ids, internal=internal)
+        return aborted_ids
+
+    def abort_requests_collecting_outputs(
+        self,
+        request_ids: Iterable[str],
+        *,
+        internal: bool,
+    ) -> tuple[list[str], list[RequestOutput | PoolingRequestOutput]]:
+        """Abort requests and return terminal abort outputs with partial tokens.
+
+        Mirrors upstream ``OutputProcessor.abort_requests``, but also returns
+        abort ``RequestOutput`` objects when ``queue`` is ``None`` (Omni stage
+        pools register OP state without a collector queue).
+
+        Terminal abort outputs use ``RequestOutputKind.CUMULATIVE`` so DELTA
+        streaming requests still surface the full prefix generated so far.
+        ``new_token_ids`` is the detokenizer prefix: Omni's
+        ``make_request_output`` writes that list onto ``CompletionOutput.token_ids``.
+        """
         request_ids = list(request_ids)
         for request_id in request_ids:
             if internal:
@@ -424,7 +445,60 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     self._native_text_metrics_by_request.pop(req_state.external_req_id, None)
             else:
                 self._native_text_metrics_by_request.pop(request_id, None)
-        return super().abort_requests(request_ids, internal)
+
+        internal_req_ids: list[str] = []
+        for request_id in request_ids:
+            if internal:
+                internal_req_ids.append(request_id)
+                if req_state := self.request_states.get(request_id):
+                    external_req_id = req_state.external_req_id
+                    internal_ids = self.external_req_ids.get(external_req_id)
+                    if internal_ids is not None:
+                        try:
+                            internal_ids.remove(request_id)
+                        except ValueError:
+                            pass
+                        if not internal_ids:
+                            self.external_req_ids.pop(external_req_id, None)
+            elif internal_ids := self.external_req_ids.pop(request_id, []):
+                internal_req_ids.extend(internal_ids)
+
+        request_ids_to_abort: list[str] = []
+        abort_outputs: list[RequestOutput | PoolingRequestOutput] = []
+        for request_id in internal_req_ids:
+            req_state = self.request_states.pop(request_id, None)
+            if req_state is not None:
+                self.lora_states.request_finished(request_id, req_state.lora_name)
+                request_ids_to_abort.append(request_id)
+                original_kind = req_state.output_kind
+                req_state.output_kind = RequestOutputKind.CUMULATIVE
+                detok = req_state.detokenizer
+                new_token_ids = list(detok.output_token_ids) if detok is not None else []
+                try:
+                    request_output = req_state.make_request_output(
+                        new_token_ids=new_token_ids,
+                        pooling_output=None,
+                        finish_reason=FinishReason.ABORT,
+                        stop_reason=None,
+                        kv_transfer_params=None,
+                    )
+                finally:
+                    req_state.output_kind = original_kind
+                if request_output is not None:
+                    abort_outputs.append(request_output)
+                    if req_state.queue is not None:
+                        req_state.queue.put(request_output)
+            elif parent := self.parent_requests.get(request_id):
+                if parent.child_requests:
+                    child_reqs = list(parent.child_requests)
+                    child_aborted, child_outputs = self.abort_requests_collecting_outputs(
+                        child_reqs,
+                        internal=True,
+                    )
+                    request_ids_to_abort.extend(child_aborted)
+                    abort_outputs.extend(child_outputs)
+                self.parent_requests.pop(request_id, None)
+        return request_ids_to_abort, abort_outputs
 
     def add_request(
         self,
