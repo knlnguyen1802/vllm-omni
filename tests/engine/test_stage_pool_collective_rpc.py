@@ -67,5 +67,6 @@ def test_collective_rpc_control_helper_honors_timeout():
         result = await pool.collective_rpc(0, "sleep", timeout=0.01, args=(1,))
         assert result != "slept"
         assert result["supported"] is False
+        assert "sleep timed out after 0.01s" in result["error"]
 
     asyncio.run(run())

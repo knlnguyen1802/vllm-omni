@@ -1212,17 +1212,22 @@ class StagePool:
         for replica_id, replica_request_ids in request_ids_by_replica.items():
             # Orchestrator ids are OP external ids; EngineCore may use a
             # different internal request_id assigned by InputProcessor.
+            # Always key collected outputs by the orchestrator id we passed
+            # (internal=False), never by RequestOutput.request_id — some stages
+            # still surface EngineCore/internal ids and would drop the prefix.
             engine_abort_ids = list(replica_request_ids)
             if not is_diffusion and self._output_processor is not None:
                 collect = getattr(self._output_processor, "abort_requests_collecting_outputs", None)
                 if collect is not None:
-                    collected_ids, stage_outputs = collect(replica_request_ids, internal=False)
-                    for req_out in stage_outputs:
-                        req_id = getattr(req_out, "request_id", None)
-                        if req_id:
-                            abort_outputs.append((req_id, req_out))
-                    if collected_ids:
-                        engine_abort_ids = list(collected_ids)
+                    engine_abort_ids = []
+                    for orch_req_id in replica_request_ids:
+                        collected_ids, stage_outputs = collect([orch_req_id], internal=False)
+                        for req_out in stage_outputs:
+                            abort_outputs.append((orch_req_id, req_out))
+                        if collected_ids:
+                            engine_abort_ids.extend(collected_ids)
+                        else:
+                            engine_abort_ids.append(orch_req_id)
                 else:
                     aborted = self._output_processor.abort_requests(replica_request_ids, internal=False)
                     if aborted:
@@ -1273,9 +1278,13 @@ class StagePool:
                 replica_id,
                 method,
             )
+            if isinstance(exc, TimeoutError):
+                error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
+            else:
+                error = str(exc) or repr(exc)
             return {
                 "supported": False,
-                "error": str(exc),
+                "error": error,
             }
 
     def shutdown_replica(self, replica_id: int) -> None:

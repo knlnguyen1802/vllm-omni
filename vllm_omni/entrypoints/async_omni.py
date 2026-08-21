@@ -17,7 +17,7 @@ from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.outputs import PoolingRequestOutput
+from vllm.outputs import CompletionOutput, PoolingRequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
 from vllm.renderers.inputs.preprocess import extract_prompt_components
@@ -597,8 +597,11 @@ class AsyncOmni(EngineClient, OmniBase):
                 req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
 
             # Add request(s) to stage 0. For streaming inputs, submit
-            # chunks incrementally through streaming_update.
+            # chunks incrementally through streaming_update. Hold the
+            # admission slot until the first ADD actually completes — the
+            # helper returns as soon as the pump task is created.
             if isinstance(prompt, AsyncGenerator):
+                first_chunk_submitted = asyncio.get_running_loop().create_future()
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
                     input_stream=prompt,
@@ -607,7 +610,9 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    first_chunk_submitted=first_chunk_submitted,
                 )
+                await first_chunk_submitted
             else:
                 await self.engine.add_request_async(
                     request_id=request_id,
@@ -680,6 +685,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
         lora_request: Any = None,
+        first_chunk_submitted: asyncio.Future[None] | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -695,6 +701,10 @@ class AsyncOmni(EngineClient, OmniBase):
         if not stage0_params.skip_clone:
             stage0_params = stage0_params.clone()
             stage0_params.skip_clone = True
+
+        def _mark_first_chunk_submitted() -> None:
+            if first_chunk_submitted is not None and not first_chunk_submitted.done():
+                first_chunk_submitted.set_result(None)
 
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
@@ -721,6 +731,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             resumable=True,
                         )
                         has_submitted_first_chunk = True
+                        _mark_first_chunk_submitted()
                     else:
                         await self.engine.add_streaming_update_async(
                             request_id=request_id,
@@ -746,37 +757,43 @@ class AsyncOmni(EngineClient, OmniBase):
                     )
                 )
             finally:
-                if not cancelled:
-                    # Send empty final request to indicate that inputs have
-                    # finished. Don't send if canceled (session was aborted).
-                    final_sampling_params_list = list(sampling_params_list)
-                    final_sampling_params_list[0] = stage0_params
-                    final_prompt = TokensPrompt(prompt_token_ids=[0])
+                try:
+                    if not cancelled:
+                        # Send empty final request to indicate that inputs have
+                        # finished. Don't send if canceled (session was aborted).
+                        final_sampling_params_list = list(sampling_params_list)
+                        final_sampling_params_list[0] = stage0_params
+                        final_prompt = TokensPrompt(prompt_token_ids=[0])
 
-                    if has_submitted_first_chunk:
-                        await self.engine.add_streaming_update_async(
-                            request_id=request_id,
-                            prompt=final_prompt,
-                            prompt_text=None,
-                            sampling_params_list=final_sampling_params_list,
-                            final_stage_id=final_stage_id,
-                            final_output_stage_ids=final_output_stage_ids,
-                            arrival_time=arrival_time,
-                            lora_request=lora_request,
-                            resumable=False,
-                        )
-                    else:
-                        await self.engine.add_request_async(
-                            request_id=request_id,
-                            prompt=final_prompt,
-                            prompt_text=None,
-                            sampling_params_list=final_sampling_params_list,
-                            final_stage_id=final_stage_id,
-                            final_output_stage_ids=final_output_stage_ids,
-                            arrival_time=arrival_time,
-                            lora_request=lora_request,
-                            resumable=False,
-                        )
+                        if has_submitted_first_chunk:
+                            await self.engine.add_streaming_update_async(
+                                request_id=request_id,
+                                prompt=final_prompt,
+                                prompt_text=None,
+                                sampling_params_list=final_sampling_params_list,
+                                final_stage_id=final_stage_id,
+                                final_output_stage_ids=final_output_stage_ids,
+                                arrival_time=arrival_time,
+                                lora_request=lora_request,
+                                resumable=False,
+                            )
+                        else:
+                            await self.engine.add_request_async(
+                                request_id=request_id,
+                                prompt=final_prompt,
+                                prompt_text=None,
+                                sampling_params_list=final_sampling_params_list,
+                                final_stage_id=final_stage_id,
+                                final_output_stage_ids=final_output_stage_ids,
+                                arrival_time=arrival_time,
+                                lora_request=lora_request,
+                                resumable=False,
+                            )
+                            has_submitted_first_chunk = True
+                finally:
+                    # Always release generate() admission, even on cancel /
+                    # empty stream / submit failure, so sleep() cannot stall.
+                    _mark_first_chunk_submitted()
 
         input_stream_task = asyncio.create_task(handle_inputs())
         req_state.input_stream_task = input_stream_task
@@ -1128,8 +1145,13 @@ class AsyncOmni(EngineClient, OmniBase):
         abort outputs (partial tokens) into each request's asyncio queue, then
         pops ``request_states`` so generate() can observe the abort output
         before frontend teardown. Orchestrator abort errors propagate.
+
+        When ``abort_async`` returns no output for an active request (OP not
+        registered yet, unbound replica, or orchestrator id drop), enqueue a
+        synthetic finished abort so ``generate()`` cannot hang on ``queue.get``.
         """
         abort_outputs = await self.engine.abort_async(request_ids) or []
+        delivered: set[str] = set()
         for output_msg in abort_outputs:
             req_id = getattr(output_msg, "request_id", None)
             if req_id is None:
@@ -1139,6 +1161,14 @@ class AsyncOmni(EngineClient, OmniBase):
                 logger.debug("[AsyncOmni] Dropping abort output for unknown req %s", req_id)
                 continue
             await state.queue.put(output_msg)
+            delivered.add(req_id)
+        for rid in request_ids:
+            state = self.request_states.get(rid)
+            if state is not None and rid not in delivered:
+                queue = getattr(state, "queue", None)
+                if queue is not None:
+                    await state.queue.put(self._synthetic_abort_output_message(rid))
+                    delivered.add(rid)
         for rid in request_ids:
             state = self.request_states.pop(rid, None)
             input_stream_task = getattr(state, "input_stream_task", None)
@@ -1146,6 +1176,36 @@ class AsyncOmni(EngineClient, OmniBase):
                 input_stream_task.cancel()
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
+
+    @staticmethod
+    def _synthetic_abort_output_message(request_id: str) -> OutputMessage:
+        """Terminal abort OutputMessage used when the engine returned none."""
+        engine_output = OmniRequestOutput(
+            request_id=request_id,
+            finished=True,
+            stage_id=0,
+            final_output_type="text",
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="",
+                    token_ids=[],
+                    cumulative_logprob=None,
+                    logprobs=None,
+                    finish_reason="abort",
+                    stop_reason=None,
+                )
+            ],
+        )
+        return OutputMessage(
+            request_id=request_id,
+            stage_id=0,
+            replica_id=None,
+            engine_outputs=engine_output,
+            metrics=None,
+            finished=True,
+            stage_submit_ts=None,
+        )
 
     def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
