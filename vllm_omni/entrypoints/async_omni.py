@@ -146,6 +146,11 @@ class AsyncOmni(EngineClient, OmniBase):
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
+        # True after pause_generation() or AR EngineCore sleep; wake_up must
+        # not reopen generate() until resume_generation(). Diffusion-only
+        # sleep uses _paused as a temporary admission gate and clears it
+        # on wake so sleep → wake → generate keeps working.
+        self._hold_admission_until_resume: bool = False
         self._sleeping_tags: set[str] = set()
         self._level2_sleeping: bool = False
         self._duplex_request_client: DuplexRequestClient | None = None
@@ -1168,6 +1173,7 @@ class AsyncOmni(EngineClient, OmniBase):
             # Keep running EngineCore pause + cache clear even when frontend
             # admission is already paused (sleep or a prior pause_generation).
             self._paused = True
+            self._hold_admission_until_resume = True
 
         ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         if ar_stage_ids:
@@ -1204,6 +1210,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
         async with self._pause_cond:
             self._paused = False
+            self._hold_admission_until_resume = False
             self._pause_cond.notify_all()
 
     async def is_paused(self) -> bool:
@@ -1276,9 +1283,13 @@ class AsyncOmni(EngineClient, OmniBase):
         Frontend admission is blocked at the start of this call (``_paused``)
         so pipelined :meth:`generate` cannot race into stages while sleep is
         in flight. This does **not** invoke EngineCore.pause_scheduler again
-        (sleep already pauses the AR scheduler). ``wake_up`` does **not** clear
-        ``_paused``; callers must :meth:`resume_generation` when ready
-        (typical trainer order: pause → abort → sleep → train → wake → resume).
+        (sleep already pauses the AR scheduler).
+
+        For AR / mixed engines, ``wake_up`` does **not** clear ``_paused``;
+        callers must :meth:`resume_generation` when ready (typical trainer
+        order: pause → abort → sleep → train → wake → resume). Diffusion-only
+        engines have no EngineCore pause to hold, so ``wake_up`` restores
+        admission and ``sleep → wake → generate`` keeps working.
         """
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. EngineCore.sleep will
@@ -1288,9 +1299,9 @@ class AsyncOmni(EngineClient, OmniBase):
 
         self._final_output_handler()
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
-
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
+            self._hold_admission_until_resume = True
             logger.info(
                 "[%s] Sleeping AR stage(s) %s via EngineCore.sleep(level=%s, mode=%s)",
                 self._name,
@@ -1351,9 +1362,11 @@ class AsyncOmni(EngineClient, OmniBase):
         AR/LLM stages use EngineCore.wake_up (restore memory, auto-resume
         scheduler). Diffusion stages keep the worker-level wake RPC.
 
-        Does **not** clear the frontend ``_paused`` admission gate set by
-        :meth:`sleep` / :meth:`pause_generation`. Call :meth:`resume_generation`
-        when the trainer is ready to admit new requests.
+        Does **not** clear the frontend ``_paused`` admission gate when
+        :meth:`pause_generation` ran or AR stages were slept — call
+        :meth:`resume_generation` when the trainer is ready to admit new
+        requests. Diffusion-only ``sleep`` uses ``_paused`` only as a race
+        guard; this method restores admission after a successful wake.
         """
         self._final_output_handler()
 
@@ -1410,6 +1423,13 @@ class AsyncOmni(EngineClient, OmniBase):
             self._name,
             ar_stage_ids + diffusion_stage_ids,
         )
+        # Diffusion-only sleep uses `_paused` as a race guard. Restore
+        # generate() admission after memory is back. AR/mixed sleep and
+        # pause_generation keep the trainer hold until resume_generation.
+        if not getattr(self, "_hold_admission_until_resume", False):
+            async with self._pause_cond:
+                self._paused = False
+                self._pause_cond.notify_all()
         return final_acks
 
     async def _wake_diffusion(self, stage_ids: list[int], requested_tags: list[str]) -> list[OmniACK]:

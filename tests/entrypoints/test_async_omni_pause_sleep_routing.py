@@ -18,6 +18,7 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
     omni._pause_cond = asyncio.Condition()
     omni._paused = False
+    omni._hold_admission_until_resume = False
     omni._sleeping_tags = set()
     omni._level2_sleeping = False
     omni.event_resolver = SimpleNamespace(watch_task=lambda *a, **k: None, resolve=AsyncMock())
@@ -61,6 +62,7 @@ def test_pause_generation_routes_ar_via_collective_rpc():
         await omni.pause_generation(mode="abort", clear_cache=True)
 
         assert omni._paused is True
+        assert omni._hold_admission_until_resume is True
         omni.collective_rpc.assert_awaited_once_with(
             method="pause_scheduler",
             args=(),
@@ -110,6 +112,7 @@ def test_resume_generation_resumes_ar_then_clears_frontend_pause():
             stage_ids=[0],
         )
         assert omni._paused is False
+        assert omni._hold_admission_until_resume is False
 
     asyncio.run(run())
 
@@ -136,6 +139,7 @@ def test_sleep_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
         assert CuMemTag.KV_CACHE.value in omni._sleeping_tags
         # Sleep gates frontend admission for the trainer resume contract.
         assert omni._paused is True
+        assert omni._hold_admission_until_resume is True
 
     asyncio.run(run())
 
@@ -160,6 +164,7 @@ def test_sleep_blocks_admission_before_engine_core_rpc():
 
         assert paused_at_rpc == [True]
         assert omni._paused is True
+        assert omni._hold_admission_until_resume is True
         # Sleep must not also call pause_scheduler (EngineCore.sleep pauses).
         assert all(c.kwargs.get("method") != "pause_scheduler" for c in omni.collective_rpc.await_args_list)
 
@@ -171,6 +176,7 @@ def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
         omni._paused = True
+        omni._hold_admission_until_resume = True
         omni._sleeping_tags = {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}
         diffusion_ack = OmniACK(task_id="diff", status="SUCCESS", stage_id=1, rank=0)
         omni._wake_diffusion = AsyncMock(return_value=[diffusion_ack])
@@ -188,8 +194,9 @@ def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
         omni._wake_diffusion.assert_awaited_once()
         assert {ack.stage_id for ack in acks} == {0, 1}
         assert not omni._sleeping_tags
-        # wake_up restores memory but does not resume frontend admission.
+        # Mixed/AR wake restores memory but does not resume frontend admission.
         assert omni._paused is True
+        assert omni._hold_admission_until_resume is True
 
     asyncio.run(run())
 
@@ -198,16 +205,19 @@ def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
 def test_wake_up_does_not_resume_frontend_admission():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
-        omni._paused = True
-        omni._sleeping_tags = {CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value}
+        await omni.sleep(level=1, mode="abort")
+        assert omni._paused is True
+        assert omni._hold_admission_until_resume is True
 
         await omni.wake_up()
 
         assert omni._paused is True
+        assert omni._hold_admission_until_resume is True
         assert not omni._sleeping_tags
-        # Explicit resume is required after sleep/wake.
+        # Explicit resume is required after AR sleep/wake.
         await omni.resume_generation()
         assert omni._paused is False
+        assert omni._hold_admission_until_resume is False
 
     asyncio.run(run())
 
@@ -225,6 +235,8 @@ def test_sleep_level1_wake_without_tags_clears_all_sleeping_tags():
 
         await omni.wake_up()
         assert not omni._sleeping_tags
+        assert omni._paused is True
+        assert omni._hold_admission_until_resume is True
 
     asyncio.run(run())
 
@@ -243,5 +255,56 @@ def test_sleep_diffusion_only_skips_engine_core_collective_rpc():
         )
         omni._sleep_diffusion.assert_awaited_once_with([0], 1)
         assert omni._paused is True
+        assert omni._hold_admission_until_resume is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_wake_up_restores_admission_for_diffusion_only():
+    """Pure diffusion must keep sleep → wake → generate (no resume)."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni._sleep_diffusion = AsyncMock(return_value=[OmniACK(task_id="d", status="SUCCESS", stage_id=0, rank=0)])
+        omni._wake_diffusion = AsyncMock(return_value=[OmniACK(task_id="w", status="SUCCESS", stage_id=0, rank=0)])
+
+        await omni.sleep(level=1)
+        assert omni._paused is True
+
+        async def wait_for_admission() -> None:
+            async with omni._pause_cond:
+                await omni._pause_cond.wait_for(lambda: not omni._paused)
+
+        waiter = asyncio.create_task(wait_for_admission())
+        await omni.wake_up()
+        await asyncio.wait_for(waiter, timeout=1.0)
+        assert omni._paused is False
+        assert omni._hold_admission_until_resume is False
+        assert not omni._sleeping_tags
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_pause_then_sleep_wake_keeps_admission_paused_for_diffusion():
+    """Explicit pause_generation still requires resume after diffusion wake."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["diffusion"])
+        omni.reset_prefix_cache = AsyncMock(return_value=True)
+        omni.reset_mm_cache = AsyncMock()
+        omni.reset_encoder_cache = AsyncMock()
+        omni._sleep_diffusion = AsyncMock(return_value=[OmniACK(task_id="d", status="SUCCESS", stage_id=0, rank=0)])
+        omni._wake_diffusion = AsyncMock(return_value=[OmniACK(task_id="w", status="SUCCESS", stage_id=0, rank=0)])
+
+        await omni.pause_generation()
+        await omni.sleep(level=1)
+        await omni.wake_up()
+
+        assert omni._paused is True
+        assert omni._hold_admission_until_resume is True
+        await omni.resume_generation()
+        assert omni._paused is False
 
     asyncio.run(run())
