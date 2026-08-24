@@ -19,6 +19,7 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni._pause_cond = asyncio.Condition()
     omni._paused = False
     omni._hold_admission_until_resume = False
+    omni._admitting = 0
     omni._sleeping_tags = set()
     omni._level2_sleeping = False
     omni.event_resolver = SimpleNamespace(watch_task=lambda *a, **k: None, resolve=AsyncMock())
@@ -172,6 +173,33 @@ def test_sleep_blocks_admission_before_engine_core_rpc():
 
 
 @pytest.mark.cpu
+def test_sleep_waits_for_in_flight_generate_admission():
+    """Sleep must not offload while generate() is still in add_request."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._admitting = 1
+        rpc_started = asyncio.Event()
+
+        async def rpc_side_effect(**kwargs):
+            if kwargs.get("method") == "sleep":
+                rpc_started.set()
+            return [True]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc_side_effect)
+        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
+        await asyncio.sleep(0.05)
+        assert not sleep_task.done()
+        assert not rpc_started.is_set()
+        await omni._release_generate_admission()
+        await asyncio.wait_for(sleep_task, timeout=1)
+        assert rpc_started.is_set()
+        assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_wake_up_routes_ar_via_collective_rpc_and_diffusion_to_worker_rpc():
     async def run() -> None:
         omni = _make_omni(stage_types=["llm", "diffusion"])
@@ -306,5 +334,48 @@ def test_pause_then_sleep_wake_keeps_admission_paused_for_diffusion():
         assert omni._hold_admission_until_resume is True
         await omni.resume_generation()
         assert omni._paused is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_streaming_first_chunk_holds_admission_until_add_completes():
+    """Sleep must wait while the streaming pump's first ADD is still in flight."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        first_chunk_submitted = asyncio.get_running_loop().create_future()
+        rpc_started = asyncio.Event()
+
+        async def rpc_side_effect(**kwargs):
+            if kwargs.get("method") == "sleep":
+                rpc_started.set()
+            return [True]
+
+        omni.collective_rpc = AsyncMock(side_effect=rpc_side_effect)
+
+        # Mirror generate(): hold admission until the streaming first-chunk
+        # future completes, then release before EngineCore sleep can proceed.
+        async with omni._pause_cond:
+            omni._admitting += 1
+
+        async def streaming_admission() -> None:
+            await first_chunk_submitted
+            await omni._release_generate_admission()
+
+        admit_task = asyncio.create_task(streaming_admission())
+        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
+        await asyncio.sleep(0.05)
+        assert not sleep_task.done()
+        assert not rpc_started.is_set()
+        assert omni._admitting == 1
+
+        # First ADD still running: sleep must not start EngineCore offload.
+        assert not first_chunk_submitted.done()
+        first_chunk_submitted.set_result(None)
+        await asyncio.wait_for(admit_task, timeout=1)
+        await asyncio.wait_for(sleep_task, timeout=1)
+        assert rpc_started.is_set()
+        assert omni._admitting == 0
 
     asyncio.run(run())

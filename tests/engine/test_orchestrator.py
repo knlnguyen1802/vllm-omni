@@ -245,8 +245,32 @@ class FakeOutputProcessor:
         )
 
     def abort_requests(self, request_ids, internal: bool = False):
-        self.abort_calls.append(request_ids)
-        return request_ids
+        aborted_ids, _outputs = self.abort_requests_collecting_outputs(request_ids, internal=internal)
+        return aborted_ids
+
+    def abort_requests_collecting_outputs(self, request_ids, *, internal: bool = False):
+        """Mirror MultimodalOutputProcessor collecting for AR abort-prefix tests."""
+        del internal
+        ids = list(request_ids)
+        self.abort_calls.append(ids)
+        outputs: list[RequestOutput] = []
+        for rid in ids:
+            seeded = next(
+                (ro for ro in self.request_outputs if getattr(ro, "request_id", None) == rid),
+                None,
+            )
+            token_ids = list(seeded.outputs[0].token_ids) if seeded is not None and seeded.outputs else [1, 2]
+            # Intentionally stamp an internal-looking id on the RequestOutput so
+            # StagePool must re-key by the orchestrator id it passed in.
+            outputs.append(
+                _build_request_output(
+                    f"engine-internal-{rid}",
+                    token_ids=token_ids,
+                    finished=True,
+                    finish_reason="abort",
+                )
+            )
+        return ids, outputs
 
     def update_scheduler_stats(self, _scheduler_stats) -> None:
         return None
@@ -295,6 +319,7 @@ def _build_request_output(
     prompt_token_ids: list[int] | None = None,
     finished: bool = True,
     text: str = "test",
+    finish_reason: str | None = None,
 ) -> RequestOutput:
     completion = CompletionOutput(
         index=0,
@@ -302,7 +327,7 @@ def _build_request_output(
         token_ids=list(token_ids or [1, 2]),
         cumulative_logprob=0.0,
         logprobs=None,
-        finish_reason="stop" if finished else None,
+        finish_reason=(finish_reason if finish_reason is not None else ("stop" if finished else None)),
         stop_reason=None,
     )
     return RequestOutput(
@@ -845,6 +870,14 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
         assert result.rpc_correlation_key == ("abort", "abort-1")
         assert stages[0].abort_calls == [["req-ack"]]
         assert "req-ack" not in orchestrator_fixture.orchestrator.request_states
+        assert result.abort_outputs is not None
+        assert len(result.abort_outputs) == 1
+        abort_msg = result.abort_outputs[0]
+        assert abort_msg.request_id == "req-ack"
+        assert abort_msg.finished is True
+        assert abort_msg.stage_id == 1
+        assert list(abort_msg.engine_outputs.outputs[0].token_ids) == [2]
+        assert abort_msg.engine_outputs.outputs[0].finish_reason == "abort"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 

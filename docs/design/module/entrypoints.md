@@ -43,6 +43,7 @@ depends_on:
 validation_paths:
   - tests/entrypoints/test_omni_entrypoints.py
   - tests/entrypoints/test_async_omni.py
+  - tests/entrypoints/test_async_omni_pause_sleep_routing.py
   - tests/entrypoints/test_async_omni_duplex.py
   - tests/entrypoints/test_serve.py
   - tests/entrypoints/test_stream_finish_reason.py
@@ -119,7 +120,9 @@ promotion.
 
 Test request validation, protocol conversion, model-adapter routing,
 streaming, session identity, disconnect/cancellation, and error mapping for
-each affected offline or serving entrypoint.
+each affected offline or serving entrypoint. Sleep must wait for in-flight
+`generate()` admission before EngineCore offload; `wake_up` does not resume
+admission — callers must `resume_generation()`.
 
 ## Promotion gate
 
