@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
@@ -18,6 +18,7 @@ class CosyVoice3Config(PretrainedConfig):
         self.llm_output_size = 896
         self.hidden_size = self.llm_output_size
         self.num_attention_heads = 14
+        self.num_key_value_heads = 2
         self.num_hidden_layers = 24
         self.spk_embed_dim = 192
         self.token_frame_rate = 25
@@ -42,6 +43,13 @@ class CosyVoice3Config(PretrainedConfig):
         self.qwen_pretrain_path = "CosyVoice-BlankEN"
         self.campplus_onxx_path = "campplus.onnx"
         self.speech_tokenizer_path = "speech_tokenizer_v3.onnx"
+        # Flow-decoder estimator ONNX for the optional TensorRT code2wav path.
+        # The fp16 (strongly-typed) ONNX gives an fp16 engine; if it is not in
+        # the model dir it is fetched from ``flow_estimator_onnx_repo``. Falls
+        # back to the bundled fp32 ONNX (fp32+TF32 engine) when unavailable.
+        self.flow_estimator_onnx_path = "flow.decoder.estimator.autocast_fp16.onnx"
+        self.flow_estimator_onnx_repo = "yuekai/Fun-CosyVoice3-0.5B-2512-FP16-ONNX"
+        self.flow_estimator_onnx_path_fp32 = "flow.decoder.estimator.fp32.onnx"
         self.spk2info_path = "spk2info.pt"
         self.version = "cosyvoice3"
         self.llm = {

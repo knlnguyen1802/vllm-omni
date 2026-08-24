@@ -12,12 +12,19 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.config.stage_config import StageConfig
 from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
 from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.entrypoints.omni_base import OmniBase, OmniEngineDeadError
+from vllm_omni.errors import (
+    OmniClientError,
+    client_error_from_metadata,
+    client_error_metadata,
+    is_client_error_status,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -66,8 +73,8 @@ def make_output_msg(
         final_output_type=final_output_type,
         images=images or [],
         stage_durations={},
+        outputs=[SimpleNamespace(text=payload, index=0)],
     )
-    engine_output.payload = payload
     return OutputMessage(
         request_id=request_id,
         stage_id=stage_id,
@@ -98,9 +105,15 @@ class FakeAsyncOmniEngine:
         ]
         self.supported_tasks = ("generate",)
         self.stage_clients = [SimpleNamespace(is_comprehension=False) for _ in range(self.num_stages)]
+        # One replica per stage, sharing the stage_clients objects so a test that
+        # marks stage_clients[i] dead is reflected in the pool's liveness.
+        self.stage_pools = [_FakeStagePool([client], stage_id=i) for i, client in enumerate(self.stage_clients)]
         self.stage_vllm_configs = [None for _ in range(self.num_stages)]
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
+        self.endpoint_restrictions = ()
+        self.duplex_session_config = None
+        self.duplex_serving_adapter_path = None
 
         self.output_q: queue.Queue[Any] = queue.Queue()
         self.submitted: list[dict[str, Any]] = []
@@ -176,12 +189,37 @@ def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) 
 
 
 def _make_base():
-    from vllm_omni.entrypoints.omni_base import OmniBase
-
     obj = object.__new__(OmniBase)
     obj.engine = MagicMock()
     obj.request_states = {}
     return obj
+
+
+def test_resolve_sampling_params_list_preserves_stage_constraints():
+    base = _make_base()
+    base.engine.num_stages = 1
+    base.default_sampling_params_list = [SamplingParams(max_tokens=1000, detokenize=False, stop_token_ids=[42])]
+    base.engine.stage_configs = [
+        StageConfig(
+            stage_id=0,
+            model_stage="dummy-model",
+            sampling_constraints={"detokenize": False, "stop_token_ids": [42]},
+        ).to_omegaconf()
+    ]
+    base.sampling_constraints_list = base._get_sampling_constraints_list(base.engine.stage_configs)
+    assert base.sampling_constraints_list == [{"detokenize": False, "stop_token_ids": [42]}]
+    caller_params = SamplingParams(seed=1234, max_tokens=7, detokenize=True, stop_token_ids=[7])
+
+    resolved = base.resolve_sampling_params_list(caller_params)
+
+    assert resolved[0] is not caller_params
+    assert resolved[0].seed == 1234
+    assert resolved[0].max_tokens == 7
+    assert resolved[0].detokenize is False
+    assert resolved[0].stop_token_ids == [42]
+    assert 42 in resolved[0]._all_stop_token_ids
+    assert caller_params.detokenize is True
+    assert caller_params.stop_token_ids == [7]
 
 
 def _stage_spec(
@@ -462,7 +500,7 @@ async def test_async_omni_yields_only_final_stage_outputs(monkeypatch: pytest.Mo
         app.shutdown()
 
     assert [output.stage_id for output in outputs] == [2]
-    assert [output.request_output.payload for output in outputs] == ["final"]
+    assert [output.outputs[0].text for output in outputs] == ["final"]
     assert "req-1" not in app.request_states
 
 
@@ -480,7 +518,7 @@ async def test_async_omni_accepts_multiple_final_stage_streams(monkeypatch: pyte
         app.shutdown()
 
     assert [output.stage_id for output in outputs] == [0, 0, 0, 2, 2, 2]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-stage0-0",
         "req-1-stage0-1",
         "req-1-stage0-2",
@@ -505,7 +543,7 @@ async def test_async_omni_stops_on_final_stage_finished(monkeypatch: pytest.Monk
     finally:
         app.shutdown()
 
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-stage0",
         "req-1-stage2-final",
     ]
@@ -532,7 +570,7 @@ async def test_async_omni_diffusion_only_yields_single_image_output(monkeypatch:
     assert outputs[0].stage_id == 0
     assert outputs[0].final_output_type == "image"
     assert outputs[0].images == ["req-1-image"]
-    assert outputs[0].request_output.payload == "req-1-diffusion-final"
+    assert outputs[0].outputs[0].text == "req-1-diffusion-final"
 
 
 @pytest.mark.asyncio
@@ -553,7 +591,7 @@ async def test_async_omni_llm_diffusion_yields_text_stream_then_image(monkeypatc
 
     assert [output.stage_id for output in outputs] == [0, 0, 0, 1]
     assert [output.final_output_type for output in outputs] == ["text", "text", "text", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         "req-1-text-0",
         "req-1-text-1",
         "req-1-text-2",
@@ -604,6 +642,71 @@ async def test_async_omni_propagates_fatal_error_context(monkeypatch: pytest.Mon
     assert getattr(exc_info.value, "error_stage_id") == 2
 
 
+def _enqueue_client_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        ErrorMessage(
+            request_id=msg["request_id"],
+            stage_id=2,
+            error="Input was blocked by Cosmos3 guardrails.",
+            status_code=400,
+            error_type="BadRequestError",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_omni_propagates_client_error_status(monkeypatch: pytest.MonkeyPatch):
+    """A non-fatal client error from the orchestrator must be routed to the
+    requesting generate() call (not raised in the shared dispatcher) and
+    surface as an OmniClientError carrying status_code/error_type."""
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_client_error_message)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(OmniClientError) as exc_info:
+            async for _ in app.generate(prompt="blocked", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "BadRequestError"
+    assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
+
+
+def _enqueue_server_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        ErrorMessage(
+            request_id=msg["request_id"],
+            stage_id=2,
+            error="GPU exploded",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_omni_propagates_server_error_as_runtime(monkeypatch: pytest.MonkeyPatch):
+    """A non-fatal error WITHOUT a 4xx status_code is a server fault: it must
+    surface as a RuntimeError (-> HTTP 500), not an OmniClientError (-> 400).
+    Guards against the fix over-broadly mapping every error to a client error."""
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_server_error_message)
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        # OmniClientError subclasses ValueError, not RuntimeError, so matching
+        # RuntimeError here also proves it was NOT raised as a client error.
+        with pytest.raises(RuntimeError) as exc_info:
+            async for _ in app.generate(prompt="boom", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert not isinstance(exc_info.value, OmniClientError)
+    assert str(exc_info.value) == "GPU exploded"
+
+
 def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkeypatch: pytest.MonkeyPatch):
     sampling_params = [SamplingParams(max_tokens=8) for _ in range(3)]
     engine = FakeAsyncOmniEngine(
@@ -618,7 +721,7 @@ def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkey
 
     assert len(outputs) == 4
     assert [output.stage_id for output in outputs] == [0, 2, 0, 2]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-stage0-0",
         f"{engine.submitted[0]['request_id']}-stage2-final",
         f"{engine.submitted[1]['request_id']}-stage0-0",
@@ -662,7 +765,7 @@ def test_omni_generate_diffusion_only_yields_single_image_per_request(monkeypatc
     assert len(outputs) == 2
     assert [output.stage_id for output in outputs] == [0, 0]
     assert [output.final_output_type for output in outputs] == ["image", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-diffusion-final",
         f"{engine.submitted[1]['request_id']}-diffusion-final",
     ]
@@ -690,7 +793,7 @@ def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
     assert len(outputs) == 4
     assert [output.stage_id for output in outputs] == [0, 1, 0, 1]
     assert [output.final_output_type for output in outputs] == ["text", "image", "text", "image"]
-    assert [output.request_output.payload for output in outputs] == [
+    assert [output.outputs[0].text for output in outputs] == [
         f"{engine.submitted[0]['request_id']}-text-0",
         f"{engine.submitted[0]['request_id']}-image-final",
         f"{engine.submitted[1]['request_id']}-text-0",
@@ -761,11 +864,151 @@ def test_non_fatal_error_raises_runtime():
         base._handle_output_message(msg)
 
 
+def test_non_fatal_client_error_raises_omni_client_error():
+    """A non-fatal ErrorMessage carrying a 4xx status_code (e.g. a guardrail
+    block) must surface as an OmniClientError with the metadata intact, not a
+    bare RuntimeError. This covers the offline/sync Omni consumer path."""
+    base = _make_base()
+    msg = ErrorMessage(
+        error="Input was blocked by Cosmos3 guardrails.",
+        status_code=400,
+        error_type="BadRequestError",
+    )
+
+    with pytest.raises(OmniClientError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "BadRequestError"
+    assert str(exc_info.value) == "Input was blocked by Cosmos3 guardrails."
+
+
+_NON_400_CLIENT_ERRORS = [
+    pytest.param(429, "RateLimitError", id="429-too-many-requests"),
+    pytest.param(413, "PayloadTooLargeError", id="413-payload-too-large"),
+    pytest.param(422, "UnprocessableEntityError", id="422-unprocessable-entity"),
+    pytest.param(403, "PermissionDeniedError", id="403-forbidden"),
+]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_type"), [pytest.param(400, "BadRequestError", id="400")] + _NON_400_CLIENT_ERRORS
+)
+def test_client_error_metadata_round_trip_preserves_4xx(status_code: int, error_type: str):
+    original = OmniClientError("blocked", status_code=status_code, error_type=error_type)
+
+    # Outbound: what the broad `except Exception` handlers serialize.
+    carried_status, carried_type = client_error_metadata(original)
+    assert carried_status == status_code
+    assert carried_type == error_type
+    assert is_client_error_status(carried_status)
+
+    # Inbound: reconstruction at the consuming end.
+    rebuilt = client_error_from_metadata("blocked", status_code=carried_status, error_type=carried_type)
+    assert isinstance(rebuilt, OmniClientError)
+    assert rebuilt.status_code == status_code
+    assert rebuilt.error_type == error_type
+    assert str(rebuilt) == "blocked"
+
+
+@pytest.mark.parametrize(("status_code", "error_type"), _NON_400_CLIENT_ERRORS)
+def test_non_fatal_client_error_preserves_non_400_status(status_code: int, error_type: str):
+    base = _make_base()
+    msg = ErrorMessage(
+        error="client side failure",
+        status_code=status_code,
+        error_type=error_type,
+    )
+
+    with pytest.raises(OmniClientError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.error_type == error_type
+    assert str(exc_info.value) == "client side failure"
+
+
+@pytest.mark.parametrize(
+    "status_code",
+    [
+        pytest.param(None, id="no-status"),
+        pytest.param(399, id="399-below-4xx"),
+        pytest.param(500, id="500-server-error"),
+        pytest.param(503, id="503-service-unavailable"),
+    ],
+)
+def test_non_fatal_non_4xx_status_raises_runtime(status_code: int | None):
+    base = _make_base()
+    msg = ErrorMessage(
+        error="server side failure",
+        status_code=status_code,
+        error_type="ShouldBeIgnoredForNon4xx",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        base._handle_output_message(msg)
+
+    assert not isinstance(exc_info.value, OmniClientError)
+    assert str(exc_info.value) == "server side failure"
+
+
+def _make_enqueue_client_error(
+    status_code: int,
+    error_type: str,
+    error_text: str,
+) -> Callable[[FakeAsyncOmniEngine, dict[str, Any]], None]:
+    def _enqueue(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+        engine.output_q.put_nowait(
+            ErrorMessage(
+                request_id=msg["request_id"],
+                stage_id=2,
+                error=error_text,
+                status_code=status_code,
+                error_type=error_type,
+            )
+        )
+
+    return _enqueue
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status_code", "error_type"), _NON_400_CLIENT_ERRORS)
+async def test_async_omni_propagates_non_400_client_error_status(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    error_type: str,
+):
+    error_text = f"blocked with {status_code}"
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=THREE_STAGE_META,
+        on_add_request=_make_enqueue_client_error(status_code, error_type, error_text),
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = AsyncOmni("dummy-model")
+    try:
+        with pytest.raises(OmniClientError) as exc_info:
+            async for _ in app.generate(prompt="blocked", request_id="req-1"):
+                pass
+    finally:
+        app.shutdown()
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.error_type == error_type
+    assert str(exc_info.value) == error_text
+
+
+class _FakeStagePool:
+    def __init__(self, clients: list, stage_id: int = 0):
+        self.clients = clients
+        self.stage_id = stage_id
+
+
 def test_async_omni_errored_property_alive():
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
         is_alive=lambda: True,
-        stage_clients=[SimpleNamespace(is_comprehension=False)],
+        stage_pools=[_FakeStagePool(clients=[SimpleNamespace()])],
     )
 
     assert omni.errored is False
@@ -775,21 +1018,47 @@ def test_async_omni_errored_property_dead_engine():
     omni = object.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(
         is_alive=lambda: False,
-        stage_clients=[SimpleNamespace(is_comprehension=False)],
+        stage_pools=[_FakeStagePool(clients=[SimpleNamespace()])],
     )
 
     assert omni.errored is True
 
 
-def test_async_omni_errored_property_dead_stage():
+def test_async_omni_errored_false_when_stage_dead():
+    # errored is process-fatal only: a dead stage must not trip the serving
+    # precheck, or requests that never touch that stage would be rejected too.
+    # Stage liveness surfaces via check_health / per-request dispatch failures.
     omni = object.__new__(AsyncOmni)
-    dead_stage = SimpleNamespace(is_comprehension=False, _engine_dead=True)
     omni.engine = SimpleNamespace(
         is_alive=lambda: True,
-        stage_clients=[dead_stage],
+        stage_pools=[_FakeStagePool(clients=[SimpleNamespace(_engine_dead=True)])],
     )
 
-    assert omni.errored is True
+    assert omni.errored is False
+
+
+def test_async_omni_errored_false_when_a_replica_survives():
+    # Per-replica fault isolation (#4285): one replica dies, another lives →
+    # the stage is still serving, so the engine is not errored.
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        is_alive=lambda: True,
+        stage_pools=[_FakeStagePool(clients=[SimpleNamespace(_engine_dead=True), SimpleNamespace()])],
+    )
+
+    assert omni.errored is False
+
+
+def test_async_omni_errored_false_when_evicted_replica_leaves_stage_empty():
+    # Even a fully evicted stage (all slots None/dead) is not process-fatal;
+    # only orchestrator death makes errored True.
+    omni = object.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(
+        is_alive=lambda: True,
+        stage_pools=[_FakeStagePool(clients=[None, SimpleNamespace(_engine_dead=True)])],
+    )
+
+    assert omni.errored is False
 
 
 def _enqueue_stage_error(
@@ -803,7 +1072,6 @@ def _enqueue_stage_error(
     if kill_engine:
         engine._alive = False
     engine_output = OmniRequestOutput.from_error(msg["request_id"], error_text)
-    engine_output.payload = ""
     engine.output_q.put_nowait(
         OutputMessage(
             request_id=msg["request_id"],
@@ -859,20 +1127,22 @@ async def test_async_omni_propagates_engine_generate_error(monkeypatch: pytest.M
 
 def test_check_health_passes_when_all_healthy():
     base = _make_base()
-    healthy_stage = MagicMock()
-    healthy_stage.check_health = MagicMock()
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [healthy_stage]
+    healthy_stage = SimpleNamespace(check_health=lambda: None)
+    base.engine.stage_pools = [_FakeStagePool([healthy_stage])]
     base.check_health()  # should not raise
 
 
 def test_check_health_raises_when_stage_dead():
     base = _make_base()
-    dead_stage = MagicMock()
-    dead_stage.check_health = MagicMock(side_effect=EngineDeadError("Stage-1 dead"))
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [dead_stage]
-    with pytest.raises(EngineDeadError, match="Stage-1 dead"):
+
+    def _raise_dead() -> None:
+        raise EngineDeadError("Stage-1 engine core is dead")
+
+    dead_stage = SimpleNamespace(check_health=_raise_dead)
+    base.engine.stage_pools = [_FakeStagePool([dead_stage], stage_id=1)]
+    with pytest.raises(EngineDeadError, match="Stage-1"):
         base.check_health()
 
 
@@ -890,22 +1160,25 @@ def test_check_health_raises_when_orchestrator_dead():
 def test_omni_base_errored_false_when_alive():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [SimpleNamespace()]
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace()])]
     assert base.errored is False
 
 
-def test_omni_base_is_running_false_when_stage_engine_dead():
+def test_omni_base_is_running_true_when_stage_engine_dead():
+    # is_running tracks the orchestrator only; a dead stage must not make
+    # `errored and not is_running` true, which would let terminate_if_errored
+    # kill the server on a partial failure.
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [SimpleNamespace(_engine_dead=True)]
-    assert base.is_running is False
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace(_engine_dead=True)])]
+    assert base.is_running is True
 
 
-def test_omni_base_is_running_false_when_stage_resources_engine_dead():
+def test_omni_base_is_running_true_when_stage_resources_engine_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
-    base.engine.stage_clients = [SimpleNamespace(resources=SimpleNamespace(engine_dead=True))]
-    assert base.is_running is False
+    base.engine.stage_pools = [_FakeStagePool([SimpleNamespace(resources=SimpleNamespace(engine_dead=True))])]
+    assert base.is_running is True
 
 
 def test_omni_base_errored_true_when_orchestrator_dead():
@@ -915,20 +1188,22 @@ def test_omni_base_errored_true_when_orchestrator_dead():
     assert base.errored is True
 
 
-def test_omni_base_errored_true_when_stage_engine_dead():
+def test_omni_base_errored_false_when_stage_engine_dead():
+    # Process-fatal only: the serving precheck reads errored before routing,
+    # so a dead stage here would reject requests that never touch it.
     base = _make_base()
     base.engine.is_alive.return_value = True
     dead_stage = SimpleNamespace(_engine_dead=True)
-    base.engine.stage_clients = [dead_stage]
-    assert base.errored is True
+    base.engine.stage_pools = [_FakeStagePool([dead_stage])]
+    assert base.errored is False
 
 
-def test_omni_base_errored_true_when_stage_resources_engine_dead():
+def test_omni_base_errored_false_when_stage_resources_engine_dead():
     base = _make_base()
     base.engine.is_alive.return_value = True
     dead_stage = SimpleNamespace(resources=SimpleNamespace(engine_dead=True))
-    base.engine.stage_clients = [dead_stage]
-    assert base.errored is True
+    base.engine.stage_pools = [_FakeStagePool([dead_stage])]
+    assert base.errored is False
 
 
 # ───────── Omni (sync) EngineDeadError / EngineGenerateError ─────────
@@ -994,13 +1269,14 @@ def test_omni_errored_property_dead_engine(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_omni_errored_property_dead_stage(monkeypatch: pytest.MonkeyPatch):
-    """Omni.errored returns True when a stage client is marked dead."""
+    """Omni.errored stays False when only a stage client dies (process-fatal
+    semantics): the request-level failure and check_health carry the signal."""
     engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META)
     _patch_engine(monkeypatch, engine)
 
     app = Omni("dummy-model")
     try:
         engine.stage_clients[0]._engine_dead = True
-        assert app.errored is True
+        assert app.errored is False
     finally:
         app.shutdown()

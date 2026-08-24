@@ -793,17 +793,9 @@ class LancePipeline(BagelPipeline):
             curr_rope=cfg_text_context["ropes"],
             video_shapes=[video_shape],
         )
-        cfg_img_lat = self.bagel.prepare_video_latent_cfg(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            video_shapes=[video_shape],
-        )
         for k, v in cfg_text_lat.items():
             if torch.is_tensor(v):
                 cfg_text_lat[k] = v.to(self.device)
-        for k, v in cfg_img_lat.items():
-            if torch.is_tensor(v):
-                cfg_img_lat[k] = v.to(self.device)
 
         self._regen_init_noise_on_device(gen_input_lat, req.sampling_params.seed)
 
@@ -822,7 +814,7 @@ class LancePipeline(BagelPipeline):
             latents, *_ = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"],
-                cfg_img_past_key_values=gen_context["past_key_values"],  # no img CFG branch
+                cfg_img_past_key_values=None,  # no img CFG branch
                 num_timesteps=num_timesteps,
                 timestep_shift=timestep_shift,
                 cfg_text_scale=cfg_text_scale,
@@ -835,7 +827,7 @@ class LancePipeline(BagelPipeline):
                 # ``cfg_text_packed_query_indexes`` / ``cfg_text_key_values_lens``
                 # / ``cfg_text_packed_key_value_indexes`` removed post-main-merge
                 # (derived from ``cfg_text_past_key_values``).
-                cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
+                cfg_img_packed_position_ids=None,
                 # ``cfg_img_*`` index/lens kwargs removed — same as above.
             )
 
@@ -844,8 +836,10 @@ class LancePipeline(BagelPipeline):
         frames = [Image.fromarray(f) for f in frames_np]
         logger.info("Lance t2v: decoded %d frames at %dx%d", len(frames), frames[0].width, frames[0].height)
         return DiffusionOutput(
-            output=frames[0],
-            custom_output={"video_frames": frames, "video_shape": video_shape},
+            output={
+                "payload": {"video": frames},
+                "metadata": {"video": {"shape": video_shape}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1038,11 +1032,10 @@ class LancePipeline(BagelPipeline):
             if torch.is_tensor(v):
                 cfg_text_lat[k] = v.to(self.device)
 
-        # cfg_img branch: keep off (cfg_img_scale=1.0 matches upstream
-        # ``cfg_vit_scale=1.0``).  generate_image needs the cfg_img_* args
-        # but skips the branch when scale<=1.0; just point them at the
-        # cond's lat metadata so shapes/types are fine.
-        cfg_img_lat = cfg_text_lat
+        # cfg_img branch is off by default (cfg_img_scale=1.0 matches
+        # upstream ``cfg_vit_scale=1.0``).  Avoid passing synthetic metadata
+        # in that path; Bagel.generate_image only reads it when scale > 1.0.
+        cfg_img_lat = cfg_text_lat if cfg_img_scale > 1.0 else None
 
         self._regen_init_noise_on_device(gen_input_lat, req.sampling_params.seed)
 
@@ -1071,18 +1064,18 @@ class LancePipeline(BagelPipeline):
                 # ``cfg_text_packed_query_indexes`` / ``cfg_text_key_values_lens``
                 # / ``cfg_text_packed_key_value_indexes`` removed post-main-merge
                 # (derived from ``cfg_text_past_key_values``).
-                cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
+                cfg_img_packed_position_ids=(
+                    cfg_img_lat["cfg_packed_position_ids"] if cfg_img_lat is not None else None
+                ),
                 # ``cfg_img_*`` index/lens kwargs removed — same as above.
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
-        # Put the PIL image into ``custom_output`` too — the orchestrator
-        # serializes ``custom_output`` across the IPC boundary but strips
-        # the bare ``output`` field, so consumers that only see
-        # ``outputs[0].output`` (e.g. gradio_demo) get ``None`` otherwise.
         return DiffusionOutput(
-            output=img,
-            custom_output={"image": img, "image_shape": image_shape},
+            output={
+                "payload": {"image": img},
+                "metadata": {"image": {"shape": image_shape}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1269,7 +1262,7 @@ class LancePipeline(BagelPipeline):
         for k, v in cfg_text_lat.items():
             if torch.is_tensor(v):
                 cfg_text_lat[k] = v.to(self.device)
-        cfg_img_lat = cfg_text_lat
+        cfg_img_lat = cfg_text_lat if cfg_img_scale > 1.0 else None
 
         self._regen_init_noise_on_device(gen_input_lat, req.sampling_params.seed)
 
@@ -1358,7 +1351,9 @@ class LancePipeline(BagelPipeline):
                 # ``cfg_text_packed_query_indexes`` / ``cfg_text_key_values_lens``
                 # / ``cfg_text_packed_key_value_indexes`` removed post-main-merge
                 # (derived from ``cfg_text_past_key_values``).
-                cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
+                cfg_img_packed_position_ids=(
+                    cfg_img_lat["cfg_packed_position_ids"] if cfg_img_lat is not None else None
+                ),
                 # ``cfg_img_*`` index/lens kwargs removed — same as above.
                 frame_condition_token_indexes=frame_condition_token_indexes,
             )
@@ -1366,8 +1361,10 @@ class LancePipeline(BagelPipeline):
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], out_shape)
         frames = [Image.fromarray(f) for f in frames_np]
         return DiffusionOutput(
-            output=frames[0],
-            custom_output={"video_frames": frames, "video_shape": out_shape},
+            output={
+                "payload": {"video": frames},
+                "metadata": {"video": {"shape": out_shape}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1587,9 +1584,9 @@ class LancePipeline(BagelPipeline):
             if torch.is_tensor(v):
                 cfg_text_lat[k] = v.to(self.device)
 
-        # cfg_img branch is off (cfg_img_scale=1.0); generate_image needs the
-        # arg surface but skips the branch when scale<=1.0.
-        cfg_img_lat = cfg_text_lat
+        # cfg_img branch is off by default; pass metadata only when an
+        # explicit cfg_img_scale enables the branch.
+        cfg_img_lat = cfg_text_lat if cfg_img_scale > 1.0 else None
 
         self._regen_init_noise_on_device(gen_input_lat, req.sampling_params.seed)
 
@@ -1618,15 +1615,19 @@ class LancePipeline(BagelPipeline):
                 # ``cfg_text_packed_query_indexes`` / ``cfg_text_key_values_lens``
                 # / ``cfg_text_packed_key_value_indexes`` removed post-main-merge
                 # (derived from ``cfg_text_past_key_values``).
-                cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
+                cfg_img_packed_position_ids=(
+                    cfg_img_lat["cfg_packed_position_ids"] if cfg_img_lat is not None else None
+                ),
                 # ``cfg_img_*`` index/lens kwargs removed — same as above.
             )
 
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], video_shape)
         frames = [Image.fromarray(f) for f in frames_np]
         return DiffusionOutput(
-            output=frames[0],
-            custom_output={"video_frames": frames, "video_shape": video_shape},
+            output={
+                "payload": {"video": frames},
+                "metadata": {"video": {"shape": video_shape}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1708,8 +1709,10 @@ class LancePipeline(BagelPipeline):
         text_output = text_output.lstrip("\n")
         logger.info("Lance x2t_video: generated %d tokens", token_ids.shape[0])
         return DiffusionOutput(
-            output=text_output,
-            custom_output={"text_output": text_output},
+            output={
+                "payload": {"text": text_output},
+                "metadata": {"text": {"text_output": text_output}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1804,8 +1807,10 @@ class LancePipeline(BagelPipeline):
         text_output = text_output.lstrip("\n")
         logger.info("Lance x2t_image: generated %d tokens", token_ids.shape[0])
         return DiffusionOutput(
-            output=text_output,
-            custom_output={"text_output": text_output},
+            output={
+                "payload": {"text": text_output},
+                "metadata": {"text": {"text_output": text_output}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 

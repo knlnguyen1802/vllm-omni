@@ -212,7 +212,7 @@ def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir
     output_audio_dur = 0.0
 
     for batch_idx, o in enumerate(outputs):
-        audio_tensor = torch.cat(o.multimodal_output["audio"])
+        audio_tensor = torch.cat((o.multimodal_output["audio"],))
         audio_array = audio_tensor.tolist()
         output_audio_dur += float(len(audio_array)) / 24000
         if args.write_audio:
@@ -304,7 +304,7 @@ def parse_args() -> Namespace:
         "--cfg-alpha",
         type=float,
         default=None,
-        help="CFG alpha for flow-matching guidance (default: use value from stage config, typically 1.2).",
+        help="CFG alpha for flow-matching guidance (default: use the deploy config value, typically 1.2).",
     )
     parser.add_argument(
         "--quantization",

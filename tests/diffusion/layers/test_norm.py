@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for LayerNorm and RMSNorm custom ops in diffusion layers."""
 
+import sys
+import types
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -299,6 +302,44 @@ def test_rmsnorm_numerical_correctness():
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_rmsnorm_dtype_matches_parameter_and_fp32_accumulation_contract():
+    """dtype controls gamma storage; reduced-precision inputs still use fp32 accumulation."""
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    hidden_size = 64
+    eps = 1e-6
+    norm = RMSNorm(hidden_size, eps=eps, dtype=torch.bfloat16)
+    x = torch.randn(2, 4, hidden_size, dtype=torch.bfloat16)
+
+    assert norm.weight.dtype == torch.bfloat16
+
+    x_fp32 = x.float()
+    expected = (x_fp32 * torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + eps) * norm.weight.float()).to(x.dtype)
+
+    torch.testing.assert_close(norm.forward_native(x), expected, atol=0, rtol=0)
+
+
+def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.MonkeyPatch):
+    """The NPU fused op receives the bf16 checkpoint gamma used by H3."""
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def npu_rms_norm(x: torch.Tensor, gamma: torch.Tensor, epsilon: float):
+        captured["gamma"] = gamma
+        captured["epsilon"] = torch.tensor(epsilon)
+        return (x,)
+
+    monkeypatch.setitem(sys.modules, "torch_npu", types.SimpleNamespace(npu_rms_norm=npu_rms_norm))
+    norm = RMSNorm(64, eps=1e-5, dtype=torch.bfloat16)
+    x = torch.randn(2, 4, 64, dtype=torch.bfloat16)
+
+    assert norm.forward_npu(x) is x
+    assert captured["gamma"] is norm.weight
+    assert captured["gamma"].dtype == torch.bfloat16
+    assert captured["epsilon"].item() == pytest.approx(1e-5)
+
+
 # ── RMSNorm compile-path regression tests ──
 
 
@@ -578,11 +619,26 @@ def test_rmsnorm_fused_native_parity_2d_input():
 
 
 def test_rmsnorm_fused_native_parity_custom_weight():
-    """Verify fused and native RMSNorm parity with non-default weights."""
+    """Verify fused and native RMSNorm parity with non-default weights.
+
+    Note: bfloat16 requires wider tolerance because the fused CUDA kernel
+    (vllm._custom_ops.rms_norm) computes in bf16 precision internally,
+    while forward_native uses float32 intermediates. With random custom
+    weights (not the default ones-weight), this precision gap exceeds 1e-3.
+
+    The gap surfaced after upstream vLLM routed RMSNorm through the vLLM IR
+    op (ir.ops.rms_norm) — see upstream commit 40bb17502
+    "[vLLM IR] 1/N Implement IR skeleton and rms_norm op (#33825)" — which
+    changed which fused kernel/precision path the layer dispatches to.
+    """
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     hidden_size = 64
     eps = 1e-6
+
+    # Per-dtype tolerances: bf16 fused kernel has inherent precision limit
+    atol_map = {torch.float32: 1e-3, torch.float16: 1e-3, torch.bfloat16: 2e-2}
+    rtol_map = {torch.float32: 1e-3, torch.float16: 1e-3, torch.bfloat16: 1e-2}
 
     for dtype in [torch.float32, torch.float16, torch.bfloat16]:
         torch.manual_seed(789)
@@ -594,4 +650,4 @@ def test_rmsnorm_fused_native_parity_custom_weight():
         out_fused = norm._forward_fused(x)
         out_native = norm.forward_native(x)
 
-        torch.testing.assert_close(out_fused, out_native, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(out_fused, out_native, atol=atol_map[dtype], rtol=rtol_map[dtype])
