@@ -841,7 +841,11 @@ async def test_run_abort(orchestrator_factory) -> None:
 async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> None:
     stages = [
         FakeStageClient(stage_type="llm", final_output=False),
-        FakeStageClient(stage_type="llm", final_output=True),
+        FakeStageClient(
+            stage_type="llm",
+            final_output=True,
+            next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+        ),
     ]
     processors = [
         FakeOutputProcessor(request_outputs=[_build_request_output("req-ack", token_ids=[1], finished=True)]),
@@ -860,6 +864,11 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
             final_stage_id=1,
         )
         await _wait_for(lambda: len(stages[0].add_request_calls) == 1)
+        # Abort outputs come from the final AR stage's output processor, and
+        # StagePool.abort_requests only collects for requests with a live
+        # replica binding. Forward off stage-0 first so stage-1 is bound.
+        stages[0].push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+        await _wait_for(lambda: len(stages[1].add_request_calls) == 1)
 
         orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=["req-ack"], rpc_id="abort-1"))
         result = await _get_rpc_message(orchestrator_fixture)
@@ -869,6 +878,7 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
         assert result.error is None
         assert result.rpc_correlation_key == ("abort", "abort-1")
         assert stages[0].abort_calls == [["req-ack"]]
+        assert stages[1].abort_calls == [["req-ack"]]
         assert "req-ack" not in orchestrator_fixture.orchestrator.request_states
         assert result.abort_outputs is not None
         assert len(result.abort_outputs) == 1
