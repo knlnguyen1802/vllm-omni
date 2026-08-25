@@ -244,6 +244,8 @@ class TestOmniLlmSleepMode:
         try:
             await llm_engine.sleep(stage_ids=[0], level=1)
             await llm_engine.wake_up(stage_ids=[0], tags=["weights"])
+            # wake_up restores weights but keeps the AR admission hold.
+            # Resume so generate() can reach the sleeping-tags rejection.
             await llm_engine.resume_generation(stage_ids=[0])
             with pytest.raises(RuntimeError, match="partially or fully asleep"):
                 async for _ in llm_engine.generate("test", sampling_params=SamplingParams(max_tokens=4)):
