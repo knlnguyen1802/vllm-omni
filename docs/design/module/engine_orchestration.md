@@ -114,6 +114,9 @@ resume; diffusion abort remains whole-sample retry. Aborting a parallel-sampling
 child must drop `parent_requests` once no children remain. EngineCore control
 RPCs (`sleep` / `wake_up` / `pause_scheduler` / `resume_scheduler`) must
 propagate worker exceptions rather than returning `{"supported": False}`.
+When a request has multiple final output stages, only the last abort message
+is request-terminal. Output-processor abort state is committed only after the
+physical EngineCore abort succeeds.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 

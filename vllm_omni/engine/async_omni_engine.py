@@ -57,6 +57,7 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     InteractionMessage,
+    OutputMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -1757,7 +1758,7 @@ class AsyncOmniEngine:
         self,
         request_ids: list[str],
         timeout: float | None = None,
-    ) -> list[Any]:
+    ) -> list[OutputMessage]:
         """Abort requests and wait for orchestrator acknowledgment.
 
         Unlike :meth:`abort`, this generates an ``rpc_id``, correlates the

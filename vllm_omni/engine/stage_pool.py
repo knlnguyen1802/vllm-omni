@@ -1225,7 +1225,11 @@ class StagePool:
                 if collect is not None:
                     engine_abort_ids = []
                     for orch_req_id in replica_request_ids:
-                        collected_ids, stage_outputs = collect([orch_req_id], internal=False)
+                        collected_ids, stage_outputs = collect(
+                            [orch_req_id],
+                            internal=False,
+                            commit_state=False,
+                        )
                         for req_out in stage_outputs:
                             abort_outputs.append((orch_req_id, req_out))
                         if collected_ids:
@@ -1240,6 +1244,10 @@ class StagePool:
             if client is None:
                 continue
             await client.abort_requests_async(engine_abort_ids)
+            if not is_diffusion and self._output_processor is not None:
+                commit = getattr(self._output_processor, "commit_aborted_request_state", None)
+                if callable(commit):
+                    commit(replica_request_ids, internal=False)
 
         return abort_outputs
 

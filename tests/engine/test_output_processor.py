@@ -700,3 +700,25 @@ def test_abort_last_parallel_child_drops_parent_request():
     assert aborted == ["1_parent"]
     assert "parent" not in processor.parent_requests
     assert not parent.child_requests
+
+
+def test_abort_snapshot_leaves_state_until_commit():
+    processor, parent = _abort_processor_with_parent(["0_parent"])
+    processor.external_req_ids["parent"] = ["0_parent"]
+
+    aborted, outputs = processor.abort_requests_collecting_outputs(
+        ["parent"],
+        internal=False,
+        commit_state=False,
+    )
+    assert aborted == ["0_parent"]
+    assert outputs
+    assert "0_parent" in processor.request_states
+    assert processor.external_req_ids["parent"] == ["0_parent"]
+    assert "parent" in processor.parent_requests
+    assert parent.child_requests == {"0_parent"}
+
+    processor.commit_aborted_request_state(["parent"], internal=False)
+    assert "0_parent" not in processor.request_states
+    assert "parent" not in processor.parent_requests
+    assert "parent" not in processor.external_req_ids

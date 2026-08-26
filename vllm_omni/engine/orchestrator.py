@@ -941,11 +941,16 @@ class Orchestrator:
                             replica_id=pool.get_bound_replica_id(orch_req_id),
                             engine_outputs=engine_output,
                             metrics=None,
-                            finished=True,
+                            finished=False,
                             stage_submit_ts=req_state.stage_submit_ts.get(pool.stage_id),
                         )
                     )
             pool.release_bindings(request_ids)
+        last_index_by_req: dict[str, int] = {}
+        for index, output_msg in enumerate(abort_outputs):
+            last_index_by_req[output_msg.request_id] = index
+        for index, output_msg in enumerate(abort_outputs):
+            output_msg.finished = index == last_index_by_req[output_msg.request_id]
         return abort_outputs
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:

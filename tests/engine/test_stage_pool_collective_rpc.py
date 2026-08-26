@@ -89,3 +89,36 @@ def test_collective_rpc_non_control_method_still_returns_error_dict():
         assert "probe failed" in result["error"]
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
+    async def run() -> None:
+        class RecordingOutputProcessor:
+            def __init__(self) -> None:
+                self.collected = False
+                self.committed = False
+
+            def abort_requests_collecting_outputs(self, request_ids, *, internal=False, commit_state=True):
+                del internal
+                self.collected = True
+                assert commit_state is False
+                return list(request_ids), [SimpleNamespace(request_id=request_ids[0])]
+
+            def commit_aborted_request_state(self, request_ids, *, internal=False):
+                del request_ids, internal
+                self.committed = True
+
+        abort = AsyncMock(side_effect=RuntimeError("engine abort failed"))
+        output_processor = RecordingOutputProcessor()
+        client = SimpleNamespace(stage_type="llm", abort_requests_async=abort)
+        pool = StagePool(0, [client], output_processor=output_processor)  # type: ignore[arg-type]
+        pool._request_bindings["req-1"] = 0
+
+        with pytest.raises(RuntimeError, match="engine abort failed"):
+            await pool.abort_requests(["req-1"])
+        assert output_processor.collected is True
+        assert output_processor.committed is False
+        abort.assert_awaited_once()
+
+    asyncio.run(run())

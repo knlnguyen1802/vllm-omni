@@ -145,9 +145,11 @@ class AsyncOmni(EngineClient, OmniBase):
         OmniBase.__init__(self, model=model, **kwargs)
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
-        # generate() coroutines that passed the pause wait but have not yet
-        # submitted to EngineCore. sleep() waits for this to hit zero so a
-        # pipelined request cannot race into EngineCore during drain/offload.
+        # In-flight EngineCore submits (non-streaming add_request, or each
+        # streaming ADD/update/final marker). sleep() waits for this to hit
+        # zero so a pipelined request cannot race into EngineCore during
+        # drain/offload. Streaming generate does not hold a slot while
+        # waiting for the next client chunk.
         self._admitting: int = 0
         # True after pause_generation() or AR EngineCore sleep; wake_up must
         # not reopen generate() until resume_generation(). Diffusion-only
@@ -513,13 +515,18 @@ class AsyncOmni(EngineClient, OmniBase):
         external_request_id = request_id
         request_id = self._get_unique_request_id(external_request_id)
 
-        # Wait until generation is resumed if the engine is paused, then hold
-        # an admission slot until add_request completes so sleep() cannot
-        # race a just-unblocked generate into EngineCore during offload.
+        # Wait until generation is resumed if the engine is paused. Non-streaming
+        # generate holds an admission slot until add_request completes so sleep()
+        # cannot race a just-unblocked generate into EngineCore during offload.
+        # Streaming generate does **not** hold the slot while waiting for the
+        # first client chunk; the input pump acquires it immediately before each
+        # EngineCore ADD/update.
+        streaming_input = isinstance(prompt, AsyncGenerator)
         async with self._pause_cond:
             await self._pause_cond.wait_for(lambda: not self._paused)
-            self._admitting = getattr(self, "_admitting", 0) + 1
-        admitting = True
+            if not streaming_input:
+                self._admitting = getattr(self, "_admitting", 0) + 1
+        admitting = not streaming_input
 
         logger.debug(f"[AsyncOmni] generate() called for request {external_request_id}")
 
@@ -602,10 +609,10 @@ class AsyncOmni(EngineClient, OmniBase):
                 req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
 
             # Add request(s) to stage 0. For streaming inputs, submit
-            # chunks incrementally through streaming_update. Hold the
-            # admission slot until the first ADD actually completes — the
-            # helper returns as soon as the pump task is created.
-            if isinstance(prompt, AsyncGenerator):
+            # chunks incrementally through streaming_update. The helper
+            # returns as soon as the pump task is created; each ADD/update
+            # takes its own admission slot inside the pump.
+            if streaming_input:
                 first_chunk_submitted = asyncio.get_running_loop().create_future()
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
@@ -631,8 +638,9 @@ class AsyncOmni(EngineClient, OmniBase):
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
             req_start_ts[request_id] = submit_ts
-            await self._release_generate_admission()
-            admitting = False
+            if admitting:
+                await self._release_generate_admission()
+                admitting = False
 
             # Process results based on mode
             # Both sequential and async_chunk modes read the same message stream
@@ -649,18 +657,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
-            # The input pump can outlive a normally-completed generation
-            # (e.g. a realtime client that keeps streaming after the final
-            # output); a live pump keeps issuing streaming updates for a
-            # request the orchestrator no longer tracks.
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
-
-            self._log_summary_and_cleanup(request_id)
-
         except (asyncio.CancelledError, GeneratorExit):
-            if input_stream_task is not None and not input_stream_task.done():
-                input_stream_task.cancel()
             self._record_request_failure_once(request_id, reason="client_disconnect")
             await self._abort_internal_requests(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
@@ -671,14 +668,27 @@ class AsyncOmni(EngineClient, OmniBase):
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
+            if input_stream_task is not None and not input_stream_task.done():
+                input_stream_task.cancel()
             if admitting:
                 await self._release_generate_admission()
+            self._log_summary_and_cleanup(request_id)
 
     async def _release_generate_admission(self) -> None:
         """Drop one in-flight generate admission slot held across add_request."""
         async with self._pause_cond:
             self._admitting = max(getattr(self, "_admitting", 1) - 1, 0)
             self._pause_cond.notify_all()
+
+    async def _submit_with_admission(self, awaitable):
+        """Wait for resume, hold one admission slot for a single EngineCore submit."""
+        async with self._pause_cond:
+            await self._pause_cond.wait_for(lambda: not self._paused)
+            self._admitting = getattr(self, "_admitting", 0) + 1
+        try:
+            return await awaitable
+        finally:
+            await self._release_generate_admission()
 
     async def _add_streaming_input_request(
         self,
@@ -724,30 +734,34 @@ class AsyncOmni(EngineClient, OmniBase):
                     prompt_text, _, _ = extract_prompt_components(self.model_config, chunk_prompt)
 
                     if not has_submitted_first_chunk:
-                        await self.engine.add_request_async(
-                            request_id=request_id,
-                            prompt=chunk_prompt,
-                            prompt_text=prompt_text,
-                            sampling_params_list=chunk_sampling_params_list,
-                            final_stage_id=final_stage_id,
-                            final_output_stage_ids=final_output_stage_ids,
-                            arrival_time=arrival_time,
-                            lora_request=lora_request,
-                            resumable=True,
+                        await self._submit_with_admission(
+                            self.engine.add_request_async(
+                                request_id=request_id,
+                                prompt=chunk_prompt,
+                                prompt_text=prompt_text,
+                                sampling_params_list=chunk_sampling_params_list,
+                                final_stage_id=final_stage_id,
+                                final_output_stage_ids=final_output_stage_ids,
+                                arrival_time=arrival_time,
+                                lora_request=lora_request,
+                                resumable=True,
+                            )
                         )
                         has_submitted_first_chunk = True
                         _mark_first_chunk_submitted()
                     else:
-                        await self.engine.add_streaming_update_async(
-                            request_id=request_id,
-                            prompt=chunk_prompt,
-                            prompt_text=prompt_text,
-                            sampling_params_list=chunk_sampling_params_list,
-                            final_stage_id=final_stage_id,
-                            final_output_stage_ids=final_output_stage_ids,
-                            arrival_time=arrival_time,
-                            lora_request=lora_request,
-                            resumable=True,
+                        await self._submit_with_admission(
+                            self.engine.add_streaming_update_async(
+                                request_id=request_id,
+                                prompt=chunk_prompt,
+                                prompt_text=prompt_text,
+                                sampling_params_list=chunk_sampling_params_list,
+                                final_stage_id=final_stage_id,
+                                final_output_stage_ids=final_output_stage_ids,
+                                arrival_time=arrival_time,
+                                lora_request=lora_request,
+                                resumable=True,
+                            )
                         )
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
@@ -771,33 +785,37 @@ class AsyncOmni(EngineClient, OmniBase):
                         final_prompt = TokensPrompt(prompt_token_ids=[0])
 
                         if has_submitted_first_chunk:
-                            await self.engine.add_streaming_update_async(
-                                request_id=request_id,
-                                prompt=final_prompt,
-                                prompt_text=None,
-                                sampling_params_list=final_sampling_params_list,
-                                final_stage_id=final_stage_id,
-                                final_output_stage_ids=final_output_stage_ids,
-                                arrival_time=arrival_time,
-                                lora_request=lora_request,
-                                resumable=False,
+                            await self._submit_with_admission(
+                                self.engine.add_streaming_update_async(
+                                    request_id=request_id,
+                                    prompt=final_prompt,
+                                    prompt_text=None,
+                                    sampling_params_list=final_sampling_params_list,
+                                    final_stage_id=final_stage_id,
+                                    final_output_stage_ids=final_output_stage_ids,
+                                    arrival_time=arrival_time,
+                                    lora_request=lora_request,
+                                    resumable=False,
+                                )
                             )
                         else:
-                            await self.engine.add_request_async(
-                                request_id=request_id,
-                                prompt=final_prompt,
-                                prompt_text=None,
-                                sampling_params_list=final_sampling_params_list,
-                                final_stage_id=final_stage_id,
-                                final_output_stage_ids=final_output_stage_ids,
-                                arrival_time=arrival_time,
-                                lora_request=lora_request,
-                                resumable=False,
+                            await self._submit_with_admission(
+                                self.engine.add_request_async(
+                                    request_id=request_id,
+                                    prompt=final_prompt,
+                                    prompt_text=None,
+                                    sampling_params_list=final_sampling_params_list,
+                                    final_stage_id=final_stage_id,
+                                    final_output_stage_ids=final_output_stage_ids,
+                                    arrival_time=arrival_time,
+                                    lora_request=lora_request,
+                                    resumable=False,
+                                )
                             )
                             has_submitted_first_chunk = True
                 finally:
-                    # Always release generate() admission, even on cancel /
-                    # empty stream / submit failure, so sleep() cannot stall.
+                    # Unblock generate() even on cancel / empty stream / submit
+                    # failure so it can observe a terminal abort or empty result.
                     _mark_first_chunk_submitted()
 
         input_stream_task = asyncio.create_task(handle_inputs())
@@ -1144,12 +1162,13 @@ class AsyncOmni(EngineClient, OmniBase):
         await self._abort(internal_req_ids)
 
     async def _abort(self, request_ids: list[str]) -> None:
-        """Abort request IDs via the engine and clean frontend state after ack.
+        """Abort request IDs via the engine and enqueue terminal abort outputs.
 
         Waits for orchestrator abort acknowledgment, enqueues any AR terminal
         abort outputs (partial tokens) into each request's asyncio queue, then
-        pops ``request_states`` so generate() can observe the abort output
-        before frontend teardown. Orchestrator abort errors propagate.
+        cancels the input pump. Frontend ``request_states`` stay registered so
+        ``generate()`` can consume the terminal message in
+        ``_process_orchestrator_results`` and run normal cleanup.
 
         When ``abort_async`` returns no output for an active request (OP not
         registered yet, unbound replica, or orchestrator id drop), enqueue a
@@ -1176,7 +1195,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     delivered.add(rid)
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
-            state = self.request_states.pop(rid, None)
+            state = self.request_states.get(rid)
             input_stream_task = getattr(state, "input_stream_task", None)
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()

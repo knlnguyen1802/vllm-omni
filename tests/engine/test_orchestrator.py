@@ -251,9 +251,9 @@ class FakeOutputProcessor:
         aborted_ids, _outputs = self.abort_requests_collecting_outputs(request_ids, internal=internal)
         return aborted_ids
 
-    def abort_requests_collecting_outputs(self, request_ids, *, internal: bool = False):
+    def abort_requests_collecting_outputs(self, request_ids, *, internal: bool = False, commit_state: bool = True):
         """Mirror MultimodalOutputProcessor collecting for AR abort-prefix tests."""
-        del internal
+        del internal, commit_state
         ids = list(request_ids)
         self.abort_calls.append(ids)
         outputs: list[RequestOutput] = []
@@ -893,6 +893,39 @@ async def test_run_abort_emits_result_when_rpc_id_set(orchestrator_factory) -> N
         assert abort_msg.engine_outputs.outputs[0].finish_reason == "abort"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_abort_marks_only_last_final_stage_output_finished() -> None:
+    """A request with two final AR stages must keep earlier abort outputs unfinished."""
+    stages = [
+        FakeStageClient(stage_type="llm", final_output=True),
+        FakeStageClient(stage_type="llm", final_output=True),
+    ]
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-two", token_ids=[1], finished=True)]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-two", token_ids=[2], finished=True)]),
+    ]
+    pools = _build_stage_pools([[stages[0]], [stages[1]]], output_processors=processors)
+    pools[0]._request_bindings["req-two"] = 0
+    pools[1]._request_bindings["req-two"] = 0
+
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    orchestrator.request_states["req-two"] = OrchestratorRequestState(
+        request_id="req-two",
+        final_stage_id=1,
+        final_output_stage_ids={0, 1},
+    )
+
+    outputs = await orchestrator._abort_request_ids(["req-two"])
+    assert [(msg.stage_id, msg.finished) for msg in outputs] == [(0, False), (1, True)]
+    assert list(outputs[0].engine_outputs.outputs[0].token_ids) == [1]
+    assert list(outputs[1].engine_outputs.outputs[0].token_ids) == [2]
 
 
 @pytest.mark.asyncio

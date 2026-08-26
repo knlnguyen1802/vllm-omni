@@ -176,7 +176,6 @@ def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefi
             assert re.fullmatch(rf"{re.escape(cancel_prefix)}-[0-9a-f]+", rid)
         assert len(aborted_ids) == expected_cancel_count
         assert len(set(aborted_ids)) == expected_cancel_count
-        assert len(omni.request_states) == len(req_ids) - expected_cancel_count
 
         for t in tasks:
             t.cancel()
@@ -186,7 +185,9 @@ def test_abort_handles_internal_request_mapping(req_ids: list[str], cancel_prefi
 
 
 @pytest.mark.cpu
-def test_abort_pops_request_states_only_after_ack():
+def test_abort_keeps_request_states_until_generate_cleanup():
+    """Frontend abort must not drop request_states; generate() owns cleanup."""
+
     async def run():
         release = asyncio.Event()
         seen_during_wait: list[int] = []
@@ -211,7 +212,7 @@ def test_abort_pops_request_states_only_after_ack():
 
         release.set()
         await task
-        assert "req-1-aaaa" not in omni.request_states
+        assert "req-1-aaaa" in omni.request_states
 
     asyncio.run(run())
 
@@ -291,7 +292,7 @@ def test_abort_enqueues_prefix_tokens_from_engine():
         assert msg.finished is True
         assert list(msg.engine_outputs.outputs[0].token_ids) == [7, 8, 9]
         assert msg.engine_outputs.outputs[0].finish_reason == "abort"
-        assert "req-1-cccc" not in omni.request_states
+        assert "req-1-cccc" in omni.request_states
 
     asyncio.run(run())
 
@@ -319,7 +320,7 @@ def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
         assert msg.finished is True
         assert msg.request_id == "req-1-dddd"
         assert msg.engine_outputs.outputs[0].finish_reason == "abort"
-        assert "req-1-dddd" not in omni.request_states
+        assert "req-1-dddd" in omni.request_states
 
     asyncio.run(run())
 
