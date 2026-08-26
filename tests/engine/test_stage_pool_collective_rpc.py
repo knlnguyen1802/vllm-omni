@@ -64,9 +64,28 @@ def test_collective_rpc_control_helper_honors_timeout():
             return "slept"
 
         pool, _client = _make_pool(sleep_async=slow_sleep)
-        result = await pool.collective_rpc(0, "sleep", timeout=0.01, args=(1,))
-        assert result != "slept"
+        with pytest.raises(asyncio.TimeoutError):
+            await pool.collective_rpc(0, "sleep", timeout=0.01, args=(1,))
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_control_method_reraises_worker_error():
+    async def run() -> None:
+        pool, _client = _make_pool(wake_up_async=AsyncMock(side_effect=RuntimeError("worker died")))
+        with pytest.raises(RuntimeError, match="worker died"):
+            await pool.collective_rpc(0, "wake_up")
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_non_control_method_still_returns_error_dict():
+    async def run() -> None:
+        pool, _client = _make_pool(collective_rpc_async=AsyncMock(side_effect=RuntimeError("probe failed")))
+        result = await pool.collective_rpc(0, "reset_prefix_cache")
         assert result["supported"] is False
-        assert "TimeoutError" in result["error"] or "timed out" in result["error"]
+        assert "probe failed" in result["error"]
 
     asyncio.run(run())

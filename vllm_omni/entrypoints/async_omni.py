@@ -155,6 +155,7 @@ class AsyncOmni(EngineClient, OmniBase):
         # on wake so sleep → wake → generate keeps working.
         self._hold_admission_until_resume: bool = False
         self._sleeping_tags: set[str] = set()
+        self._stage_sleeping_tags: dict[int, set[str]] = {}
         self._level2_sleeping: bool = False
         self._duplex_request_client: DuplexRequestClient | None = None
         self.duplex_lifecycle_events: asyncio.Queue[DuplexSessionLifecycleMessage] = asyncio.Queue()
@@ -1234,6 +1235,47 @@ class AsyncOmni(EngineClient, OmniBase):
                 ar_stage_ids.append(sid)
         return ar_stage_ids, diffusion_stage_ids
 
+    def _sleeping_tags_for_stages(self, stage_ids: list[int]) -> set[str]:
+        """Union of sleeping tags recorded for the given stages."""
+        per_stage = getattr(self, "_stage_sleeping_tags", None) or {}
+        tags: set[str] = set()
+        for sid in stage_ids:
+            tags.update(per_stage.get(sid, set()))
+        return tags
+
+    def _refresh_union_sleeping_tags(self) -> None:
+        """Keep ``_sleeping_tags`` as the engine-wide union of per-stage tags."""
+        per_stage = getattr(self, "_stage_sleeping_tags", None) or {}
+        union: set[str] = set()
+        for stage_tags in per_stage.values():
+            union.update(stage_tags)
+        self._sleeping_tags = union
+
+    def _record_stage_sleep(self, stage_ids: list[int], tags: Iterable[str]) -> None:
+        per_stage = getattr(self, "_stage_sleeping_tags", None)
+        if per_stage is None:
+            per_stage = {}
+            self._stage_sleeping_tags = per_stage
+        tag_set = set(tags)
+        for sid in stage_ids:
+            per_stage.setdefault(sid, set()).update(tag_set)
+        self._refresh_union_sleeping_tags()
+
+    def _clear_stage_sleep(self, stage_ids: list[int], tags: Iterable[str]) -> None:
+        per_stage = getattr(self, "_stage_sleeping_tags", None)
+        if per_stage is None:
+            self._sleeping_tags = set()
+            return
+        tag_set = set(tags)
+        for sid in stage_ids:
+            remaining = per_stage.get(sid)
+            if remaining is None:
+                continue
+            remaining.difference_update(tag_set)
+            if not remaining:
+                per_stage.pop(sid, None)
+        self._refresh_union_sleeping_tags()
+
     async def pause_generation(
         self,
         *,
@@ -1437,9 +1479,10 @@ class AsyncOmni(EngineClient, OmniBase):
         if diffusion_stage_ids:
             final_acks.extend(await self._sleep_diffusion(diffusion_stage_ids, level))
 
-        if not hasattr(self, "_sleeping_tags"):
-            self._sleeping_tags = set()
-        self._sleeping_tags.update([CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value])
+        self._record_stage_sleep(
+            ar_stage_ids + diffusion_stage_ids,
+            [CuMemTag.WEIGHTS.value, CuMemTag.KV_CACHE.value],
+        )
         if level == 2:
             self._level2_sleeping = True
         return final_acks
@@ -1483,7 +1526,12 @@ class AsyncOmni(EngineClient, OmniBase):
                 "Use sleep(level=1) instead, which offloads weights to CPU RAM "
                 "and supports fast DMA restore."
             )
-        _current_tags = getattr(self, "_sleeping_tags", set())
+        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
+        target_stage_ids = ar_stage_ids + diffusion_stage_ids
+        _current_tags = self._sleeping_tags_for_stages(target_stage_ids)
+        per_stage = getattr(self, "_stage_sleeping_tags", None) or {}
+        if not _current_tags and not per_stage:
+            _current_tags = set(getattr(self, "_sleeping_tags", set()))
         if tags is None:
             requested_tags = list(_current_tags)
         else:
@@ -1491,8 +1539,6 @@ class AsyncOmni(EngineClient, OmniBase):
         if not requested_tags:
             logger.info(f"[{self._name}] Requested tags {tags} are already warm. Skipping wake_up.")
             return []
-
-        ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
 
         final_acks: list[OmniACK] = []
         if ar_stage_ids:
@@ -1517,9 +1563,7 @@ class AsyncOmni(EngineClient, OmniBase):
         if diffusion_stage_ids:
             final_acks.extend(await self._wake_diffusion(diffusion_stage_ids, requested_tags))
 
-        for t in requested_tags:
-            if hasattr(self, "_sleeping_tags"):
-                self._sleeping_tags.discard(t)
+        self._clear_stage_sleep(target_stage_ids, requested_tags)
         # Only clear the level-2 flag once all tags are warm, in case partial
         # wake support (e.g. tags=["kv_cache"] only) is added in the future.
         if not getattr(self, "_sleeping_tags", None):

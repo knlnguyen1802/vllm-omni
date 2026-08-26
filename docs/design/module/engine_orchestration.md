@@ -110,7 +110,10 @@ Test routing, output ordering, queue correlation, cancellation, failure
 propagation, shutdown ordering, and representative multi-stage execution.
 AR abort of a final-stage LLM request must deliver a terminal output with
 `finish_reason="abort"` and the generated prefix so collocated training can
-resume; diffusion abort remains whole-sample retry.
+resume; diffusion abort remains whole-sample retry. Aborting a parallel-sampling
+child must drop `parent_requests` once no children remain. EngineCore control
+RPCs (`sleep` / `wake_up` / `pause_scheduler` / `resume_scheduler`) must
+propagate worker exceptions rather than returning `{"supported": False}`.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 

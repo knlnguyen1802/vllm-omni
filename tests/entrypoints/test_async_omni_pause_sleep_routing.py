@@ -21,6 +21,7 @@ def _make_omni(*, stage_types: list[str]) -> AsyncOmni:
     omni._admitting = 0
     omni._hold_admission_until_resume = False
     omni._sleeping_tags = set()
+    omni._stage_sleeping_tags = {}
     omni._level2_sleeping = False
     omni.event_resolver = SimpleNamespace(watch_task=lambda *a, **k: None, resolve=AsyncMock())
     omni._final_output_handler = lambda: None
@@ -378,5 +379,32 @@ def test_pause_then_sleep_wake_keeps_admission_paused_for_diffusion():
         assert omni._hold_admission_until_resume is True
         await omni.resume_generation()
         assert omni._paused is False
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_partial_wake_does_not_skip_remaining_sleeping_stage():
+    """sleep(stage_ids=[0]) then wake([0]) must not skip a later wake([1])."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "llm"])
+        await omni.sleep(stage_ids=[0, 1], level=1, mode="abort")
+        assert omni._stage_sleeping_tags.keys() == {0, 1}
+
+        await omni.wake_up(stage_ids=[0])
+        assert 0 not in omni._stage_sleeping_tags
+        assert 1 in omni._stage_sleeping_tags
+        assert CuMemTag.WEIGHTS.value in omni._sleeping_tags
+
+        omni.collective_rpc.reset_mock()
+        acks = await omni.wake_up(stage_ids=[1])
+        assert acks
+        omni.collective_rpc.assert_awaited_once()
+        wake_kwargs = omni.collective_rpc.await_args.kwargs
+        assert wake_kwargs["method"] == "wake_up"
+        assert wake_kwargs["stage_ids"] == [1]
+        assert not omni._sleeping_tags
+        assert not omni._stage_sleeping_tags
 
     asyncio.run(run())

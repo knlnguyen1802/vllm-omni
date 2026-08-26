@@ -488,6 +488,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     abort_outputs.append(request_output)
                     if req_state.queue is not None:
                         req_state.queue.put(request_output)
+                parent_req = req_state.parent_req
+                if parent_req is not None:
+                    parent_req.child_requests.discard(request_id)
+                    if not parent_req.child_requests:
+                        self.parent_requests.pop(parent_req.request_id, None)
             elif parent := self.parent_requests.get(request_id):
                 if parent.child_requests:
                     child_reqs = list(parent.child_requests)

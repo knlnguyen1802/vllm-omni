@@ -122,7 +122,8 @@ Test request validation, protocol conversion, model-adapter routing,
 streaming, session identity, disconnect/cancellation, and error mapping for
 each affected offline or serving entrypoint. Sleep must wait for in-flight
 `generate()` admission before EngineCore offload; `wake_up` does not resume
-admission — callers must `resume_generation()`.
+admission — callers must `resume_generation()`. Sleeping tags are tracked per
+stage so `wake_up(stage_ids=[0])` does not skip a later `wake_up(stage_ids=[1])`.
 
 ## Promotion gate
 

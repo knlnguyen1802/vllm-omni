@@ -1247,7 +1247,12 @@ class StagePool:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any] | Any:
-        """Dispatch a stage-scoped control-plane RPC to one physical route."""
+        """Dispatch a stage-scoped control-plane RPC to one physical route.
+
+        EngineCore control methods (``pause_scheduler``, ``resume_scheduler``,
+        ``sleep``, ``wake_up``) propagate worker exceptions. Capability probes
+        and other RPCs still return ``{"supported": False, "error": ...}``.
+        """
         args = tuple(args or ())
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
@@ -1278,6 +1283,8 @@ class StagePool:
                 replica_id,
                 method,
             )
+            if method in self._ENGINE_CORE_CONTROL_ASYNC_METHODS:
+                raise
             if isinstance(exc, TimeoutError):
                 error = f"{type(exc).__name__}: {method} timed out after {timeout}s"
             else:

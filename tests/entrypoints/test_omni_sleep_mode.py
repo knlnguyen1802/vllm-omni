@@ -374,7 +374,6 @@ class TestOmniDiffusionSleepMode:
             # AR stages keep the frontend admission gate held after wake.
             await diffusion_engine.resume_generation(stage_ids=[0])
             await asyncio.sleep(2.0)
-            await diffusion_engine.resume_generation(stage_ids=[0])
             gc.collect()
             get_vram_info(device_id)
             torch.accelerator.empty_cache()
