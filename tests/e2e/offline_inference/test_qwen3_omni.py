@@ -104,14 +104,31 @@ def _finish_reason(output) -> str | None:
 
 
 def _colocate_async_deploy() -> str:
-    """CI Qwen3-Omni deploy with sleep mode enabled on every stage."""
+    """Thinker-only Instruct deploy with sleep mode on a single GPU.
+
+    Abort / sleep admission is a thinker control-plane contract. The 3-stage
+    CI yaml plus CuMem on every stage fails engine-core startup in the L3
+    merge job: Stage 1 resolves ``devices: "1"`` while only GPU 0 is visible,
+    and talker+code2wav sleep init races the leftover 2-GPU OmniRunner from
+    earlier tests in this module.
+    """
     return modify_stage_config(
-        get_cuda_graph_config(),
+        get_deploy_config_path("qwen3_omni_moe_thinking.yaml"),
         updates={
             "stages": {
-                0: {"enable_sleep_mode": True, "enforce_eager": True},
-                1: {"enable_sleep_mode": True, "enforce_eager": True},
-                2: {"enable_sleep_mode": True, "enforce_eager": True},
+                0: {
+                    "enable_sleep_mode": True,
+                    "enforce_eager": True,
+                    "trust_remote_code": True,
+                    "tensor_parallel_size": 1,
+                    "devices": "0",
+                    "gpu_memory_utilization": 0.9,
+                    "max_num_seqs": 1,
+                    "max_model_len": 8192,
+                    "max_num_batched_tokens": 8192,
+                    "enable_prefix_caching": False,
+                    "skip_mm_profiling": True,
+                },
             },
         },
     )
@@ -119,12 +136,11 @@ def _colocate_async_deploy() -> str:
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 @pytest.mark.asyncio
 async def test_colocate_async_abort_tokens_and_sleep_admission() -> None:
-    """
-
-    **required** regression. Control-plane APIs (``abort`` / ``sleep`` /
+    """**required** regression. Control-plane APIs (``abort`` / ``sleep`` /
     ``wake_up`` / ``resume_generation``) are not in ``send_omni_request``.
 
     On ``origin/main`` this test fails:
