@@ -380,6 +380,63 @@ No restart is needed: `task=fl2va` routes to `FL2VA/transformer`, while
 `task=ref2va` routes to
 `Ref2VA/transformer`. T2VA uses the FL2VA DiT.
 
+### Step execution and continuous batching
+
+H3 implements the step-wise execution contract, so the scheduler can admit and
+retire requests between denoise steps instead of running one request end to
+end. Add the feature gate, then raise `--max-num-seqs` to co-batch:
+
+```bash
+--step-execution --max-num-seqs 4
+```
+
+Co-batched requests are packed into a single sequence that keeps one attention
+document per request, so a batch costs one DiT forward. That packing requires
+`--diffusion-attention-backend FLASH_ATTN`; other backends fall back to one
+forward per request. `--max-num-seqs 1` keeps the conservative single-request
+step path. Cache acceleration (`--cache-backend`) is not available in step mode.
+
+!!! warning "Co-batching does not improve H3 throughput for large simultaneous requests"
+    Keep `--max-num-seqs 1` unless you specifically need scheduler-level control
+    (admitting and retiring requests between denoise steps). Measured on two
+    H100s (TP2, BF16, 672x384, 209 frames, 30 steps, 4 requests at concurrency
+    4 with `--request-rate inf`, i.e. all four submitted at time 0; one packed
+    request is 16384 rows):
+
+    | Configuration | Wall time | Mean latency | Peak memory |
+    |---------------|-----------|--------------|-------------|
+    | request mode | 174.8 s | 111.5 s | 72.4 GB |
+    | `--step-execution --max-num-seqs 1` | 179.0 s | 113.8 s | 72.4 GB |
+    | `--step-execution --max-num-seqs 4` | 182.1 s | 175.7 s | 78.3 GB |
+
+    A single H3 denoise step is a compute-bound dense GEMM over an already long
+    packed sequence, so fusing N requests costs N times the FLOPs and buys almost
+    no amortization — unlike LLM decoding, which is memory-bandwidth bound.
+    Going from one request per step to four cuts the per-request denoise cost
+    only from 1.323 s to 1.291 s (2.4%), which the step-mode bookkeeping then
+    spends. Mean latency degrades further because co-batched requests finish
+    together instead of staggered. Quantization moves the absolute numbers
+    without changing this: with online `int8` the same workload runs in 153.3 s
+    at 56.9 GB (request mode), and `--max-num-seqs 4` is still 5.0% slower than
+    request mode.
+
+    Two workloads outside this table are unmeasured and may behave differently:
+
+    - **Staggered arrivals (admission latency).** A single 16384-row H3 request
+      already saturates the GPUs, so submitting all requests at time 0 is the
+      one arrival pattern where co-batching cannot win: it can only bunch
+      completions. In request mode a new request queues behind the whole
+      in-flight generation (~45 s at this size); step mode admits at the next
+      denoise-step boundary (~1.3 s). Whether that shows up as a wall-clock
+      benefit under Poisson arrivals is not yet measured for H3. To reproduce,
+      run request mode vs `--step-execution --max-num-seqs 4` with
+      `diffusion_benchmark_serving.py --request-rate 0.05` (roughly one request
+      every 20 s) and report mean / p95 latency, which then includes queueing.
+    - **Small requests.** The numbers above are drawn from 672x384 / 209-frame
+      requests. A short clip at lower resolution packs a few thousand rows and
+      may not saturate the hardware; co-batching may amortize better there.
+      This is also unmeasured.
+
 ### Online FP8 quantization
 
 MiniMax H3 supports online FP8 quantization of both the DiT and the Qwen3-VL
@@ -782,7 +839,7 @@ hf download lightx2v/Minimax-h3-Turbo "${TURBO_FILE}" --local-dir "${TURBO_DIR}"
 export TURBO_LORA="${TURBO_DIR}/${TURBO_FILE}"
 ```
 
-Start from a non-offloaded FL2VA server command and add
+Start from a non-offloaded or DLO FL2VA server command and add
 `--task-type fl2va --lora-backend peft --lora-path "${TURBO_LORA}"`.
 `--lora-path` preloads the adapter; each request still activates it and uses
 the published sampling settings:
@@ -796,11 +853,69 @@ the published sampling settings:
 
 For FL2VA, change `task` and add `input_reference` as shown above. The 8-step,
 ComfyUI, Ref2VA, and v1.1 artifacts are not supported. This integration is
-dynamic-only and does not support prefusion, DLO, or LoRA composition.
-It also rejects model-level, layerwise, and distributed layerwise offload;
-the legacy dynamic LoRA tensors do not participate in those weight lifecycles.
+dynamic-only and does not support prefusion or LoRA composition. DLO is
+supported by keeping the request-switchable LoRA A/B buffers resident on the
+accelerator while DLO streams only the base blocks; budget for this additional
+fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
 The five requested sigma points produce the four denoiser evaluations expected
 by the Turbo artifact.
+
+### FlashGen native LoRA
+
+The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
+declares its distilled sigma schedule in safetensors metadata. It is published on
+[ModelScope](https://modelscope.cn/models/FlashGen/Minimax-H3-4step-lora-flashgen):
+
+```text
+FlashGen/Minimax-H3-4step-lora-flashgen/minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+```
+
+Download only that file:
+
+```bash
+python -m pip install modelscope
+export FLASHGEN_DIR=/path/to/minimax-h3-flashgen-lora
+export FLASHGEN_FILE=minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors
+modelscope download FlashGen/Minimax-H3-4step-lora-flashgen \
+  --local_dir "${FLASHGEN_DIR}" \
+  --include "${FLASHGEN_FILE}"
+export FLASHGEN_LORA="${FLASHGEN_DIR}/${FLASHGEN_FILE}"
+```
+
+Start from a non-offloaded or DLO FL2VA server command and add
+`--task-type fl2va --lora-backend peft --lora-path "${FLASHGEN_LORA}"`.
+Each request must use T2VA and the distilled interval-count contract:
+
+```bash
+-F 'num_inference_steps=4' \
+-F 'extra_params={"task":"t2va","duration":5.2}' \
+-F "lora={\"name\":\"h3-flashgen-v1.0\",\"path\":\"${FLASHGEN_LORA}\",\"scale\":1.0}"
+```
+
+This path rejects Ref2VA and checkpoints that already pin `base_schedule` in
+`model_index.json`. The adapter metadata carries
+`base_schedule=1.0,0.7,0.4,0.15,0.0`, so `num_inference_steps=4` means four
+denoiser evaluations, not five sigma points. Request-mode generation may omit
+the field and take the count from the adapter schedule; `--step-execution`
+requires it explicitly, because the step scheduler reads the total step count
+off the request at admission, before the adapter schedule is known.
+
+DLO is supported in request-mode generation on the same terms as the Turbo
+adapter: the request-switchable LoRA A/B buffers stay resident on the
+accelerator while DLO streams only the base blocks, so budget for that
+additional fixed HBM usage. The native artifact is rank 64 over 259 target
+modules, and its packed `qkv_proj` and `fc1` layers reuse the full-input A
+tensor per slice while B carries slice-local output rows, so the resident
+footprint exceeds the on-disk payload; measure it for your parallel layout
+rather than assuming the checkpoint size. Pure Ulysses replicates the adapter
+on every rank, while DiT tensor parallelism shards the B buffers. Model-level
+and standard layerwise offload remain unsupported, and `--step-execution`
+cannot be combined with `--enable-distributed-layerwise-offload`.
+
+To validate a deployment, post the same fixed-seed T2VA request twice with the
+adapter and twice without it, then compare the four output digests. The adapter
+is bound and deterministic when each pair matches internally and the two pairs
+differ from each other.
 
 ## Key parameters
 
@@ -924,7 +1039,12 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
 - TeaCache is calibrated for FL2VA only; Ref2VA requests run uncached.
 - Combined serving requires sibling `FL2VA` and `Ref2VA` directories, loads
   both task-specific DiTs, and loads shared components once from `FL2VA`.
-- H3 currently executes one generation request per diffusion batch.
+- Request mode executes one generation request per diffusion batch. Use
+  `--step-execution` with `--max-num-seqs N` to admit several requests at once
+  (see
+  [Execution modes](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/execution_modes.md));
+  step
+  mode does not support `cache_backend`.
 - The first regional-compile request is a warmup and should not be included in
   steady-state performance measurements.
 - The serving path accepts fewer references than the model supports. H3 documents up
