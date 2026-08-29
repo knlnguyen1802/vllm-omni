@@ -646,6 +646,8 @@ class AsyncOmni(EngineClient, OmniBase):
             if admitting:
                 await self._release_generate_admission()
                 admitting = False
+            # Refresh gauges on arrival.
+            self._publish_request_gauges(len(self.request_states))
 
             # Process results based on mode
             # Both sequential and async_chunk modes read the same message stream
