@@ -16,11 +16,20 @@ from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep impor
     FlowUniPCMultistepScheduler,
 )
 
+from vllm_omni.diffusion.models.schedulers.trajectory import (
+    TrajectoryCollector,
+    attach_scheduler_trajectory,
+    configure_scheduler_for_request,
+)
+
 __all__ = [
     "DMD2EulerScheduler",
     "FlowMatchEulerDiscreteScheduler",
     "FlowUniPCMultistepScheduler",
+    "TrajectoryCollector",
+    "attach_scheduler_trajectory",
     "build_pipeline_scheduler",
+    "configure_scheduler_for_request",
     "ensure_scheduler_consumed",
     "is_injected_scheduler",
     "register_scheduler",

@@ -90,3 +90,13 @@ ignored.
 
 Custom pipelines remain supported until the rest of the RL injection surface
 is ready; see [Custom Diffusion Pipeline](custom_pipeline.md).
+
+## Optional trajectory export
+
+A scheduler may implement `TrajectoryCollector` (`configure` / `reset` /
+`get_trajectory`). `attach_scheduler_trajectory` copies those buffers onto
+`DiffusionOutput.trajectory_*` at the pipeline tail and at `post_decode`.
+Rank-0 only. RL math stays in the scheduler class, not in the denoise loop.
+Per-request knobs go through `sampling_params.extra_args["scheduler_configure"]`
+after the existing `prepare_encode` deepcopy. Do not restore `custom_output`;
+extra tensors use the payload/metadata envelope (`rl` / `prompt_embeddings`).
