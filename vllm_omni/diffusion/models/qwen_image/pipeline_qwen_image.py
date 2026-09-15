@@ -38,6 +38,11 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
 from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
+from vllm_omni.diffusion.models.schedulers.extras import attach_rollout_extras, requested_rollout_extras
+from vllm_omni.diffusion.models.schedulers.trajectory import (
+    attach_scheduler_trajectory,
+    configure_scheduler_for_request,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
@@ -389,6 +394,7 @@ class QwenImagePipeline(
         negative_prompt_embeds_mask=None,
         callback_on_step_end_tensor_inputs=None,
         max_sequence_length=None,
+        prompt_ids=None,
     ):
         if height % (self.vae_scale_factor * 2) != 0 or width % (self.vae_scale_factor * 2) != 0:
             logger.warning(
@@ -409,9 +415,9 @@ class QwenImagePipeline(
                 f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
                 " only forward one of the two."
             )
-        elif prompt is None and prompt_embeds is None:
+        elif prompt is None and prompt_embeds is None and prompt_ids is None:
             raise ValueError(
-                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
+                "Provide either `prompt`, `prompt_ids`, or `prompt_embeds`."
             )
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
@@ -444,6 +450,54 @@ class QwenImagePipeline(
         bool_mask = mask.bool()
         valid_lengths = bool_mask.sum(dim=1)
         selected = hidden_states[bool_mask]
+        split_hidden_states = torch.split(selected, valid_lengths.tolist(), dim=0)
+        return split_hidden_states
+
+    @staticmethod
+    def extract_custom_prompt_ids(prompts):
+        """Pull pre-tokenized ids off OmniCustomPrompt dicts. Lists until encode_prompt()."""
+        if not prompts or not isinstance(prompts[0], dict) or prompts[0].get("prompt_ids") is None:
+            return None, None, None, None, None
+        prompt_ids = [p.get("prompt_ids") for p in prompts]
+        prompt_mask = [p.get("prompt_mask") for p in prompts]
+        negative_prompt_ids = [p.get("negative_prompt_ids") for p in prompts]
+        negative_prompt_mask = [p.get("negative_prompt_mask") for p in prompts]
+        extra_prompt_ids = [p.get("extra_prompt_ids") for p in prompts]
+        if all(m is None for m in prompt_mask):
+            prompt_mask = None
+        if all(ids is None for ids in negative_prompt_ids):
+            negative_prompt_ids = None
+            negative_prompt_mask = None
+        if all(extra is None for extra in extra_prompt_ids):
+            extra_prompt_ids = None
+        return prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask, extra_prompt_ids
+
+    def _prompt_ids_to_tensors(self, prompt_ids, attention_mask=None):
+        if isinstance(prompt_ids, torch.Tensor):
+            input_ids = prompt_ids.to(device=self.device, dtype=torch.long)
+        else:
+            rows = prompt_ids if prompt_ids and isinstance(prompt_ids[0], list | tuple) else [prompt_ids]
+            max_len = max(len(r) for r in rows)
+            pad_id = self.tokenizer.pad_token_id or 0
+            padded = [list(r) + [pad_id] * (max_len - len(r)) for r in rows]
+            input_ids = torch.tensor(padded, device=self.device, dtype=torch.long)
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if attention_mask is None:
+            pad_id = self.tokenizer.pad_token_id or 0
+            attn = (input_ids != pad_id).long()
+        elif isinstance(attention_mask, torch.Tensor):
+            attn = attention_mask.to(device=self.device)
+        else:
+            rows = attention_mask if attention_mask and isinstance(attention_mask[0], list | tuple) else [attention_mask]
+            max_len = input_ids.shape[1]
+            padded = [list(r) + [0] * (max_len - len(r)) for r in rows]
+            attn = torch.tensor(padded, device=self.device)
+        if attn.ndim == 1:
+            attn = attn.unsqueeze(0)
+        return input_ids, attn
+        valid_lengths = bool_mask.sum(dim=1)
+        selected = hidden_states[bool_mask]
         split_result = torch.split(selected, valid_lengths.tolist(), dim=0)
 
         return split_result
@@ -454,8 +508,31 @@ class QwenImagePipeline(
         dtype: torch.dtype | None = None,
         max_sequence_length: int | None = None,
         prompt_name: str = "prompt",
+        prompt_ids: list[int] | list[list[int]] | torch.Tensor | None = None,
+        attention_mask: list[int] | list[list[int]] | torch.Tensor | None = None,
     ):
         dtype = dtype or self.text_encoder.dtype
+        drop_idx = self.prompt_template_encode_start_idx
+
+        if prompt_ids is not None:
+            input_ids, attn_mask = self._prompt_ids_to_tensors(prompt_ids, attention_mask)
+            encoder_hidden_states = self.text_encoder(
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                output_hidden_states=True,
+            )
+            hidden_states = encoder_hidden_states.hidden_states[-1]
+            split_hidden_states = self._extract_masked_hidden(hidden_states, attn_mask)
+            split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+            attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+            max_seq_len = max(e.size(0) for e in split_hidden_states)
+            prompt_embeds = torch.stack(
+                [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+            )
+            encoder_attention_mask = torch.stack(
+                [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
+            )
+            return prompt_embeds.to(dtype=dtype), encoder_attention_mask
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
@@ -508,12 +585,14 @@ class QwenImagePipeline(
 
     def encode_prompt(
         self,
-        prompt: str | list[str],
+        prompt: str | list[str] | None = None,
         num_images_per_prompt: int = 1,
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
         max_sequence_length: int = 1024,
         prompt_name: str = "prompt",
+        prompt_ids: list[int] | list[list[int]] | torch.Tensor | None = None,
+        prompt_mask: list[int] | list[list[int]] | torch.Tensor | None = None,
     ):
         r"""
 
@@ -524,17 +603,32 @@ class QwenImagePipeline(
                 number of images that should be generated per prompt
             prompt_embeds (`torch.Tensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
+                provided, text embeddings will be generated from `prompt` or `prompt_ids`.
+            prompt_ids: Pre-tokenized ids. When set, the tokenizer is not called.
         """
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
-        batch_size = len(prompt) if prompt_embeds is None else prompt_embeds.shape[0]
+        if prompt_embeds is None:
+            if prompt_ids is not None:
+                batch_size = 1 if not isinstance(prompt_ids, list) or not prompt_ids else (
+                    len(prompt_ids) if isinstance(prompt_ids[0], list | tuple) else 1
+                )
+                if isinstance(prompt_ids, torch.Tensor):
+                    batch_size = prompt_ids.shape[0]
+            elif prompt is not None:
+                batch_size = len(prompt)
+            else:
+                raise ValueError("encode_prompt requires prompt, prompt_ids, or prompt_embeds")
+        else:
+            batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
             prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
                 prompt,
                 max_sequence_length=max_sequence_length,
                 prompt_name=prompt_name,
+                prompt_ids=prompt_ids,
+                attention_mask=prompt_mask,
             )
 
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
@@ -645,6 +739,15 @@ class QwenImagePipeline(
 
     def _extract_prompts(self, prompts):
         """Extract prompt and negative_prompt from OmniPromptType list."""
+        prompt_ids, _, _, _, _ = self.extract_custom_prompt_ids(prompts)
+        if prompt_ids is not None:
+            # Ids already include the Qwen template. Do not re-tokenize empty strings.
+            negative_prompt = None
+            if prompts and any(
+                not isinstance(p, str) and p.get("negative_prompt_ids") is not None for p in prompts
+            ):
+                negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in prompts]
+            return None, negative_prompt
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in prompts] or None
         if all(isinstance(p, str) or p.get("negative_prompt") is None for p in prompts):
             negative_prompt = None
@@ -675,6 +778,10 @@ class QwenImagePipeline(
         latents=None,
         attention_kwargs=None,
         callback_on_step_end_tensor_inputs=None,
+        prompt_ids=None,
+        prompt_mask=None,
+        negative_prompt_ids=None,
+        negative_prompt_mask=None,
     ):
         """Shared preparation logic for forward() and prepare_encode().
 
@@ -692,6 +799,7 @@ class QwenImagePipeline(
             negative_prompt_embeds_mask,
             callback_on_step_end_tensor_inputs,
             max_sequence_length,
+            prompt_ids=prompt_ids,
         )
 
         self._guidance_scale = guidance_scale
@@ -705,11 +813,20 @@ class QwenImagePipeline(
             batch_size = len(prompt)
         elif prompt_embeds is not None:
             batch_size = prompt_embeds.shape[0]
+        elif prompt_ids is not None:
+            if isinstance(prompt_ids, torch.Tensor):
+                batch_size = prompt_ids.shape[0]
+            elif prompt_ids and isinstance(prompt_ids[0], list | tuple):
+                batch_size = len(prompt_ids)
+            else:
+                batch_size = 1
         else:
             batch_size = 1
 
-        has_neg_prompt = negative_prompt is not None or (
-            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
+        has_neg_prompt = (
+            negative_prompt is not None
+            or negative_prompt_ids is not None
+            or (negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None)
         )
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
         self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
@@ -720,6 +837,8 @@ class QwenImagePipeline(
             prompt_embeds_mask=prompt_embeds_mask,
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
         )
         if do_true_cfg:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
@@ -729,6 +848,8 @@ class QwenImagePipeline(
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
                 prompt_name="negative_prompt",
+                prompt_ids=negative_prompt_ids,
+                prompt_mask=negative_prompt_mask,
             )
         else:
             negative_prompt_embeds = None
@@ -785,7 +906,9 @@ class QwenImagePipeline(
     ) -> "StepRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
         sampling = state.sampling
-        prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
+        prompts = [state.prompt] if state.prompt is not None else []
+        prompt, negative_prompt = self._extract_prompts(prompts)
+        prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask, _ = self.extract_custom_prompt_ids(prompts)
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
@@ -800,6 +923,10 @@ class QwenImagePipeline(
             true_cfg_scale=sampling.true_cfg_scale or 4.0,
             max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
             attention_kwargs=kwargs.get("attention_kwargs"),
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
+            negative_prompt_ids=negative_prompt_ids,
+            negative_prompt_mask=negative_prompt_mask,
         )
 
         # prepare_timesteps() has already materialized request-specific timestep
@@ -808,6 +935,7 @@ class QwenImagePipeline(
         # Per-request scheduler (must not share state with self.scheduler)
         req_scheduler = copy.deepcopy(self.scheduler)
         req_scheduler.set_begin_index(0)
+        configure_scheduler_for_request(req_scheduler, sampling)
 
         # Populate state from generation context
         state.prompt_embeds = ctx["prompt_embeds"]
@@ -984,6 +1112,7 @@ class QwenImagePipeline(
             state.latents,
             state.do_true_cfg,
             per_request_scheduler=state.scheduler,
+            generator=getattr(state.sampling, "generator", None),
         )
 
         state.step_index += 1
@@ -1000,13 +1129,30 @@ class QwenImagePipeline(
         width = state.sampling.width or self.default_sample_size * self.vae_scale_factor
         output_type = kwargs.get("output_type") or state.sampling.output_type or "pil"
 
-        return self._decode_latents(state.latents, height, width, output_type)
+        output = self._decode_latents(state.latents, height, width, output_type)
+        extras = {
+            "prompt_embeds": state.prompt_embeds,
+            "prompt_embeds_mask": state.prompt_embeds_mask,
+            "negative_prompt_embeds": state.negative_prompt_embeds,
+            "negative_prompt_embeds_mask": state.negative_prompt_embeds_mask,
+        }
+        self._attach_rl_output(output, state.scheduler, state.sampling, extras)
+        return output
+
+    def _attach_rl_output(self, output, scheduler, sampling, extras_available):
+        attach_scheduler_trajectory(output, scheduler)
+        attach_rollout_extras(output, requested_rollout_extras(sampling), extras_available)
+        return output
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common_sampling_params = sampling_params_list[0]
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
         prompt = extracted_prompt
+        prompt_ids, prompt_mask, negative_prompt_ids, negative_prompt_mask, _ = self.extract_custom_prompt_ids(
+            req.prompts
+        )
+        configure_scheduler_for_request(self.scheduler, common_sampling_params)
 
         height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
@@ -1066,6 +1212,10 @@ class QwenImagePipeline(
             latents=latents,
             attention_kwargs=attention_kwargs,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            prompt_ids=prompt_ids,
+            prompt_mask=prompt_mask,
+            negative_prompt_ids=negative_prompt_ids,
+            negative_prompt_mask=negative_prompt_mask,
         )
 
         latents = self.diffuse(
@@ -1087,11 +1237,19 @@ class QwenImagePipeline(
                 "return_dict": False,
                 "attention_kwargs": self.attention_kwargs,
             },
+            generator=generator,
         )
 
         self._current_timestep = None
 
         result = self._decode_latents(latents, height, width, output_type)
+        extras = {
+            "prompt_embeds": ctx["prompt_embeds"],
+            "prompt_embeds_mask": ctx["prompt_embeds_mask"],
+            "negative_prompt_embeds": ctx["negative_prompt_embeds"],
+            "negative_prompt_embeds_mask": ctx["negative_prompt_embeds_mask"],
+        }
+        self._attach_rl_output(result, self.scheduler, common_sampling_params, extras)
         return split_diffusion_output_by_request(
             result,
             req,
