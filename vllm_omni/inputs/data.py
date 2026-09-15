@@ -130,8 +130,14 @@ class OmniCustomPrompt(TypedDict, total=False):
     arguments directly, bypassing the tokenization stage in the pipeline.
 
     Attributes:
-        prompt_ids: Pre-tokenized prompt token IDs (single or batched)
+        prompt_ids: Pre-tokenized prompt token IDs (single or batched).
+            Lists until ``encode_prompt()``.
         negative_prompt_ids: Pre-tokenized negative prompt token IDs
+        extra_prompt_ids: Extra encoder ids (CLIP+T5 / SD3.5). Lists until
+            ``encode_prompt()``.
+        extra_negative_prompt_ids: Extra encoder negative ids
+        extra_prompt_masks: Extra encoder attention masks
+        extra_negative_prompt_masks: Extra encoder negative attention masks
         prompt_mask: Attention mask tensor for the prompt
         negative_prompt_mask: Attention mask tensor for the negative prompt
         extra_args: Additional pipeline-specific arguments
@@ -139,6 +145,10 @@ class OmniCustomPrompt(TypedDict, total=False):
 
     prompt_ids: list[int] | list[list[int]]
     negative_prompt_ids: list[int] | list[list[int]]
+    extra_prompt_ids: dict[str, list[int] | list[list[int]]]
+    extra_negative_prompt_ids: dict[str, list[int] | list[list[int]]]
+    extra_prompt_masks: dict[str, list[int] | list[list[int]]]
+    extra_negative_prompt_masks: dict[str, list[int] | list[list[int]]]
     prompt_mask: torch.Tensor
     negative_prompt_mask: torch.Tensor
     extra_args: dict[str, Any]
