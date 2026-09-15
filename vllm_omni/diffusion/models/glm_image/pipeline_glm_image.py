@@ -283,6 +283,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
             default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
                 model_path, subfolder="scheduler", local_files_only=True
             ),
+            model=model_path,
             local_files_only=True,
         )
 

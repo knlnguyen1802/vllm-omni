@@ -12,9 +12,9 @@ contract.
 import copy
 import importlib.metadata
 import inspect
-from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import Mock
+from weakref import WeakSet
 
 import pytest
 
@@ -82,23 +82,25 @@ def _isolate_registry(monkeypatch):
     """Snapshot the module-global registry and skip real entry-point scans."""
     snapshot = dict(registry_mod._SCHEDULER_REGISTRY)
     monkeypatch.setattr(registry_mod, "_entry_points_loaded", True)
-    monkeypatch.setattr(registry_mod, "_consumed_scheduler_config_ids", set())
+    monkeypatch.setattr(registry_mod, "_consumed_scheduler_configs", WeakSet())
     RecordingMockScheduler.constructed.clear()
     yield
     registry_mod._SCHEDULER_REGISTRY.clear()
     registry_mod._SCHEDULER_REGISTRY.update(snapshot)
 
 
-def _od_config(**overrides) -> SimpleNamespace:
-    """Stub OmniDiffusionConfig (duck-typed; the factory only uses getattr)."""
-    base = {
-        "model": "stub-model",
-        "scheduler": None,
-        "scheduler_kwargs": None,
-        "local_files_only": False,
-    }
-    base.update(overrides)
-    return SimpleNamespace(**base)
+class _OdConfig:
+    """Weakref-able OmniDiffusionConfig stub for consume-tracking tests."""
+
+    def __init__(self, **overrides) -> None:
+        self.model = "stub-model"
+        self.scheduler = None
+        self.scheduler_kwargs = None
+        self.__dict__.update(overrides)
+
+
+def _od_config(**overrides) -> _OdConfig:
+    return _OdConfig(**overrides)
 
 
 def assert_scheduler_contract(scheduler: Any) -> None:
@@ -258,6 +260,18 @@ class TestBuildPipelineScheduler:
         result = build_pipeline_scheduler(od_config, scheduler_kwargs={"shift": 3.0})
         assert RecordingMockScheduler.constructed[-1]["kwargs"] == {"shift": 3.0, "num_train_timesteps": 1000}
         assert result.config == {"shift": 3.0, "num_train_timesteps": 1000}
+
+    def test_reserved_scheduler_kwargs_raise(self):
+        register_scheduler("config_sched", RecordingMockScheduler)
+        od_config = _od_config(scheduler="config_sched", scheduler_kwargs={"subfolder": "other"})
+        with pytest.raises(ValueError, match="subfolder"):
+            build_pipeline_scheduler(od_config, local_files_only=False)
+
+    def test_model_arg_overrides_od_config_model(self):
+        register_scheduler("config_sched", RecordingMockScheduler)
+        od_config = _od_config(scheduler="config_sched", model="hub/name")
+        build_pipeline_scheduler(od_config, model="/resolved/snapshot", local_files_only=True)
+        assert RecordingMockScheduler.constructed[-1]["model"] == "/resolved/snapshot"
 
     def test_config_accepts_dotted_path(self):
         od_config = _od_config(scheduler=f"{__name__}.RecordingMockScheduler")

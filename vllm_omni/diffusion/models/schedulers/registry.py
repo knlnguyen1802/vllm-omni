@@ -56,6 +56,7 @@ import importlib.metadata
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
+from weakref import WeakSet
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -64,7 +65,8 @@ SCHEDULER_ENTRY_POINT_GROUP = "vllm_omni.schedulers"
 
 _SCHEDULER_REGISTRY: dict[str, type] = {}
 _entry_points_loaded = False
-_consumed_scheduler_config_ids: set[int] = set()
+_consumed_scheduler_configs: WeakSet = WeakSet()
+_RESERVED_FROM_PRETRAINED_KEYS = frozenset({"subfolder", "local_files_only"})
 
 
 def register_scheduler(name: str, cls: type | None = None):
@@ -116,14 +118,15 @@ def is_injected_scheduler(od_config: "OmniDiffusionConfig") -> bool:
 
 def mark_scheduler_consumed(od_config: "OmniDiffusionConfig") -> None:
     """Record that this config's ``scheduler`` field was handled by a construction site."""
-    _consumed_scheduler_config_ids.add(id(od_config))
+    if is_injected_scheduler(od_config):
+        _consumed_scheduler_configs.add(od_config)
 
 
 def ensure_scheduler_consumed(od_config: "OmniDiffusionConfig", pipeline: Any) -> None:
     """Fail if ``od_config.scheduler`` was set but no construction site consumed it."""
     if not is_injected_scheduler(od_config):
         return
-    if id(od_config) in _consumed_scheduler_config_ids:
+    if od_config in _consumed_scheduler_configs:
         return
     pipeline_name = type(pipeline).__name__ if pipeline is not None else "pipeline"
     raise ValueError(
@@ -140,6 +143,7 @@ def build_pipeline_scheduler(
     scheduler_kwargs: dict[str, Any] | None = None,
     default_builder: Callable[[], Any] | None = None,
     *,
+    model: str | None = None,
     local_files_only: bool | None = None,
     revision: str | None = None,
     subfolder: str = "scheduler",
@@ -166,12 +170,19 @@ def build_pipeline_scheduler(
         return default_builder()
     kwargs = dict(getattr(od_config, "scheduler_kwargs", None) or {})
     kwargs.update(scheduler_kwargs or {})
+    reserved = _RESERVED_FROM_PRETRAINED_KEYS.intersection(kwargs)
+    if reserved:
+        raise ValueError(
+            f"scheduler_kwargs must not include {sorted(reserved)}; "
+            "pass those as factory arguments instead."
+        )
+    pretrained_model = model if model is not None else od_config.model
     if local_files_only is None:
-        local_files_only = os.path.exists(od_config.model)
+        local_files_only = os.path.exists(pretrained_model)
     if revision is not None:
         kwargs.setdefault("revision", revision)
     return cls.from_pretrained(
-        od_config.model,
+        pretrained_model,
         subfolder=subfolder,
         local_files_only=local_files_only,
         **kwargs,
