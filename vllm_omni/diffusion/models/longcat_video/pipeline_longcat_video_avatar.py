@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer i
     create_full_precision_avatar_dit,
     create_quantized_avatar_dit,
 )
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
@@ -376,9 +377,9 @@ def _ensure_local_dir(model: str | os.PathLike[str], allow_patterns: list[str] |
     model_path = Path(model)
     if model_path.exists():
         return model_path
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
-    return Path(snapshot_download(str(model), allow_patterns=allow_patterns))
+    return Path(hf_api().snapshot_download(str(model), allow_patterns=allow_patterns))
 
 
 def _ensure_avatar_model_index(model_dir: Path, use_int8: bool) -> None:
@@ -578,7 +579,12 @@ class LongCatVideoAvatarPipeline(nn.Module, SupportImageInput, SupportAudioInput
         dtype = getattr(self.od_config, "dtype", torch.bfloat16)
         base_dir = self._base_model_dir()
         self.tokenizer = AutoTokenizer.from_pretrained(str(base_dir), subfolder="tokenizer")
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(str(self.model_dir), subfolder="scheduler")
+        self.scheduler = build_pipeline_scheduler(
+            self.od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                str(self.model_dir), subfolder="scheduler"
+            ),
+        )
 
         # vLLM initializes native pipelines under the target device context.
         # Build LongCat's large components on CPU first by default to avoid

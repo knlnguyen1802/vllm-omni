@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import copy
 import re
@@ -228,6 +231,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     serving._tts_model_type = "higgs_audio_v3"
     serving._get_tts_adapter = lambda: Adapter()
     serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
+    serving._speech_output_policies = {}
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
     stage0_params = stage_sampling_params[0]
@@ -893,6 +897,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         "_bookkeeping_sync",
         lambda *args, **kwargs: (
             0,
+            None,
             None,
             [],
             None,
@@ -1825,6 +1830,7 @@ class TestPreferModelSamplerNoneFallback:
             if _declares_prefer_model_sampler(p.read_text(encoding="utf-8", errors="ignore"))
         }
         expected = {
+            "audio8_tts",
             "cosyvoice3",
             "glm_tts",
             "higgs_audio_v2",
@@ -1832,6 +1838,7 @@ class TestPreferModelSamplerNoneFallback:
             "hunyuan_image3",
             "minicpmo_4_5",
             "minimax_music3",
+            "nemotron_voicechat",
         }
         assert declarers == expected, (
             "The set of models declaring `prefer_model_sampler` changed:\n"

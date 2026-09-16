@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import copy
+import json
 import math
 import os
 import random
@@ -28,13 +29,14 @@ from vllm_omni.diffusion.diffusion_kv.config import (
     parse_diffusion_kv_cache_mode,
 )
 from vllm_omni.diffusion.lora.manager import LoRABackend
+from vllm_omni.diffusion.media import DiffusionMediaOutput
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.quantization import build_quant_config
 
 if TYPE_CHECKING:
-    from vllm.config import ProfilerConfig
+    from vllm.config import KVTransferConfig, ProfilerConfig
 
 # Import after TYPE_CHECKING to avoid circular imports at runtime
 # The actual import is deferred to __post_init__ to avoid import order issues
@@ -42,45 +44,68 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_omni_diffusion_kwargs(raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
-    normalized = dict(kwargs)
+    config_kwargs = dict(raw_kwargs)
+
+    dtype = config_kwargs.get("dtype")
+    if dtype is None:
+        config_kwargs["dtype"] = "auto"
+    elif isinstance(dtype, torch.dtype):
+        config_kwargs["dtype"] = str(dtype).removeprefix("torch.")
+    elif not isinstance(dtype, str):
+        raise TypeError(f"Provided dtype must be a string or torch.dtype, got {type(dtype).__name__}")
+
+    # OmniEngineArgs / deploy YAML use diffusion_scheduler so users can
+    # distinguish it from stage scheduler_cls (request batching).
+    if config_kwargs.get("diffusion_scheduler") is not None:
+        config_kwargs["scheduler"] = config_kwargs.pop("diffusion_scheduler")
+    else:
+        config_kwargs.pop("diffusion_scheduler", None)
+    if config_kwargs.get("diffusion_scheduler_kwargs") is not None:
+        config_kwargs["scheduler_kwargs"] = config_kwargs.pop("diffusion_scheduler_kwargs")
+    else:
+        config_kwargs.pop("diffusion_scheduler_kwargs", None)
 
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".
-    if "static_lora_scale" in normalized:
-        if "lora_scale" not in normalized:
-            normalized["lora_scale"] = normalized["static_lora_scale"]
-        normalized.pop("static_lora_scale", None)
+    if "static_lora_scale" in config_kwargs:
+        if "lora_scale" not in config_kwargs:
+            config_kwargs["lora_scale"] = config_kwargs["static_lora_scale"]
+        config_kwargs.pop("static_lora_scale", None)
+
+    diffusion_quantization = config_kwargs.pop("diffusion_quantization_config", None)
+    if config_kwargs.get("quantization_config") is None and diffusion_quantization is not None:
+        config_kwargs["quantization_config"] = diffusion_quantization
 
     # Backwards-compatibility: map "quantization" to "quantization_config"
     # so callers using the old field name still work.
-    if "quantization" in normalized and normalized.get("quantization_config", None) is None:
-        normalized["quantization_config"] = normalized.pop("quantization")
+    if "quantization" in config_kwargs and config_kwargs.get("quantization_config", None) is None:
+        config_kwargs["quantization_config"] = config_kwargs.pop("quantization")
     else:
-        normalized.pop("quantization", None)
+        config_kwargs.pop("quantization", None)
 
     # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
-    if normalized.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in normalized:
-        normalized["diffusion_kv_cache_dtype"] = normalized.pop("kv_cache_dtype")
+    if config_kwargs.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in config_kwargs:
+        config_kwargs["diffusion_kv_cache_dtype"] = config_kwargs.pop("kv_cache_dtype")
     else:
-        normalized.pop("kv_cache_dtype", None)
-    if normalized.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in normalized:
-        normalized["diffusion_kv_cache_skip_steps"] = normalized.pop("kv_cache_skip_steps")
+        config_kwargs.pop("kv_cache_dtype", None)
+    if config_kwargs.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in config_kwargs:
+        config_kwargs["diffusion_kv_cache_skip_steps"] = config_kwargs.pop("kv_cache_skip_steps")
     else:
-        normalized.pop("kv_cache_skip_steps", None)
-    if normalized.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in normalized:
-        normalized["diffusion_kv_cache_skip_layers"] = normalized.pop("kv_cache_skip_layers")
+        config_kwargs.pop("kv_cache_skip_steps", None)
+    if config_kwargs.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in config_kwargs:
+        config_kwargs["diffusion_kv_cache_skip_layers"] = config_kwargs.pop("kv_cache_skip_layers")
     else:
-        normalized.pop("kv_cache_skip_layers", None)
+        config_kwargs.pop("kv_cache_skip_layers", None)
 
     # Handle "diffusion_attention_backend" shorthand: merge into
     # diffusion_attention_config before field filtering.
-    diffusion_attn_backend = normalized.pop("diffusion_attention_backend", None)
-    fastvideo_vsa_topk = normalized.pop("fastvideo_vsa_topk", None)
+    diffusion_attn_backend = config_kwargs.pop("diffusion_attention_backend", None)
+    fastvideo_vsa_topk = config_kwargs.pop("fastvideo_vsa_topk", None)
     if diffusion_attn_backend is not None or fastvideo_vsa_topk is not None:
-        existing = normalized.get("diffusion_attention_config")
-        normalized["diffusion_attention_config"] = parse_attention_config(
+        existing = config_kwargs.get("diffusion_attention_config")
+        config_kwargs["diffusion_attention_config"] = parse_attention_config(
             existing,
             attention_backend=diffusion_attn_backend,
             fastvideo_vsa_topk=fastvideo_vsa_topk,
@@ -88,16 +113,64 @@ def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]
 
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
-    if "cache_backend" not in normalized:
+    if "cache_backend" not in config_kwargs:
         cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
-        normalized["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+        config_kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+    elif config_kwargs["cache_backend"] is None:
+        # Callers (e.g. example CLIs with `default=None`) pass an explicit
+        # None for "no cache"; canonicalize it so every consumer sees the
+        # declared `str` value instead of relying on per-model None handling.
+        config_kwargs["cache_backend"] = "none"
+
+    cache_config = config_kwargs.get("cache_config")
+    if isinstance(cache_config, str):
+        try:
+            config_kwargs["cache_config"] = json.loads(cache_config)
+        except json.JSONDecodeError:
+            logger.warning("Invalid cache_config JSON, using backend defaults.")
+            config_kwargs.pop("cache_config", None)
+
+    if config_kwargs.get("streaming_output") is None and config_kwargs.get("diffusion_streaming_output") is not None:
+        config_kwargs["streaming_output"] = config_kwargs["diffusion_streaming_output"]
+    config_kwargs.pop("diffusion_streaming_output", None)
 
     # Convert optional YAML null values to empty containers.
     for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
-        if key in normalized and normalized[key] is None:
-            normalized[key] = {}
+        if key in config_kwargs and config_kwargs[key] is None:
+            config_kwargs[key] = {}
 
-    return normalized
+    return config_kwargs
+
+
+def validate_host_weight_runtime_options(*, mode: object, root: object) -> None:
+    """Validate HWR policy without touching the configured storage domain.
+
+    Filesystem locality and store construction belong to the eligible loader
+    path. Keeping this check purely structural is what lets disabled and
+    AllGather DLO configurations retain zero HWR interaction.
+    """
+    if mode not in {"disabled", "preferred", "required"}:
+        raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required")
+    if mode != "disabled" and (not isinstance(root, str) or not root.strip()):
+        raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
+
+
+def validate_dlo_host_registration_options(
+    *,
+    limit_gib: object,
+    enable_dlo: bool,
+    use_allgather: bool,
+    hwr_mode: object,
+) -> float:
+    """Validate the optional transport budget without probing CUDA or HWR."""
+    if not isinstance(limit_gib, (int, float, str)):
+        raise TypeError(f"dlo_host_registration_limit_gib must be a number; got {type(limit_gib).__name__}")
+    value = float(limit_gib)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("dlo_host_registration_limit_gib must be finite and >= 0")
+    if value and (not enable_dlo or use_allgather or hwr_mode == "disabled"):
+        raise ValueError("dlo_host_registration_limit_gib requires enabled no-AllGather DLO and Host Weight Runtime")
+    return value
 
 
 def parse_kv_cache_skip_selector(
@@ -193,6 +266,9 @@ class DiffusionParallelConfig:
     - When used in hybrid Ulysses+Ring, Ring requires consistent per-rank
       sequence shapes across the ring group.
     """
+
+    ulysses_a2a_permute: bool = False
+    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
 
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
@@ -400,6 +476,27 @@ class DiffusionParallelConfig:
             raise TypeError(f"Expected parallel config dict, got {type(data)!r}")
         return cls(**data)
 
+    @classmethod
+    def from_stage_overrides(cls, kwargs: Mapping[str, Any]) -> "DiffusionParallelConfig":
+        """Resolve nested or flat stage inputs through the config's own defaults."""
+        parallel_config = kwargs.get("parallel_config")
+        if isinstance(parallel_config, cls):
+            return parallel_config
+
+        valid_fields = {item.name for item in fields(cls) if item.init}
+        if isinstance(parallel_config, Mapping):
+            return cls.from_dict(dict(parallel_config))
+        elif parallel_config is not None and hasattr(parallel_config, "__dict__"):
+            return cls.from_dict(dict(vars(parallel_config)))
+        elif parallel_config is not None:
+            raise TypeError(
+                f"parallel_config must be a mapping or DiffusionParallelConfig, got {type(parallel_config).__name__}"
+            )
+        else:
+            values = {key: value for key, value in kwargs.items() if key in valid_fields}
+
+        return cls(**{key: value for key, value in values.items() if value is not None})
+
 
 @dataclass
 class TransformerConfig:
@@ -597,14 +694,22 @@ def resolve_model_class_name(
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
-    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index, resolve_native_diffusion_model_class
 
     if not model:
         return None
+    native_model_class = resolve_native_diffusion_model_class(model)
+    if native_model_class is not None:
+        return native_model_class
+
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
-    # Diffusers models: read _class_name from the pipeline index.
-    model_index = get_diffusion_model_index(model, revision=revision)
+    # Diffusers models: read _class_name from the pipeline index. Missing
+    # local paths can otherwise be interpreted as invalid Hub repo IDs.
+    try:
+        model_index = get_diffusion_model_index(model, revision=revision)
+    except Exception:
+        model_index = None
     if model_index is not None:
         return model_index.get("_class_name")
     if diffusion_load_format == "diffusers":
@@ -652,6 +757,28 @@ def resolve_model_class_name(
     return None
 
 
+def uses_diffusers_adapter(od_config: object) -> bool:
+    """Return whether execution uses the Diffusers adapter backend.
+
+    A custom pipeline takes precedence over ``diffusion_load_format`` in the
+    worker, so adapter-specific behavior must only apply when no custom
+    pipeline override is configured.
+    """
+    return (
+        getattr(od_config, "custom_pipeline_args", None) is None
+        and getattr(od_config, "diffusion_load_format", "default") == "diffusers"
+    )
+
+
+@dataclass
+class VideoOutputTransportConfig:
+    enable_device_postprocess: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enable_device_postprocess, bool):
+            raise TypeError("enable_device_postprocess must be a bool")
+
+
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
@@ -687,6 +814,7 @@ class OmniDiffusionConfig:
     # Cache backend configuration (NEW)
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
+    video_output_transport: VideoOutputTransportConfig = field(default_factory=VideoOutputTransportConfig)
     enable_cache_dit_summary: bool = False
 
     # Prompt-embedding cache. When enabled, ``DiffusionModelRunner`` wraps the
@@ -749,7 +877,12 @@ class OmniDiffusionConfig:
 
     output_type: str = "pil"
 
-    # CPU offload parameters
+    # CPU offload parameters. Keep the public mapping raw so stage configs can
+    # serialize it across processes; __post_init__ validates it once and caches
+    # the internal typed resolution used at runtime.
+    diffusion_offload_config: dict[str, Any] | None = None
+    # Compatibility aliases. Some model-specific legacy stage lifecycles are
+    # intentionally broader than the compact dit/text_encoder selector.
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
@@ -766,6 +899,14 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    # Final-layout Host Weight Runtime policy. The loader only activates this
+    # for eligible no-AllGather DLO; all other configurations preserve their
+    # existing loader/storage path.
+    host_weight_runtime_mode: str = "disabled"
+    host_weight_runtime_root: str | None = None
+    # Optional per-worker ceiling for registering final-layout HWR mappings.
+    # Zero adds no ceiling; pin_cpu_memory controls whether registration is tried.
+    dlo_host_registration_limit_gib: float = 0.0
 
     pin_cpu_memory: bool = True  # Use pinned memory for faster transfers when offloading
 
@@ -790,6 +931,7 @@ class OmniDiffusionConfig:
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
 
     # Enable sleep mode
@@ -813,6 +955,15 @@ class OmniDiffusionConfig:
 
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
+
+    # Diffusion sampling-scheduler injection (not the request scheduler).
+    # Registry name (see vllm_omni.diffusion.models.schedulers) or dotted
+    # class path. Constructed via build_pipeline_scheduler / from_pretrained.
+    # Set from OmniEngineArgs.diffusion_scheduler. Pipelines that do not
+    # consume this field fail at load (ensure_scheduler_consumed).
+    scheduler: str | None = None
+    # Extra kwargs forwarded to the injected scheduler's from_pretrained().
+    scheduler_kwargs: dict[str, Any] | None = None
 
     # Diffusion model loading format
     # "default", "custom_pipeline", "dummy", "diffusers" (HF diffusers adapter)
@@ -844,6 +995,7 @@ class OmniDiffusionConfig:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "text_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -866,6 +1018,9 @@ class OmniDiffusionConfig:
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
+    # Native vLLM KV connector configuration. PR0 only assembles the connector;
+    # the native page data path is owned by the follow-up landing PR.
+    kv_transfer_config: "KVTransferConfig | None" = None
     additional_config: dict[str, Any] = field(default_factory=dict)
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
@@ -992,6 +1147,11 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        from vllm_omni.diffusion.offloader.config import (
+            OffloadStrategy,
+            materialize_legacy_offload_flags,
+        )
+
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1028,9 +1188,21 @@ class OmniDiffusionConfig:
             "need_recv_cache", False
         ):
             raise ValueError(
-                "paged_scheduler Diffusion KV does not support imported AR KV in Phase 1; "
-                "disable need_recv_cache until connector-aware admission is implemented"
+                "paged_scheduler Diffusion KV does not support imported AR KV; "
+                "disable need_recv_cache until connector-aware import is implemented"
             )
+
+        if self.kv_transfer_config is not None:
+            from vllm_omni.diffusion.diffusion_kv.kv_connector import parse_kv_transfer_config
+
+            if any(self.omni_kv_config.get(name, False) for name in ("need_send_cache", "need_recv_cache")):
+                raise ValueError(
+                    "native kv_transfer_config cannot be combined with legacy omni_kv_config transfer; "
+                    "configure exactly one KV transfer path"
+                )
+            if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+                raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
+            self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
 
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)
@@ -1065,6 +1237,9 @@ class OmniDiffusionConfig:
                 self.num_gpus = 1
 
         self.parallel_config.resolve_data_parallel_size(self.num_gpus)
+        # Resolve offload only after DP/SP normalization so cached policy
+        # validation observes the actual execution topology.
+        offload_strategy = materialize_legacy_offload_flags(self)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
@@ -1073,10 +1248,14 @@ class OmniDiffusionConfig:
                 incompatible_features.append("HSDP")
             if self.parallel_config.sequence_parallel_size > 1:
                 incompatible_features.append("sequence parallelism")
-            if self.enable_cpu_offload:
-                incompatible_features.append("CPU offload")
-            if self.enable_layerwise_offload:
-                incompatible_features.append("layerwise offload")
+            if offload_strategy is not OffloadStrategy.NONE:
+                incompatible_features.append(
+                    {
+                        OffloadStrategy.MODEL_LEVEL: "CPU offload",
+                        OffloadStrategy.LAYER_WISE: "layerwise offload",
+                        OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
+                    }[offload_strategy]
+                )
             if incompatible_features:
                 features = ", ".join(incompatible_features)
                 raise ValueError(
@@ -1111,6 +1290,13 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        if self.video_output_transport is None:
+            self.video_output_transport = VideoOutputTransportConfig()
+        elif isinstance(self.video_output_transport, Mapping):
+            self.video_output_transport = VideoOutputTransportConfig(**dict(self.video_output_transport))
+        elif not isinstance(self.video_output_transport, VideoOutputTransportConfig):
+            raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
+
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
         # time. For late (post-construction) assignment, callers should use
@@ -1141,6 +1327,17 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+
+        validate_host_weight_runtime_options(
+            mode=self.host_weight_runtime_mode,
+            root=self.host_weight_runtime_root,
+        )
+        self.dlo_host_registration_limit_gib = validate_dlo_host_registration_options(
+            limit_gib=self.dlo_host_registration_limit_gib,
+            enable_dlo=self.enable_distributed_layerwise_offload,
+            use_allgather=self.dlo_use_allgather,
+            hwr_mode=self.host_weight_runtime_mode,
+        )
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(
@@ -1262,11 +1459,10 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
-        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
-
-        # Default model_class_name for diffusers adapter
-        if self.model_class_name is None and self.diffusion_load_format == "diffusers":
-            self.model_class_name = "DiffusersAdapterPipeline"
+        from vllm_omni.diffusion.utils.hf_utils import (
+            get_diffusion_model_index,
+            resolve_native_diffusion_model_class,
+        )
 
         assert self.model is not None
         try:
@@ -1277,6 +1473,8 @@ class OmniDiffusionConfig:
             if config_dict is not None:
                 if self.model_class_name is None:
                     self.model_class_name = config_dict.get("_class_name", None)
+                    if self.model_class_name is None and self.diffusion_load_format == "diffusers":
+                        self.model_class_name = "DiffusersAdapterPipeline"
                 self.update_multimodal_support()
 
                 # Skip transformer config loading for diffusers adapter
@@ -1317,6 +1515,8 @@ class OmniDiffusionConfig:
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
+                if self.model_class_name is None:
+                    self.model_class_name = "DiffusersAdapterPipeline"
                 self.set_tf_model_config(TransformerConfig())
                 logger.warning(
                     "Could not find a valid pipeline index per Diffusers format. "
@@ -1328,6 +1528,12 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
+                    native_model_class = resolve_native_diffusion_model_class(self.model)
+                    if native_model_class is not None:
+                        self.model_class_name = native_model_class
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
                     # ``Lance_3B_Video/``).  Try to recover that case before
@@ -1429,15 +1635,18 @@ class OmniDiffusionConfig:
                     raise
 
     @classmethod
-    def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
-        kwargs = normalize_omni_diffusion_kwargs(kwargs)
-
-        # Filter kwargs to only include valid fields
+    def normalize_init_kwargs(cls, raw_kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        config_kwargs = normalize_omni_diffusion_kwargs(raw_kwargs)
         valid_fields = {f.name for f in fields(cls)}
-        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+        # Remaining ``None`` values mean "unset" at the CLI/deploy boundary.
+        # Drop them so non-optional dataclass defaults are not overwritten.
+        # Fields where ``None`` has normalization semantics (for example dtype
+        # and nullable container inputs) are handled above before this filter.
+        return {key: value for key, value in config_kwargs.items() if key in valid_fields and value is not None}
 
-        instance = cls(**filtered_kwargs)
-        return instance
+    @classmethod
+    def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
+        return cls(**cls.normalize_init_kwargs(kwargs))
 
 
 @dataclass
@@ -1448,8 +1657,8 @@ class DiffusionOutput:
 
     output: torch.Tensor | tuple[Any, ...] | dict[str, Any] | None = None
 
-    # Legacy compatibility fields. New pipeline-specific payloads should be
-    # carried by output["payload"] instead.
+    # Legacy compatibility fields. Decoded video uses ``media``; other new
+    # payloads should be carried by output["payload"] instead.
     trajectory_timesteps: torch.Tensor | dict[str, Any] | None = None
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
@@ -1480,12 +1689,26 @@ class DiffusionOutput:
     # memory usage info
     peak_memory_mb: float = 0.0
 
+    # KV-recv wall-clock (ms) from the runner; feeds vllm_omni:diffusion_kv_load_s.
+    kv_recv_ms: float = 0.0
+
     # When True, move tensor fields to CPU at construction time. Useful when
     # the output is shipped across process boundaries (e.g. step-execution
     # mode) and the receiving side must not initialise a stray CUDA context.
     to_cpu: bool = False
 
+    # Typed video-media contract. Declared last so the pre-existing positional
+    # constructor order (output, trajectory_timesteps, ...) that out-of-tree
+    # pipelines rely on is preserved. Mutually exclusive with ``output``.
+    media: DiffusionMediaOutput | None = None
+
     def __post_init__(self) -> None:
+        if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
+            raise TypeError(f"media must be DiffusionMediaOutput, got {type(self.media).__name__}")
+        if self.media is not None and self.output is not None:
+            raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+        if self.media is not None and self.post_process_func is not None:
+            raise ValueError("Typed diffusion media cannot carry a model-specific post_process_func")
         if not self.to_cpu:
             return
 
@@ -1501,6 +1724,10 @@ class DiffusionOutput:
             return value
 
         self.output = _maybe_to_cpu(self.output)
+        if self.media is not None:
+            if not self.media.prepared_for_transport:
+                raise ValueError("Diffusion media must be prepared before to_cpu=True")
+            self.media = self.media.to_cpu()
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
@@ -1611,12 +1838,27 @@ class AttnQuantSpec:
 
     @property
     def enabled(self) -> bool:
-        return self.dtype_qk is not None or self.dtype_vo is not None
+        # Include flashinfer_backend so a variant pin without dtypes is serialized.
+        return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
 # Backends that select key blocks instead of attending densely, and so accept
 # a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
+
+
+class RainFusionPrecision(str, Enum):
+    """Execution precision for block-sparse RainFusion (rf_v3) attention.
+
+    ``bf16``: no quantization, pure BF16 sparse attention (official baseline).
+    ``fp8``: BSA FP8 path - Hadamard rotation then full FP8 block quantization
+        of Q/K/V before the BSA kernel.
+    ``mix``: EagleQBSA mixed precision - Q/K per-block INT8 + V per-channel FP8.
+    """
+
+    BF16 = "bf16"
+    FP8 = "fp8"
+    MIX = "mix"
 
 
 @dataclass
@@ -1627,10 +1869,13 @@ class BlockSparseSpec:
     ``start_step`` keeps the first N denoise steps dense and ``skip_layers`` (an
     index selector such as "0-3,38") exempts individual DiT blocks. Those two are
     the accuracy knobs to trade back quality at a fixed ``sparsity``.
+    ``precision`` selects the kernel precision mode (see ``RainFusionPrecision``).
     """
 
     sparsity: float = 0.8
     start_step: int = 0
+    end_step: int = 0
+    precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
 
@@ -1638,6 +1883,13 @@ class BlockSparseSpec:
         self.sparsity = _in_range(self.sparsity, "block_sparse.sparsity", 0.0, 1.0) or 0.0
         if self.start_step < 0:
             raise ValueError(f"block_sparse.start_step must be >= 0; got {self.start_step!r}.")
+        if self.end_step < 0:
+            raise ValueError(f"block_sparse.end_step must be >= 0; got {self.end_step!r}.")
+        precision = self.precision.value if isinstance(self.precision, RainFusionPrecision) else self.precision
+        valid = {member.value for member in RainFusionPrecision}
+        if precision not in valid:
+            raise ValueError(f"block_sparse.precision must be one of {sorted(valid)}; got {self.precision!r}.")
+        self.precision = precision
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -1702,24 +1954,27 @@ class AttentionSpec:
                 kw["target_sparsity"] = ss.target_sparsity
             if ss.disabled_until_timestep:
                 kw["disabled_until_timestep"] = ss.disabled_until_timestep
-        if self.quant is not None and self.quant.enabled:
+        if self.quant is not None:
             q = self.quant
-            quant_kw: dict[str, Any] = {
-                "dtype_qk": q.dtype_qk,
-                "q_block_size": q.q_block_size,
-                "k_block_size": q.k_block_size,
-            }
-            if q.dtype_vo is not None:
-                quant_kw["dtype_vo"] = q.dtype_vo
+            quant_kw: dict[str, Any] = {}
+            if q.dtype_qk is not None or q.dtype_vo is not None:
+                quant_kw["dtype_qk"] = q.dtype_qk
+                quant_kw["q_block_size"] = q.q_block_size
+                quant_kw["k_block_size"] = q.k_block_size
+                if q.dtype_vo is not None:
+                    quant_kw["dtype_vo"] = q.dtype_vo
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
-            kw["quant"] = quant_kw
+            if quant_kw:
+                kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
         if self.block_sparse is not None:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
             kw["start_step"] = bs.start_step
+            kw["end_step"] = bs.end_step
+            kw["precision"] = bs.precision
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 
