@@ -3,6 +3,8 @@
 
 """CPU tests for loading diffusion LoRA adapters from in-memory tensors."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -94,3 +96,37 @@ def test_base_request_still_routes_to_dir_path(monkeypatch):
     # to fail on the placeholder rather than taking the tensor branch.
     with pytest.raises(Exception):
         manager._load_adapter(base)
+
+
+def test_worker_moves_lora_stacks_to_device_after_wake(monkeypatch):
+    # The worker module pulls the diffusion KV layout, which requires a vLLM
+    # core new enough to match this checkout; skip under older cores.
+    try:
+        from vllm_omni.diffusion.worker import diffusion_worker
+    except ImportError:
+        pytest.skip("DiffusionWorker chain incompatible with the installed vLLM core")
+    DiffusionWorker = diffusion_worker.DiffusionWorker
+
+    import vllm_omni.platforms as omni_platforms
+
+    layer = SimpleNamespace(
+        lora_a_stacked=(torch.ones(1),),
+        lora_b_stacked=(torch.ones(1),),
+    )
+    worker = object.__new__(DiffusionWorker)
+    worker.device = torch.device("meta")
+    worker.model_runner = None
+    worker._sleep_saved_buffers = {}
+    worker.lora_manager = SimpleNamespace(_lora_modules={"transformer.block": layer})
+
+    class _NoopAllocator:
+        @staticmethod
+        def get_instance():
+            return SimpleNamespace(wake_up=lambda tags: None)
+
+    monkeypatch.setattr(diffusion_worker, "_get_cumem_allocator_class", staticmethod(lambda: _NoopAllocator))
+    monkeypatch.setattr(omni_platforms.current_omni_platform, "synchronize", lambda: None)
+
+    assert DiffusionWorker.wake_up(worker, tags=["weights"]) is True
+    assert layer.lora_a_stacked[0].device.type == "meta"
+    assert layer.lora_b_stacked[0].device.type == "meta"
