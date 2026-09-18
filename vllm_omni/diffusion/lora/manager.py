@@ -28,6 +28,7 @@ from vllm_omni.diffusion.lora.utils import (
     _match_target_modules,
     from_layer_diffusion,
 )
+from vllm_omni.lora.request import TensorLoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
@@ -297,6 +298,9 @@ class DiffusionLoRAManager:
 
         logger.debug("Supported LoRA modules: %s", self._expected_lora_modules)
 
+        if isinstance(lora_request, TensorLoRARequest):
+            return self._load_adapter_from_tensors(lora_request)
+
         lora_path = get_adapter_absolute_path(lora_request.lora_path)
         logger.debug("Resolved LoRA path: %s", lora_path)
 
@@ -339,6 +343,60 @@ class DiffusionLoRAManager:
 
         logger.info(
             "Loaded LoRA model: id=%d, num_modules=%d, modules=%s",
+            lora_model.id,
+            len(lora_model.loras),
+            list(lora_model.loras.keys()),
+        )
+
+        for lora in lora_model.loras.values():
+            lora.optimize()  # ref: _create_merged_loras_inplace, internal scaling
+
+        return lora_model, peft_helper
+
+    def _load_adapter_from_tensors(self, lora_request: TensorLoRARequest) -> tuple[LoRAModel, PEFTHelper]:
+        """Build a LoRAModel from in-memory adapter tensors (RL trainer sync).
+
+        Tensors arrive in PEFT naming. Pipelines whose engine-side layout
+        differs from the trainer's module names (e.g. fused DiT projections)
+        may define ``map_lora_update_to_engine(tensors, peft_config)`` to
+        translate them before loading; without a translation the adapter
+        either binds to zero modules (raised) or to a subset of the declared
+        targets.
+        """
+        peft_config = dict(lora_request.peft_config or {})
+        lora_tensors = dict(lora_request.lora_tensors or {})
+
+        mapper = getattr(getattr(self, "pipeline", None), "map_lora_update_to_engine", None)
+        if callable(mapper):
+            lora_tensors, peft_config = mapper(lora_tensors, peft_config)
+
+        if not lora_tensors:
+            raise ValueError(
+                f"TensorLoRARequest {lora_request.lora_int_id} ({lora_request.lora_name!r}) "
+                "carried no adapter tensors; the trainer-side adapter collection "
+                "produced an empty state dict."
+            )
+
+        peft_helper = PEFTHelper.from_dict(peft_config)
+        logger.info(
+            "Loaded PEFT config from tensors: r=%d, lora_alpha=%d, target_modules=%s",
+            peft_helper.r,
+            peft_helper.lora_alpha,
+            peft_helper.target_modules,
+        )
+
+        lora_model = LoRAModel.from_lora_tensors(
+            lora_model_id=lora_request.lora_int_id,
+            tensors=lora_tensors,
+            peft_helper=peft_helper,
+            device="cpu",  # consistent with the from-dir path
+            dtype=self.dtype,
+            model_vocab_size=None,
+            weights_mapper=None,
+        )
+
+        logger.info(
+            "Loaded LoRA model from tensors: id=%d, num_modules=%d, modules=%s",
             lora_model.id,
             len(lora_model.loras),
             list(lora_model.loras.keys()),

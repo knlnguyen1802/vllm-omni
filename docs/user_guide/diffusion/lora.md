@@ -280,6 +280,34 @@ layerwise offload are rejected in every mode, because the dynamic LoRA tensors
 are neither parameters nor registered buffers and therefore do not participate
 in those weight lifecycles.
 
+## Loading Adapters from Tensors
+
+`TensorLoRARequest` (in `vllm_omni.lora.request`) carries an adapter as in-memory
+tensors plus its PEFT config dict, for callers that hold weights in memory —
+typically RL trainers pushing the actor's adapter into a rollout engine every
+training step. It is a `LoRARequest` subclass, so it flows through the same
+`add_lora` / `remove_lora` / `list_loras` APIs; `lora_path` stays a placeholder
+identity because the weights come from `lora_tensors`.
+
+```python
+from vllm_omni.lora.request import TensorLoRARequest
+
+request = TensorLoRARequest(
+    lora_name="actor-adapter",
+    lora_int_id=123,
+    lora_path="unused-placeholder",
+    peft_config=peft_config_dict,      # PEFTHelper.from_dict shape
+    lora_tensors=adapter_tensors,      # adapter tensors by module name
+)
+await omni.add_lora(request)
+```
+
+Tensors are keyed by module name. Pipelines whose engine-side layout differs from
+the trainer's module names (for example fused DiT projections) can define
+`map_lora_update_to_engine(tensors, peft_config)` to translate them before loading;
+an adapter that translates to no tensors, or binds to zero modules, raises instead
+of silently leaving the base model unchanged.
+
 ## See Also
 
 - [Text-to-Image Offline Example](../examples/offline_inference/text_to_image.md#lora) - Complete offline LoRA example
