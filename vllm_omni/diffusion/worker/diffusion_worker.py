@@ -762,7 +762,12 @@ class DiffusionWorker:
         # for the frontend server yet.
         if self.lora_manager is None:
             return False
-        return self.lora_manager.add_adapter(lora_request)
+        added = self.lora_manager.add_adapter(lora_request)
+        if added:
+            # A freshly bound adapter's stacked weights may live on CPU;
+            # execution and later in-place updates expect them on device.
+            self._move_lora_stacks_to_device()
+        return added
 
     def submit_interaction(
         self,
@@ -854,8 +859,29 @@ class DiffusionWorker:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
             logger.info(f"[Worker {self.rank}] Buffers restored from CPU.")
+        self._move_lora_stacks_to_device()
         logger.info(f"[Worker {self.rank}] Wake-up complete.")
         return True
+
+    def _move_lora_stacks_to_device(self) -> None:
+        """Move LoRA stacked weights back to the worker device after a sleep.
+
+        LoRA ``lora_a_stacked`` / ``lora_b_stacked`` are unregistered buffers
+        outside the pipeline's named buffers, so sleep-mode save/restore never
+        covers them; level-1 sleep leaves them on CPU.
+        """
+        manager = getattr(self, "lora_manager", None)
+        if manager is None:
+            return
+        for module in getattr(manager, "_lora_modules", {}).values():
+            for name in ("lora_a_stacked", "lora_b_stacked"):
+                tensors = getattr(module, name, None)
+                if tensors is not None:
+                    setattr(
+                        module,
+                        name,
+                        tuple(tensor.to(self.device, non_blocking=True) for tensor in tensors),
+                    )
 
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform

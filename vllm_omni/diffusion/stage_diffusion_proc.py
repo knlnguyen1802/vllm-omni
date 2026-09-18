@@ -251,13 +251,20 @@ class StageDiffusionProc:
             )
 
         if method == "add_lora":
-            # Reconstruct LoRARequest after IPC if needed.
+            # Reconstruct LoRARequest after IPC if needed. A dict payload that
+            # carries tensor fields converts to TensorLoRARequest; converting
+            # it to the base LoRARequest class would silently drop them.
             lora_request = args[0] if args else kwargs.get("lora_request")
             if lora_request is not None:
                 from vllm.lora.request import LoRARequest
 
                 if not isinstance(lora_request, LoRARequest):
-                    lora_request = msgspec.convert(lora_request, LoRARequest)
+                    target_cls = LoRARequest
+                    if isinstance(lora_request, dict) and {"peft_config", "lora_tensors"} & set(lora_request):
+                        from vllm_omni.lora.request import TensorLoRARequest
+
+                        target_cls = TensorLoRARequest
+                    lora_request = msgspec.convert(lora_request, target_cls)
             results = await loop.run_in_executor(
                 self._executor,
                 self._engine.collective_rpc,
