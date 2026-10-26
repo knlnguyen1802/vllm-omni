@@ -209,7 +209,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # side. Park here until the full wake instead of erroring (#8678).
         streaming_input = isinstance(prompt, AsyncGenerator)
         async with self._pause_cond:
-            await self._pause_cond.wait_for(lambda: not self._paused and not self._sleeping_tags)
+            await self._pause_cond.wait_for(lambda: not self._paused and not getattr(self, "_sleeping_tags", None))
             if not streaming_input:
                 self._admitting = getattr(self, "_admitting", 0) + 1
         admitting = not streaming_input
@@ -459,7 +459,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 async with self._pause_cond:
                     # Same full-wake condition as generate()'s gate: streaming
                     # ADDs must not race a partially-asleep engine either (#8678).
-                    await self._pause_cond.wait_for(lambda: not self._paused and not self._sleeping_tags)
+                    await self._pause_cond.wait_for(
+                        lambda: not self._paused and not getattr(self, "_sleeping_tags", None)
+                    )
                     self._admitting = getattr(self, "_admitting", 0) + 1
             try:
                 await submit_factory()
