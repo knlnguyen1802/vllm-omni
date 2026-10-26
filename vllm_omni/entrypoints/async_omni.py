@@ -49,6 +49,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+class _SubmitRevokedError(Exception):
+    """Internal: a tracked streaming submit was revoked (request aborted).
+
+    Stops the input pump without reporting an input error or sending the
+    final empty update — the revoke already closed the request out.
+    """
+
+
 CACHE_RESET_TIMEOUT_S = 60.0
 
 
@@ -313,7 +322,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 await first_chunk_submitted
             else:
-                await self._submit_tracked(
+                revoked_submit = await self._submit_tracked(
                     request_id,
                     lambda: self.engine.add_request_async(
                         request_id=request_id,
@@ -329,6 +338,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     hold_admission=False,
                     on_revoke=lambda: self._finish_revoked_submit(request_id),
                 )
+                if revoked_submit:
+                    # _finish_revoked_submit already enqueued the terminal
+                    # abort output; the results loop below drains it and the
+                    # generator finishes as a normal aborted request.
+                    logger.debug("[AsyncOmni] Submit for %s was revoked before admission", request_id)
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
             stage_first_ts[0] = submit_ts
@@ -414,7 +428,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         *,
         hold_admission: bool,
         on_revoke: Callable[[], Awaitable[None]] | None = None,
-    ) -> None:
+    ) -> bool:
         """Gate + run one engine submit, tracked for pause/sleep/abort revoke.
 
         The submit runs as a task that registers here *before* the admission
@@ -429,7 +443,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         barrier. When the submit is revoked (the task is cancelled while the
         caller was not), ``on_revoke`` closes the request out as an abort
         instead of letting the CancelledError escape into a caller that never
-        cancelled anything.
+        cancelled anything. Returns whether that happened — a True return
+        means the request is already closed out and the caller must stop
+        submitting for it (the streaming pump stops; generate() drains the
+        terminal abort output below).
         """
         pending = getattr(self, "_pending_submits", None)
         if pending is None:
@@ -460,6 +477,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             # task may still be unwinding its slot release when the error
             # reaches us, so submit_task.cancelled() is not reliable here.)
             caller = asyncio.current_task()
+
             if caller is not None and caller.cancelling() > 0:  # type: ignore[attr-defined]
                 # Stop the gated submit too, so one parked at the gate or the
                 # queue cannot run later for a request whose caller is gone.
@@ -467,8 +485,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 raise
             if on_revoke is not None:
                 await on_revoke()
+            return True
         finally:
             pending.pop(request_id, None)
+        return False
 
     async def _finish_revoked_submit(self, request_id: str) -> None:
         """Close out a submit revoked before admission as an aborted request.
@@ -540,7 +560,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
         async def _submit_streaming_chunk(submit_factory) -> None:
             """One streaming ADD/update: admission-gated and revoke-tracked."""
-            await self._submit_tracked(request_id, submit_factory, hold_admission=True, on_revoke=_revoke_streaming)
+            if await self._submit_tracked(request_id, submit_factory, hold_admission=True, on_revoke=_revoke_streaming):
+                # The revoke already ended this request (synthetic abort
+                # enqueued); stop the pump instead of sending further chunk
+                # or final updates for it.
+                raise _SubmitRevokedError
 
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
@@ -585,6 +609,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 resumable=True,
                             )
                         )
+            except _SubmitRevokedError:
+                cancelled = True
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:

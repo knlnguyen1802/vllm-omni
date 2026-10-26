@@ -1422,6 +1422,78 @@ def test_sleep_aborts_tracked_streaming_submit():
 
 
 @pytest.mark.cpu
+def test_pump_stops_after_revoked_first_chunk(mocker):
+    """After a revoke closes the request, the streaming pump must stop: no
+    further chunk submits and no final empty update for an already-aborted
+    request (the synthetic abort output already ended it)."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
+        omni._paused = False
+        omni._admitting = 0
+        mocker.patch.object(AsyncOmni, "model_config", new=SimpleNamespace())
+        omni._record_request_failure_once = lambda *args, **kwargs: None
+        omni._validate_streaming_input_sampling_params = lambda params: None
+        mocker.patch(
+            "vllm_omni.entrypoints.async_omni.extract_prompt_components",
+            return_value=("text", None, None),
+        )
+
+        state = SimpleNamespace(queue=asyncio.Queue())
+        omni.request_states = {"req-1": state}
+
+        submits: list[str] = []
+        first_submit_parked = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def parked_add(**kwargs) -> None:
+            submits.append("add")
+            first_submit_parked.set()
+            await gate.wait()
+
+        async def chunk_update(**kwargs) -> None:
+            submits.append("update")
+
+        omni.engine.add_request_async = parked_add
+        omni.engine.add_streaming_update_async = chunk_update
+
+        async def input_stream():
+            yield SimpleNamespace(sampling_params=None, prompt="chunk-1")
+            yield SimpleNamespace(sampling_params=None, prompt="chunk-2")
+
+        stage0_params = SimpleNamespace(skip_clone=True)
+        first_chunk_submitted = asyncio.get_running_loop().create_future()
+
+        asyncio.create_task(
+            omni._add_streaming_input_request(
+                request_id="req-1",
+                input_stream=input_stream(),
+                sampling_params_list=[stage0_params],
+                final_stage_id=0,
+                final_output_stage_ids=[0],
+                arrival_time=0.0,
+                first_chunk_submitted=first_chunk_submitted,
+            )
+        )
+        await first_submit_parked.wait()
+        assert len(omni._pending_submits) == 1
+
+        # pause_generation(mode="abort")/sleep() revokes the parked first ADD.
+        for pending in list(omni._pending_submits.values()):
+            pending.cancel()
+        # The wrapper returns as soon as the pump task is created; the pump
+        # itself is registered on the request state.
+        await asyncio.wait_for(state.input_stream_task, timeout=2)
+
+        assert submits == ["add"], f"pump submitted after the revoke: {submits}"
+        assert first_chunk_submitted.done(), "generate() would stay parked on the first chunk"
+        assert not state.queue.empty(), "revoked request got no terminal abort output"
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_tracked_non_streaming_submit_does_not_run_while_paused_and_holds_single_slot():
     """Non-streaming generate() already holds the outer admission slot across
     add_request: _submit_tracked must not stack a second one (sleep()'s
@@ -1500,7 +1572,6 @@ def test_cancelled_companion_put_revokes_admitted_parent(mocker):
     it would otherwise sit admitted with scheduler and KV capacity for a CFG
     group that can never complete."""
 
-    import concurrent.futures
     import faulthandler
     import threading
 
@@ -1529,8 +1600,8 @@ def test_cancelled_companion_put_revokes_admitted_parent(mocker):
 
             parent = SimpleNamespace(request_id="parent-1", request_artifact_dirs=None)
             companion = object()
-            settled: concurrent.futures.Future = concurrent.futures.Future()
-            group = asyncio.create_task(engine._put_request_queue_group(parent, [companion], settled))
+            outcome: dict[str, bool] = {"parent_enqueued": False}
+            group = asyncio.create_task(engine._put_request_queue_group(parent, [companion], outcome))
             await asyncio.sleep(0.1)
             assert not group.done(), "companion put should be parked on the full queue"
             assert queue.sync_q.qsize() == 2, "parent should be enqueued ahead of the companion"
@@ -1541,7 +1612,7 @@ def test_cancelled_companion_put_revokes_admitted_parent(mocker):
             # The parent landed: its media is in the sender cache legitimately,
             # so the frontend cache reset must be skipped (only the never-
             # admitted case clears it).
-            assert settled.result() is True
+            assert outcome["parent_enqueued"] is True
             clear_mm_cache.assert_not_awaited()
 
             # Free the room the detached revoke is waiting for, then give the

@@ -651,44 +651,57 @@ class AsyncOmniEngine(OmniEngineBase):
         if owner_loop is None or owner_loop is asyncio.get_running_loop():
             await self.request_queue.async_q.put(item)
             return
-        settled: concurrent.futures.Future = concurrent.futures.Future()
-        await self._bridge_owned_put(lambda: self.request_queue.async_q.put(item), settled)
+        await self._bridge_owned_put(lambda: self.request_queue.async_q.put(item), {"parent_enqueued": False})
 
     async def _put_request_queue_group(
         self,
         msg: StageSubmissionMessage,
         companions: list[AddCompanionRequestMessage],
-        settled: concurrent.futures.Future,
+        outcome: dict[str, bool],
     ) -> None:
         """Enqueue an ADD and its CFG companions as one cancellable unit.
 
         Same owning-loop routing as :meth:`_put_request_queue`; the whole
         group runs as a single task on that loop, so cancellation between
         companion puts is handled where the queue state is visible (see
-        :meth:`_owned_enqueue_group`). ``settled`` receives whether the
-        parent landed — the caller needs that to scope its cleanup.
+        :meth:`_owned_enqueue_group`). ``outcome["parent_enqueued"]`` is set
+        to whether the parent landed — the caller needs that to scope its
+        cleanup — on every exit, including cancellation.
         """
         owner_loop = getattr(self, "orchestrator_loop", None)
         if owner_loop is None or owner_loop is asyncio.get_running_loop():
-            await self._owned_enqueue_group(msg, companions, settled)
+            await self._owned_enqueue_group(msg, companions, outcome)
             return
-        await self._bridge_owned_put(lambda: self._owned_enqueue_group(msg, companions, settled), settled)
+        await self._bridge_owned_put(lambda: self._owned_enqueue_group(msg, companions, outcome), outcome)
 
     async def _bridge_owned_put(
         self,
         owned_put_factory: Callable[[], Any],
-        settled: concurrent.futures.Future,
+        outcome: dict[str, bool],
     ) -> None:
         """Await an owning-loop put, settling it before propagating cancel."""
+        settled: concurrent.futures.Future = concurrent.futures.Future()
 
         async def _run() -> None:
             try:
                 await owned_put_factory()
             finally:
                 if not settled.done():
-                    settled.set_result(None)
+                    settled.set_result(bool(outcome.get("parent_enqueued", False)))
 
         cf = asyncio.run_coroutine_threadsafe(_run(), getattr(self, "orchestrator_loop"))
+        # Guarantee settlement on every exit: if cf.cancel() wins before _run
+        # is first scheduled on the orchestrator loop, its coroutine never
+        # starts and its own finally cannot complete `settled`. The callback
+        # runs synchronously at cf.cancel() and copies the outcome dict —
+        # which a started group updates before completing — so a started
+        # group's verdict is never lost and the frontend cancel path never
+        # hangs on an unsettled future.
+        cf.add_done_callback(
+            lambda _done: settled.set_result(bool(outcome.get("parent_enqueued", False)))
+            if not settled.done()
+            else None
+        )
         try:
             await asyncio.wrap_future(cf)
         except asyncio.CancelledError:
@@ -706,7 +719,7 @@ class AsyncOmniEngine(OmniEngineBase):
         self,
         msg: StageSubmissionMessage,
         companions: list[AddCompanionRequestMessage],
-        settled: concurrent.futures.Future,
+        outcome: dict[str, bool],
     ) -> None:
         """Put the ADD and its companions on the queue's owning loop.
 
@@ -714,8 +727,8 @@ class AsyncOmniEngine(OmniEngineBase):
         landed but before every companion did, the parent is revoked here —
         it would otherwise hold scheduler and KV capacity for a CFG group
         that can never complete. If nothing landed, the prepared artifacts
-        are removed. ``settled`` is completed with whether the parent
-        landed, even on failure, so the frontend can scope its cleanup.
+        are removed. ``outcome["parent_enqueued"]`` reports whether the
+        parent landed, on every exit, so the frontend can scope its cleanup.
         """
         parent_enqueued = False
         try:
@@ -736,8 +749,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     shutil.rmtree(artifact_dir, ignore_errors=True)
             raise
         finally:
-            if not settled.done():
-                settled.set_result(parent_enqueued)
+            outcome["parent_enqueued"] = parent_enqueued
 
     def _spawn_orphan_parent_revoke(self, request_id: str) -> None:
         """Revoke a half-enqueued CFG parent as soon as the queue has room.
@@ -830,9 +842,9 @@ class AsyncOmniEngine(OmniEngineBase):
             entry_stage_id=entry_stage_id,
             **({"kv_hints": kv_hints} if kv_hints is not None else {}),
         )
-        settled: concurrent.futures.Future = concurrent.futures.Future()
+        outcome: dict[str, bool] = {"parent_enqueued": False}
         try:
-            await self._put_request_queue_group(msg, companions, settled)
+            await self._put_request_queue_group(msg, companions, outcome)
         except BaseException:
             # Artifact cleanup for a group that never landed is handled by
             # _owned_enqueue_group, which knows whether the parent was
@@ -844,8 +856,7 @@ class AsyncOmniEngine(OmniEngineBase):
             # entries belong to that real request — clearing the
             # process-global cache here would race the Orchestrator processing
             # the ADD and force unrelated media re-sends.
-            parent_enqueued = settled.result() if settled.done() else None
-            if parent_enqueued is not True:
+            if not outcome["parent_enqueued"]:
                 await self._reset_frontend_mm_cache()
             raise
         finally:
