@@ -9,6 +9,7 @@ import asyncio
 import concurrent.futures
 import copy
 import shutil
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, cast
@@ -681,34 +682,43 @@ class AsyncOmniEngine(OmniEngineBase):
     ) -> None:
         """Await an owning-loop put, settling it before propagating cancel."""
         settled: concurrent.futures.Future = concurrent.futures.Future()
+        started = threading.Event()
+        caller_cancelled = threading.Event()
 
         async def _run() -> None:
+            started.set()
             try:
+                # cf.cancel() can complete the proxy future before this
+                # coroutine is first scheduled; a body that starts afterwards
+                # must still not run the put behind a caller that gave up.
+                if caller_cancelled.is_set():
+                    raise asyncio.CancelledError
                 await owned_put_factory()
             finally:
+                # Settle only here — after the group's own finally finalized
+                # `outcome` — so a cancelled caller reads the unwound
+                # operation's verdict, not the state at cf.cancel() time.
                 if not settled.done():
                     settled.set_result(bool(outcome.get("parent_enqueued", False)))
 
+        def _settle_cancelled_before_start(done: concurrent.futures.Future) -> None:
+            # cf.cancel() completes the proxy future synchronously, before the
+            # owning-loop task unwinds. Settle here only when the coroutine
+            # never started — nothing can have landed, so False is final; a
+            # started put settles from _run's finally after its unwind.
+            if done.cancelled():
+                caller_cancelled.set()
+                if not started.is_set() and not settled.done():
+                    settled.set_result(False)
+
         cf = asyncio.run_coroutine_threadsafe(_run(), getattr(self, "orchestrator_loop"))
-        # Guarantee settlement on every exit: if cf.cancel() wins before _run
-        # is first scheduled on the orchestrator loop, its coroutine never
-        # starts and its own finally cannot complete `settled`. The callback
-        # runs synchronously at cf.cancel() and copies the outcome dict —
-        # which a started group updates before completing — so a started
-        # group's verdict is never lost and the frontend cancel path never
-        # hangs on an unsettled future.
-        cf.add_done_callback(
-            lambda _done: settled.set_result(bool(outcome.get("parent_enqueued", False)))
-            if not settled.done()
-            else None
-        )
+        cf.add_done_callback(_settle_cancelled_before_start)
         try:
             await asyncio.wrap_future(cf)
         except asyncio.CancelledError:
             cf.cancel()
-            # The owning-loop task is only cancelled via call_soon_threadsafe;
-            # if a slot freed first, the item can still land. Waiting for the
-            # settlement keeps the cancel-then-abort ordering honest.
+            # A started put settles only once its owning-loop unwind finished;
+            # waiting for that keeps the cancel-then-abort ordering honest.
             try:
                 await asyncio.wrap_future(settled)
             except asyncio.CancelledError:

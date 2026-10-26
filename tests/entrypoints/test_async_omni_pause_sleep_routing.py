@@ -1560,11 +1560,12 @@ def test_revoked_final_update_is_not_an_input_error(mocker):
 
 
 @pytest.mark.cpu
-def test_tracked_non_streaming_submit_does_not_run_while_paused_and_holds_single_slot():
-    """Non-streaming generate() already holds the outer admission slot across
-    add_request: _submit_tracked must not stack a second one (sleep()'s
-    ``_admitting == 0`` barrier double-counts), and the gated submit body
-    must not start while the engine is paused."""
+def test_tracked_non_streaming_submit_runs_under_callers_slot():
+    """Non-streaming generate() holds the outer admission slot across
+    add_request: _submit_tracked must not stack a second one, and must not
+    re-wait on _paused — sleep()'s ``_admitting == 0`` barrier already waits
+    behind the caller's slot, so a second wait would deadlock
+    ``sleep(mode="wait")`` against it."""
 
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
@@ -1580,54 +1581,90 @@ def test_tracked_non_streaming_submit_does_not_run_while_paused_and_holds_single
             await omni._submit_tracked("req-1", add, hold_admission=False)
 
         task = asyncio.create_task(generate_like())
-        await asyncio.sleep(0.05)
-        assert not body_started.is_set(), "submit body ran while the engine was paused"
+        await asyncio.wait_for(body_started.wait(), timeout=1)
         assert omni._admitting == 1, "tracked non-streaming submit stacked a second admission slot"
-
-        omni._paused = False
-        async with omni._pause_cond:
-            omni._pause_cond.notify_all()
-
         await asyncio.wait_for(task, timeout=1)
-        assert body_started.is_set()
         assert omni._admitting == 1  # the slot still held is the caller's
 
     asyncio.run(run())
 
 
 @pytest.mark.cpu
-def test_sleep_releases_gate_parked_tracked_submit():
-    """A tracked submit parked at the admission gate when sleep() runs must be
-    revoked and unwound: its caller holds the outer slot, so a missed cancel
-    would deadlock sleep()'s ``_admitting == 0`` barrier behind a paused
-    engine."""
+def test_sleep_wait_survives_non_streaming_submit_scheduling_window():
+    """sleep(mode="wait") landing after a non-streaming submit is scheduled
+    but before it runs must not deadlock: the child runs under the caller's
+    outer slot and sleep's ``_admitting == 0`` barrier passes once the ADD
+    settles — wait mode has no cancel to break the cycle."""
 
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
         omni._pending_submits = {}
-        omni._admitting = 1  # generate()'s outer slot
+        omni._admitting = 1  # generate() passed the outer gate; slot held
+        submit_started = asyncio.Event()
+        release_submit = asyncio.Event()
+
+        async def add() -> None:
+            submit_started.set()
+            await release_submit.wait()
+
+        async def generate_like() -> None:
+            await omni._submit_tracked("req-1", add, hold_admission=False)
+            await omni._release_generate_admission()
+
+        generate_task = asyncio.create_task(generate_like())
+        await asyncio.sleep(0)  # submit registered, its first step not run
+        assert list(omni._pending_submits) == ["req-1"]
+
+        # Close the gate inside the scheduling window, like a control call
+        # slipping in between create_task and the submit's first step.
+        omni._paused = True
+        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="wait"))
+        await asyncio.sleep(0.05)
+        assert omni._paused is True
+        assert submit_started.is_set(), "submit re-waited on _paused behind sleep's own barrier"
+        release_submit.set()
+
+        await asyncio.wait_for(generate_task, timeout=2)
+        await asyncio.wait_for(sleep_task, timeout=2)  # hangs if the submit double-waits
+        assert omni._admitting == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_releases_gate_parked_streaming_submit():
+    """A streaming submit parked at the per-submit gate when sleep() runs must
+    be revoked and unwound, so sleep's ``_admitting == 0`` barrier cannot hang
+    behind a paused engine (non-streaming submits no longer re-gate: their
+    caller holds the outer slot)."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
         omni._paused = True  # the gate closed before this submit registered
         revoked = asyncio.Event()
 
         async def add() -> None:
-            raise AssertionError("submit body must not run while paused")
+            raise AssertionError("streaming submit body must not run while paused")
 
         async def on_revoke() -> None:
             revoked.set()
             await asyncio.sleep(0)
 
-        async def generate_like() -> None:
-            await omni._submit_tracked("req-1", add, hold_admission=False, on_revoke=on_revoke)
-            await omni._release_generate_admission()  # caller releases the outer slot
+        async def pump() -> None:
+            await omni._submit_tracked("stream-1", add, hold_admission=True, on_revoke=on_revoke)
 
-        task = asyncio.create_task(generate_like())
+        task = asyncio.create_task(pump())
         await asyncio.sleep(0.05)
         assert not task.done()
+        assert omni._admitting == 0  # parked before the gate: no slot held
 
         await asyncio.wait_for(omni.sleep(level=1, mode="abort"), timeout=2)
-        assert revoked.is_set()
-        assert omni._admitting == 0, "sleep's barrier stayed blocked behind a gate-parked submit"
+        # The parked submit holds no slot, so sleep's barrier passes at once
+        # and the cancelled child unwinds after sleep releases the condition.
         await asyncio.wait_for(task, timeout=1)
+        assert revoked.is_set()
+        assert not task.cancelled(), "pump ended as cancelled instead of revoked"
 
     asyncio.run(run())
 
@@ -1697,6 +1734,95 @@ def test_cancelled_companion_put_revokes_admitted_parent(mocker):
         asyncio.run(run())
     finally:
         faulthandler.cancel_dump_traceback_later()
+        queue.close()
+        orch_loop.call_soon_threadsafe(orch_loop.stop)
+        orch_thread.join(timeout=5)
+        orch_loop.close()
+
+
+@pytest.mark.cpu
+def test_cancelled_submit_with_landed_parent_keeps_mm_cache(mocker):
+    """Cancellation must settle from the owning-loop task's unwind, not from
+    cf.cancel(): the proxy future completes at cancel time while the group's
+    finally has not run, so a stale parent_enqueued=False resets the global
+    sender cache for an already-enqueued parent and returns before the queue
+    operation has settled."""
+
+    import faulthandler
+    import threading
+
+    import janus
+
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+    from vllm_omni.engine.messages import AbortRequestMessage
+
+    queue = janus.Queue(maxsize=2)
+    orch_loop = asyncio.new_event_loop()
+    orch_thread = threading.Thread(target=orch_loop.run_forever, daemon=True, name="orchestrator")
+    orch_thread.start()
+    freeze_entered = threading.Event()
+    freeze_release = threading.Event()
+
+    faulthandler.dump_traceback_later(30, exit=True)
+    try:
+
+        async def run() -> None:
+            engine = object.__new__(AsyncOmniEngine)
+            engine.request_queue = queue
+            engine.orchestrator_loop = orch_loop
+            engine.prompt_expand_func = object()
+            clear_mm_cache = AsyncMock()
+            engine.input_processor = SimpleNamespace(renderer=SimpleNamespace(clear_mm_cache_async=clear_mm_cache))
+            parent = SimpleNamespace(
+                request_id="parent-1",
+                request_artifact_dirs=None,
+                original_prompt=None,
+                sampling_params_list=[object()],
+            )
+            mocker.patch.object(engine, "_build_add_request_message", return_value=parent)
+            mocker.patch.object(engine, "_build_cfg_companions", return_value=[object()])
+
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(queue.async_q.join(), orch_loop))
+            queue.sync_q.put_nowait(object())  # leave room for exactly the parent
+
+            submit = asyncio.create_task(
+                engine.add_request_async(request_id="parent-1", prompt={"prompt": "hi"}, final_stage_id=1)
+            )
+            await asyncio.sleep(0.1)
+            assert not submit.done()
+            assert queue.sync_q.qsize() == 2, "parent should be enqueued ahead of its parked companion"
+
+            # Freeze the orchestrator loop before cancelling: its unwind can
+            # no longer race the frontend's read of `outcome`.
+            orch_loop.call_soon_threadsafe(freeze_entered.set)
+            while not freeze_entered.is_set():
+                await asyncio.sleep(0.01)
+            orch_loop.call_soon_threadsafe(lambda: freeze_release.wait())
+
+            submit.cancel()
+            freeze_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await submit
+            # The parent landed, so its media legitimately lives in the sender
+            # cache: the global reset must be skipped even though the
+            # companion never made it.
+            clear_mm_cache.assert_not_awaited()
+
+            # The half-enqueued parent is revoked behind the ADD.
+            queue.sync_q.get_nowait()
+            queue.sync_q.get_nowait()
+            for _ in range(100):
+                if queue.sync_q.qsize():
+                    break
+                await asyncio.sleep(0.02)
+            revoked = queue.sync_q.get_nowait()
+            assert isinstance(revoked, AbortRequestMessage)
+            assert revoked.request_ids == ["parent-1"]
+
+        asyncio.run(run())
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        freeze_release.set()
         queue.close()
         orch_loop.call_soon_threadsafe(orch_loop.stop)
         orch_thread.join(timeout=5)

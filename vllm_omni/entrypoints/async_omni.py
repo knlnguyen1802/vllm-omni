@@ -431,33 +431,35 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
     ) -> bool:
         """Gate + run one engine submit, tracked for pause/sleep/abort revoke.
 
-        The submit runs as a task that registers here *before* the admission
-        gate — so the cancel snapshot inside ``pause_generation()``/``sleep()``
-        cannot miss it — but does not START until the gate opens: a bare
-        ``create_task`` would run the ADD (its preprocessing and its queue
-        put) while the engine is paused or asleep, the exact race sleep()'s
-        admission barrier exists to prevent. ``hold_admission`` takes the
-        per-submit slot only for streaming pumps; a non-streaming generate()
-        already holds the outer slot across add_request, and stacking a
-        second one double-counts against sleep()'s ``_admitting == 0``
-        barrier. When the submit is revoked (the task is cancelled while the
-        caller was not), ``on_revoke`` closes the request out as an abort
-        instead of letting the CancelledError escape into a caller that never
-        cancelled anything. Returns whether that happened — a True return
-        means the request is already closed out and the caller must stop
-        submitting for it (the streaming pump stops; generate() drains the
-        terminal abort output below).
+        The submit runs as a task that registers here before any wait — so
+        the cancel snapshot inside ``pause_generation()``/``sleep()`` cannot
+        miss it. Streaming pumps (``hold_admission=True``) re-check admission
+        per submit and take a per-submit slot: their caller drops generate()'s
+        outer slot while waiting for the next client chunk, so the ADD must
+        not run while the engine is paused or partially asleep. A
+        non-streaming submit re-checks nothing and takes no slot: its caller
+        holds the outer slot across add_request, and sleep()'s ``_admitting
+        == 0`` barrier waits behind that slot — re-waiting on ``_paused``
+        here would deadlock ``sleep(mode="wait")`` against it, since only
+        ``mode="abort"`` cancels parked submits. When the submit is revoked
+        (the task is cancelled while the caller was not), ``on_revoke``
+        closes the request out as an abort instead of letting the
+        CancelledError escape into a caller that never cancelled anything.
+        Returns whether that happened — a True return means the request is
+        already closed out and the caller must stop submitting for it (the
+        streaming pump stops; generate() drains the terminal abort output
+        below).
         """
         pending = getattr(self, "_pending_submits", None)
         if pending is None:
             pending = self._pending_submits = {}
 
         async def _gated_submit() -> None:
-            async with self._pause_cond:
-                # Same full-wake condition as generate()'s gate: streaming
-                # ADDs must not race a partially-asleep engine either (#8678).
-                await self._pause_cond.wait_for(lambda: not self._paused and not self._sleeping_tags)
-                if hold_admission:
+            if hold_admission:
+                async with self._pause_cond:
+                    # Same full-wake condition as generate()'s gate: streaming
+                    # ADDs must not race a partially-asleep engine either (#8678).
+                    await self._pause_cond.wait_for(lambda: not self._paused and not self._sleeping_tags)
                     self._admitting = getattr(self, "_admitting", 0) + 1
             try:
                 await submit_factory()
