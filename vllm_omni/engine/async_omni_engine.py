@@ -244,6 +244,13 @@ class AsyncOmniEngine(OmniEngineBase):
                 if isinstance(raw_meta, dict):
                     for key in TRANSFORM_OWNED_META_KEYS:
                         raw_meta.pop(key, None)
+        # The artifact-dirs key is server-reserved: the prompt transform records
+        # where it wrote preprocessed artifacts, and the cleanup paths rmtree
+        # whatever it holds. Drop anything a client request carries under it
+        # before the transform runs, so cleanup can only ever delete
+        # server-written paths (CodeQL py/path-injection).
+        if isinstance(prompt, dict):
+            prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
         original_prompt = prompt
         preselected_stage0_replica: int | None = None
         request_artifact_dirs: list[str] = []
@@ -273,8 +280,6 @@ class AsyncOmniEngine(OmniEngineBase):
 
             prompt_transform_func = getattr(self, "prompt_transform_func", None)
             if prompt_transform_func is not None:
-                if isinstance(prompt, dict):
-                    prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
                 prompt = prompt_transform_func(
                     copy.copy(prompt),
                     effective_sampling_params_list,
