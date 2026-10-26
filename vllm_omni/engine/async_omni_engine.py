@@ -306,6 +306,16 @@ class AsyncOmniEngine(OmniEngineBase):
 
             # Full input processing (tokenization, multimodal, etc.)
             assert self.input_processor is not None
+
+            def _release_failed_preprocess() -> None:
+                """Undo a failed stage-0 preprocess: free the reserved replica
+                binding and drop artifacts the transform already wrote. Reads
+                only server-tracked state — never the client prompt."""
+                if preselected_stage0_replica is not None and self.stage_pools:
+                    self.stage_pools[0].release_binding(request_id)
+                for artifact_dir in request_artifact_dirs:
+                    shutil.rmtree(artifact_dir, ignore_errors=True)
+
             _t_preprocess = time.perf_counter()
             try:
                 request = self.input_processor.process_inputs(
@@ -323,46 +333,47 @@ class AsyncOmniEngine(OmniEngineBase):
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
             except Exception:
-                if preselected_stage0_replica is not None and self.stage_pools:
-                    self.stage_pools[0].release_binding(request_id)
-                for artifact_dir in request_artifact_dirs:
-                    shutil.rmtree(artifact_dir, ignore_errors=True)
+                _release_failed_preprocess()
                 raise
-            _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
-            # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
-            # additional_information field in the prompt.
-            request = upgrade_to_omni_request(request, prompt)
+            try:
+                _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
+                # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
+                # additional_information field in the prompt.
+                request = upgrade_to_omni_request(request, prompt)
 
-            if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
-                processed_info = deserialize_additional_information(request.additional_information)
-                processed_meta = processed_info.get("meta")
-                if isinstance(processed_meta, dict):
-                    if isinstance(original_prompt, dict):
-                        original_info = dict(original_prompt.get("additional_information") or {})
-                        original_meta = dict(original_info.get("meta") or {})
-                        original_meta.update(processed_meta)
-                        original_info["meta"] = original_meta
-                        original_prompt["additional_information"] = original_info
+                if isinstance(request, OmniEngineCoreRequest) and request.additional_information is not None:
+                    processed_info = deserialize_additional_information(request.additional_information)
+                    processed_meta = processed_info.get("meta")
+                    if isinstance(processed_meta, dict):
+                        if isinstance(original_prompt, dict):
+                            original_info = dict(original_prompt.get("additional_information") or {})
+                            original_meta = dict(original_info.get("meta") or {})
+                            original_meta.update(processed_meta)
+                            original_info["meta"] = original_meta
+                            original_prompt["additional_information"] = original_info
 
-            if reasoning_ended is not None:
-                request.reasoning_ended = reasoning_ended
+                if reasoning_ended is not None:
+                    request.reasoning_ended = reasoning_ended
 
-            # Restore external_req_id to the original user-facing request_id.
-            # InputProcessor.process_inputs() renames request_id to an internal
-            # UUID (saving the original in external_req_id), but then overwrites
-            # external_req_id with the new internal ID. We need external_req_id
-            # to match the key used in Orchestrator.request_states so that
-            # output routing (output.request_id lookup) can find the req_state.
-            request.external_req_id = request_id
-            request = apply_omni_final_stage_metadata(request, final_stage_id)
+                # Restore external_req_id to the original user-facing request_id.
+                # InputProcessor.process_inputs() renames request_id to an internal
+                # UUID (saving the original in external_req_id), but then overwrites
+                # external_req_id with the new internal ID. We need external_req_id
+                # to match the key used in Orchestrator.request_states so that
+                # output routing (output.request_id lookup) can find the req_state.
+                request.external_req_id = request_id
+                request = apply_omni_final_stage_metadata(request, final_stage_id)
 
-            # Registration with stage 0's output processor is deferred to the
-            # orchestrator thread (see Orchestrator._handle_add_request), which
-            # now routes admission through StagePool.submit_initial().
-            output_prompt_text = prompt_text
-            if output_prompt_text is None and isinstance(original_prompt, dict):
-                output_prompt_text = original_prompt.get("prompt")
-            prompt = request
+                # Registration with stage 0's output processor is deferred to the
+                # orchestrator thread (see Orchestrator._handle_add_request), which
+                # now routes admission through StagePool.submit_initial().
+                output_prompt_text = prompt_text
+                if output_prompt_text is None and isinstance(original_prompt, dict):
+                    output_prompt_text = original_prompt.get("prompt")
+                prompt = request
+            except Exception:
+                _release_failed_preprocess()
+                raise
         else:
             request_artifact_dirs = []
 
@@ -611,14 +622,14 @@ class AsyncOmniEngine(OmniEngineBase):
             # Companion construction runs under this guard too: a failure after
             # the ADD message exists must still release its preprocessed
             # artifacts and ownership key, since nothing was enqueued and the
-            # enqueue-path cleanup never runs.
+            # enqueue-path cleanup never runs. Dirs are read only from the
+            # prepared message — never from the client prompt:
+            # _build_add_request_message cleans its own extraction on any
+            # internal failure, and the entry sanitization above already
+            # dropped whatever a client supplied under the key.
             if msg is not None:
                 for artifact_dir in msg.request_artifact_dirs or ():
                     shutil.rmtree(artifact_dir, ignore_errors=True)
-            if isinstance(prompt, dict):
-                for artifact_dir in prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None) or ():
-                    if isinstance(artifact_dir, str):
-                        shutil.rmtree(artifact_dir, ignore_errors=True)
             raise
         assert msg is not None
         return msg, companions

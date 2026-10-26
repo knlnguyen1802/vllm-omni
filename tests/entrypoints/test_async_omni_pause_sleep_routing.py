@@ -1570,6 +1570,41 @@ def test_prepare_add_request_drops_client_artifact_dirs_before_any_raise(mocker)
 
 
 @pytest.mark.cpu
+def test_build_failure_after_transform_cleans_extracted_dirs(mocker):
+    """A failure after the transform attached artifact dirs must clean them at
+    the source — without any cleanup path re-reading the client prompt
+    (CodeQL py/path-injection)."""
+
+    from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.default_sampling_params_list = [SimpleNamespace(max_tokens=1)]
+    engine.stage_metadata = [SimpleNamespace(stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.prompt_transform_func = lambda prompt, params: {
+        **prompt,
+        REQUEST_ARTIFACT_DIRS_KEY: ["/tmp/omni-test-artifact"],
+    }
+    engine.input_processor = SimpleNamespace(process_inputs=lambda **kwargs: object())
+    mocker.patch.object(engine, "_scope_stage0_multimodal_cache_to_replica", return_value=(None, {"prompt": "hi"}))
+    rmtree = mocker.patch("vllm_omni.engine.async_omni_engine.shutil.rmtree")
+    mocker.patch("vllm_omni.engine.async_omni_engine.upgrade_to_omni_request", side_effect=RuntimeError("boom"))
+
+    prompt = {"prompt": "hi", REQUEST_ARTIFACT_DIRS_KEY: ["/client/controlled/path"]}
+    with pytest.raises(RuntimeError, match="boom"):
+        engine._prepare_add_request(
+            request_id="req-1", prompt=prompt, sampling_params_list=[SimpleNamespace(max_tokens=1)]
+        )
+
+    # The transform's own dirs were cleaned at the source, and only they were:
+    rmtree.assert_called_once_with("/tmp/omni-test-artifact", ignore_errors=True)
+    assert rmtree.call_count == 1
+    # The key now holds the transform's list - the client-supplied value is gone.
+    assert prompt[REQUEST_ARTIFACT_DIRS_KEY] == ["/tmp/omni-test-artifact"]
+
+
+@pytest.mark.cpu
 def test_generate_waits_for_full_wake_instead_of_erroring():
     """After a partial wake (kv_cache still asleep), generate() parks at the
     admission gate instead of raising "partially or fully asleep" and forcing
