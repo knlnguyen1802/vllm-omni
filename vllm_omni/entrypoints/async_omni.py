@@ -573,6 +573,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
             cancelled = False
+            # Reported only after the terminal submit below: once generate()
+            # sees the error it aborts the request, which would revoke a
+            # terminal update still waiting to run as its tracked task.
+            input_error: Exception | None = None
             try:
                 async for chunk in input_stream:
                     chunk_params = getattr(chunk, "sampling_params", None) or stage0_params
@@ -618,7 +622,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
-                await _report_input_error(error)
+                input_error = error
             finally:
                 try:
                     if not cancelled:
@@ -660,11 +664,14 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                             has_submitted_first_chunk = True
                 except _SubmitRevokedError:
                     # Revoke of the final update already closed the request
-                    # with a synthetic abort; do not also report an input error.
+                    # with a synthetic abort; do not also report its error.
                     pass
                 except Exception as error:
-                    await _report_input_error(error)
+                    if input_error is None:
+                        input_error = error
                 finally:
+                    if input_error is not None:
+                        await _report_input_error(input_error)
                     # Unblock generate() even on cancel / empty stream / submit
                     # failure so it can observe the queued terminal result or error.
                     _mark_first_chunk_submitted()
