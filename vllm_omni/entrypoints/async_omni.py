@@ -654,6 +654,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 )
                             )
                             has_submitted_first_chunk = True
+                except _SubmitRevokedError:
+                    # Revoke of the final update already closed the request
+                    # with a synthetic abort; do not also report an input error.
+                    pass
                 except Exception as error:
                     await _report_input_error(error)
                 finally:

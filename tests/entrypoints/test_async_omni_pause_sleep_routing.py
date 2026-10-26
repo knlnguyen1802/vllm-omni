@@ -14,6 +14,7 @@ from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK
+from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.async_omni import CACHE_RESET_TIMEOUT_S, AsyncOmni
 
 pytestmark = [pytest.mark.core_model]
@@ -1489,6 +1490,71 @@ def test_pump_stops_after_revoked_first_chunk(mocker):
         assert submits == ["add"], f"pump submitted after the revoke: {submits}"
         assert first_chunk_submitted.done(), "generate() would stay parked on the first chunk"
         assert not state.queue.empty(), "revoked request got no terminal abort output"
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_revoked_final_update_is_not_an_input_error(mocker):
+    """A revoke of the final empty update must not be reported as an input error.
+
+    That submit runs inside handle_inputs's finally, after the request was
+    already closed with a synthetic abort. _SubmitRevokedError subclasses
+    Exception, so the inner handler has to ignore it explicitly.
+    """
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
+        omni._paused = False
+        omni._admitting = 0
+        mocker.patch.object(AsyncOmni, "model_config", new=SimpleNamespace())
+        omni._record_request_failure_once = lambda *args, **kwargs: None
+        omni._validate_streaming_input_sampling_params = lambda params: None
+        mocker.patch(
+            "vllm_omni.entrypoints.async_omni.extract_prompt_components",
+            return_value=("text", None, None),
+        )
+
+        state = SimpleNamespace(queue=asyncio.Queue())
+        omni.request_states = {"req-1": state}
+        final_parked = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def parked_add(**kwargs) -> None:
+            final_parked.set()
+            await gate.wait()
+
+        omni.engine.add_request_async = parked_add
+        omni.engine.add_streaming_update_async = AsyncMock()
+
+        async def input_stream():
+            return
+            yield  # pragma: no cover
+
+        stage0_params = SimpleNamespace(skip_clone=True)
+        first_chunk_submitted = asyncio.get_running_loop().create_future()
+        asyncio.create_task(
+            omni._add_streaming_input_request(
+                request_id="req-1",
+                input_stream=input_stream(),
+                sampling_params_list=[stage0_params],
+                final_stage_id=0,
+                final_output_stage_ids=[0],
+                arrival_time=0.0,
+                first_chunk_submitted=first_chunk_submitted,
+            )
+        )
+        await asyncio.wait_for(final_parked.wait(), timeout=2)
+        for pending in list(omni._pending_submits.values()):
+            pending.cancel()
+        await asyncio.wait_for(state.input_stream_task, timeout=2)
+
+        queued = []
+        while not state.queue.empty():
+            queued.append(state.queue.get_nowait())
+        assert queued, "revoked final update produced no terminal output"
+        assert not any(isinstance(message, ErrorMessage) for message in queued)
 
     asyncio.run(run())
 
