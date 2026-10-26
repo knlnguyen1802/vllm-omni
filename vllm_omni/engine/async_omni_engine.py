@@ -625,9 +625,7 @@ class AsyncOmniEngine(OmniEngineBase):
         if owner_loop is None or owner_loop is asyncio.get_running_loop():
             await self.request_queue.async_q.put(item)
             return
-        await asyncio.wrap_future(
-            asyncio.run_coroutine_threadsafe(self.request_queue.async_q.put(item), owner_loop)
-        )
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.request_queue.async_q.put(item), owner_loop))
 
     async def add_request_async(
         self,
