@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import shutil
 import time
@@ -26,6 +27,7 @@ from vllm_omni.engine.async_engine_utils import (
 )
 from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
+    EngineQueueMessage,
     InteractionMessage,
     StageSubmissionMessage,
 )
@@ -515,6 +517,7 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            entry_stage_id=entry_stage_id,
             kv_hints=kv_hints,
         )
         try:
@@ -553,8 +556,10 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
+        entry_stage_id: int = 0,
     ) -> tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]:
         """Build the ADD message plus CFG companions without enqueueing."""
+        msg: StageSubmissionMessage | None = None
         try:
             msg = self._build_add_request_message(
                 request_id=request_id,
@@ -574,25 +579,55 @@ class AsyncOmniEngine(OmniEngineBase):
                 entry_stage_id=entry_stage_id,
                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
             )
+            # CFG companions are built before the parent is admitted, so the group
+            # is all-or-nothing: a build failure raises here, nothing is enqueued,
+            # and the caller sees the error. Admitting the parent first would leave
+            # an orphan holding scheduler and KV capacity that can never complete,
+            # because a model whose guidance is mandatory cannot decode a request
+            # whose companion never arrived.
+            companions: list[AddCompanionRequestMessage] = []
+            if self.prompt_expand_func is not None and final_stage_id > 0:
+                effective_spl = msg.sampling_params_list
+                stage0_params = effective_spl[0] if effective_spl else None
+                if stage0_params is not None:
+                    companions = self._build_cfg_companions(
+                        request_id, msg.original_prompt, stage0_params, effective_spl
+                    )
         except BaseException:
+            # Companion construction runs under this guard too: a failure after
+            # the ADD message exists must still release its preprocessed
+            # artifacts and ownership key, since nothing was enqueued and the
+            # enqueue-path cleanup never runs.
+            if msg is not None:
+                for artifact_dir in msg.request_artifact_dirs or ():
+                    shutil.rmtree(artifact_dir, ignore_errors=True)
             if isinstance(prompt, dict):
                 for artifact_dir in prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None) or ():
                     if isinstance(artifact_dir, str):
                         shutil.rmtree(artifact_dir, ignore_errors=True)
             raise
-        # CFG companions are built before the parent is admitted, so the group
-        # is all-or-nothing: a build failure raises here, nothing is enqueued,
-        # and the caller sees the error. Admitting the parent first would leave
-        # an orphan holding scheduler and KV capacity that can never complete,
-        # because a model whose guidance is mandatory cannot decode a request
-        # whose companion never arrived.
-        companions: list[AddCompanionRequestMessage] = []
-        if self.prompt_expand_func is not None and final_stage_id > 0:
-            effective_spl = msg.sampling_params_list
-            stage0_params = effective_spl[0] if effective_spl else None
-            if stage0_params is not None:
-                companions = self._build_cfg_companions(request_id, msg.original_prompt, stage0_params, effective_spl)
+        assert msg is not None
         return msg, companions
+
+    async def _put_request_queue(self, item: EngineQueueMessage) -> None:
+        """Enqueue one message without blocking the caller's event loop.
+
+        The janus queue's async facade is owned by the orchestrator loop —
+        the first loop that awaits it — and janus >= 2 raises RuntimeError
+        when any other loop touches it, even with queue capacity free. Route
+        the put through the owning loop instead: while the queue is full the
+        bridged put stays a cancellable task on that loop, so a cancelled
+        caller unwinds its submission before the item is admitted (abort()
+        settles queue-parked submits this way), and the frontend loop keeps
+        servicing timers instead of freezing inside a blocking put (#8678).
+        """
+        owner_loop = getattr(self, "orchestrator_loop", None)
+        if owner_loop is None or owner_loop is asyncio.get_running_loop():
+            await self.request_queue.async_q.put(item)
+            return
+        await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self.request_queue.async_q.put(item), owner_loop)
+        )
 
     async def add_request_async(
         self,
@@ -641,7 +676,7 @@ class AsyncOmniEngine(OmniEngineBase):
             **({"kv_hints": kv_hints} if kv_hints is not None else {}),
         )
         try:
-            await self.request_queue.async_q.put(msg)
+            await self._put_request_queue(msg)
         except BaseException:
             for artifact_dir in msg.request_artifact_dirs or ():
                 shutil.rmtree(artifact_dir, ignore_errors=True)
@@ -650,7 +685,7 @@ class AsyncOmniEngine(OmniEngineBase):
             if isinstance(msg.original_prompt, dict):
                 msg.original_prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
         for companion in companions:
-            await self.request_queue.async_q.put(companion)
+            await self._put_request_queue(companion)
         if companions:
             logger.info(
                 "[AsyncOmniEngine] CFG expansion for req %s: %d companions",

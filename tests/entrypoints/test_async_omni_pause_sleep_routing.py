@@ -1145,10 +1145,10 @@ def test_pause_abort_cancels_pending_submits():
 
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
-        omni._pending_submits = set()
+        omni._pending_submits = {}
 
         stuck = asyncio.create_task(asyncio.Event().wait())
-        omni._pending_submits.add(stuck)
+        omni._pending_submits["req-1"] = stuck
 
         await omni.pause_generation(mode="abort", clear_cache=False)
 
@@ -1165,7 +1165,7 @@ def test_sleep_releases_pending_submit_admission():
 
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
-        omni._pending_submits = set()
+        omni._pending_submits = {}
         omni._admitting = 1
 
         async def suspended_submit() -> None:
@@ -1181,7 +1181,7 @@ def test_sleep_releases_pending_submit_admission():
                 raise
 
         waiter = asyncio.create_task(release_on_cancel())
-        omni._pending_submits.add(task)
+        omni._pending_submits["req-1"] = task
 
         await asyncio.wait_for(omni.sleep(level=1, mode="abort"), timeout=2)
         assert omni._admitting == 0
@@ -1226,6 +1226,126 @@ def test_add_request_async_suspends_on_full_queue_without_wedging(mocker):
 
 
 @pytest.mark.cpu
+def test_add_request_async_survives_saturated_queue_on_orchestrator_loop(mocker):
+    """Deterministic #8678 regression at the production loop boundary.
+
+    The janus queue is bound to a dedicated orchestrator loop — what the real
+    orchestrator thread does by awaiting get() on it — and janus >= 2 raises
+    RuntimeError when any other loop touches async_q, even with capacity free.
+    With the queue saturated and never drained, a frontend submit must
+    suspend (frontend loop stays responsive), a cancelled submit must admit
+    nothing, and an unsaturated submit must complete. The deadline is
+    enforced by a watchdog outside the frontend loop: a blocking put would
+    freeze every in-loop timer, so no asyncio.wait_for guard can fire.
+    """
+
+    import faulthandler
+    import threading
+
+    import janus
+
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    # Built with no running loop, like OmniEngineBase does on the main thread.
+    queue = janus.Queue(maxsize=2)
+    orch_loop = asyncio.new_event_loop()
+    orch_thread = threading.Thread(target=orch_loop.run_forever, daemon=True, name="orchestrator")
+    orch_thread.start()
+
+    faulthandler.dump_traceback_later(30, exit=True)
+    try:
+
+        async def run() -> None:
+            engine = object.__new__(AsyncOmniEngine)
+            engine.request_queue = queue
+            engine.orchestrator_loop = orch_loop
+            engine.prompt_expand_func = None
+            mocker.patch.object(
+                engine,
+                "_build_add_request_message",
+                return_value=SimpleNamespace(request_artifact_dirs=None, original_prompt=None),
+            )
+
+            # Bind async_q to the orchestrator loop the way the production
+            # request handler's await get() does.
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(queue.async_q.join(), orch_loop))
+            # Saturate the queue without draining it.
+            queue.sync_q.put_nowait(object())
+            queue.sync_q.put_nowait(object())
+
+            submit = asyncio.create_task(engine.add_request_async(request_id="req-sat", prompt={"prompt": "hi"}))
+            for _ in range(10):
+                # The frontend loop must keep servicing timers while the
+                # submit is parked on the full queue.
+                await asyncio.sleep(0.01)
+            assert not submit.done()
+
+            submit.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await submit
+            assert queue.sync_q.qsize() == 2, "cancelled submit must not admit its item"
+
+            # Drain from the orchestrator loop: only the seeded items come
+            # out, proving the cancelled submission never crossed.
+            async def get_two():
+                return [await queue.async_q.get(), await queue.async_q.get()]
+
+            drained = await asyncio.wait_for(
+                asyncio.wrap_future(asyncio.run_coroutine_threadsafe(get_two(), orch_loop)), timeout=5
+            )
+            assert len(drained) == 2
+
+            # With room available a cross-loop submit completes instead of
+            # raising janus's "bound to a different event loop" RuntimeError.
+            await asyncio.wait_for(
+                asyncio.create_task(engine.add_request_async(request_id="req-ok", prompt={"prompt": "hi"})),
+                timeout=5,
+            )
+            assert queue.sync_q.qsize() == 1
+
+        asyncio.run(run())
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        queue.close()
+        orch_loop.call_soon_threadsafe(orch_loop.stop)
+        orch_thread.join(timeout=5)
+        orch_loop.close()
+
+
+@pytest.mark.cpu
+def test_abort_revokes_queue_parked_submit():
+    """abort(request_id) must cancel and settle a submit parked on a full
+    request queue, so the request cannot be admitted after abort returns
+    (#8678)."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
+        omni.request_states = {
+            "ext-1#uuid": SimpleNamespace(request_id="ext-1#uuid", external_request_id="ext-1"),
+        }
+        parked = asyncio.create_task(asyncio.Event().wait())
+        omni._pending_submits["ext-1#uuid"] = parked
+        parked_cancelled_at_delegation: list[bool] = []
+
+        async def engine_abort(internal_ids, timeout=None):
+            parked_cancelled_at_delegation.append(parked.cancelled())
+            return []
+
+        omni._abort = engine_abort
+
+        await omni.abort("ext-1")
+
+        assert parked.cancelled(), "parked submit survived abort()"
+        assert parked_cancelled_at_delegation == [True], (
+            "abort() delegated to the Orchestrator before revoking the parked submit"
+        )
+        assert omni._pending_submits == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_waits_for_full_wake_instead_of_erroring():
     """After a partial wake (kv_cache still asleep), generate() parks at the
     admission gate instead of raising "partially or fully asleep" and forcing
@@ -1233,7 +1353,7 @@ def test_generate_waits_for_full_wake_instead_of_erroring():
 
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
-        omni._pending_submits = set()
+        omni._pending_submits = {}
         # wake_up(tags=["weights"]) + resume_generation() already ran:
         # admission is open but the engine is still partially asleep.
         omni._paused = False

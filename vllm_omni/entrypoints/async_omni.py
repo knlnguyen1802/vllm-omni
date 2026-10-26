@@ -98,12 +98,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # drain/offload. Streaming generate does not hold a slot while
         # waiting for the next client chunk.
         self._admitting: int = 0
-        # In-flight add_request_async tasks awaiting queue room. A full request
-        # queue against a paused engine used to wedge the event loop (sync_q.put
-        # blocks the calling thread), so sleep() could never observe
-        # _admitting==0. pause_generation(mode="abort")/sleep() cancel these so
-        # the admission slots release instead of pinning the loop (#8678).
-        self._pending_submits: set[asyncio.Task[None]] = set()
+        # In-flight add_request_async tasks awaiting queue room, keyed by
+        # internal request id. A full request queue against a paused engine
+        # used to wedge the event loop (sync_q.put blocks the calling thread),
+        # so sleep() could never observe _admitting==0. pause_generation(mode=
+        # "abort")/sleep() cancel these so the admission slots release instead
+        # of pinning the loop (#8678), and abort(request_id) settles a
+        # request's own submit so a queue-parked ADD cannot be admitted after
+        # the abort returns.
+        self._pending_submits: dict[str, asyncio.Task[None]] = {}
         # True after pause_generation() or AR EngineCore sleep; wake_up must
         # not reopen generate() until resume_generation(). Diffusion-only
         # sleep uses _paused as a temporary admission gate and clears it
@@ -325,12 +328,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
                 pending = getattr(self, "_pending_submits", None)
                 if pending is None:
-                    pending = self._pending_submits = set()
-                pending.add(submit_task)
+                    pending = self._pending_submits = {}
+                pending[request_id] = submit_task
                 try:
                     await submit_task
                 finally:
-                    pending.discard(submit_task)
+                    pending.pop(request_id, None)
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
             stage_first_ts[0] = submit_ts
@@ -403,7 +406,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ``_admitting == 0`` indefinitely. Cancellation unwinds through
         generate()'s normal abort handling, releasing the slot.
         """
-        for task in list(getattr(self, "_pending_submits", ()) or ()):
+        for task in list(getattr(self, "_pending_submits", {}).values()):
             task.cancel()
 
     async def _submit_with_admission(self, awaitable):
@@ -680,6 +683,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # NOTE: If the user request_id matches multiple requests, all of them will be
         # aborted. This is also what happens in this case in vLLM's output processor.
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
+        # A submit parked on a full request queue would be admitted after this
+        # abort returned; revoke it before delegating to the Orchestrator.
+        await self._settle_pending_submits(internal_ids)
         await self._abort(internal_ids, timeout=timeout)
 
     async def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:

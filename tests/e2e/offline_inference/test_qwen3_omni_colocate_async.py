@@ -175,18 +175,21 @@ async def test_colocate_async_resubmit_window_pause_sleep_cycle() -> None:
     aborted, the abort-retry client resubmits it (the documented ~1 s retry)
     while frontend admission is still open, and only then do
     ``pause_generation(mode="abort")`` and ``sleep(level=1, mode="abort")``
-    land against the still-draining intake. Every control call is
-    timeout-guarded, so a regression deadlocks into a clear
-    ``asyncio.TimeoutError`` instead of wedging the CI job.
+    land against the still-draining intake. The wait_for timeouts bound
+    ordinary (loop-alive) stalls only.
 
     On ``origin/main`` this test fails at the partial-wake step: after
     ``wake_up(tags=["weights"])`` + ``resume_generation()`` the resubmitted
     ``generate()`` raises ``Generation rejected: Engine is partially or fully
     asleep`` instead of waiting for the full wake (the reporter measured ~20 s
-    of ~1 s-interval retry churn per training step). The deadlock legs from
-    the issue (event loop frozen on a full request queue; ``sleep()`` never
-    passing the admission barrier) are guarded by the ``wait_for`` timeouts
-    on pause and sleep.
+    of ~1 s-interval retry churn per training step). This test owns that
+    partial-wake coverage; it does not cover the full-queue freeze legs:
+    the two resubmissions cannot saturate the intake queue, and if the
+    event loop itself wedges, every in-loop ``wait_for`` timer freezes with
+    it. That freeze is covered deterministically by
+    ``test_add_request_async_survives_saturated_queue_on_orchestrator_loop``
+    in tests/entrypoints/test_async_omni_pause_sleep_routing.py, whose
+    watchdog enforces the deadline outside the blocked loop.
     """
     prompt = "What color is the sky? Write a long, detailed explanation."
     device_count = current_omni_platform.device_count()
