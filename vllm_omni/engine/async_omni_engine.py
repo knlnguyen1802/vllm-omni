@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import shutil
 import time
@@ -26,6 +27,7 @@ from vllm_omni.engine.async_engine_utils import (
     upgrade_to_omni_request,
 )
 from vllm_omni.engine.messages import (
+    AbortRequestMessage,
     AddCompanionRequestMessage,
     EngineQueueMessage,
     InteractionMessage,
@@ -564,6 +566,13 @@ class AsyncOmniEngine(OmniEngineBase):
         entry_stage_id: int = 0,
     ) -> tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]:
         """Build the ADD message plus CFG companions without enqueueing."""
+        # Client requests must never bring the server-reserved artifact-dirs
+        # key: every cleanup handler below rmtrees the paths it finds, and a
+        # raise before _build_add_request_message's own sanitization (e.g. the
+        # sampling-params ValueError) would otherwise leave a client-supplied
+        # value reachable by that cleanup (CodeQL py/path-injection).
+        if isinstance(prompt, dict):
+            prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
         msg: StageSubmissionMessage | None = None
         try:
             msg = self._build_add_request_message(
@@ -621,16 +630,137 @@ class AsyncOmniEngine(OmniEngineBase):
         the first loop that awaits it — and janus >= 2 raises RuntimeError
         when any other loop touches it, even with queue capacity free. Route
         the put through the owning loop instead: while the queue is full the
-        bridged put stays a cancellable task on that loop, so a cancelled
-        caller unwinds its submission before the item is admitted (abort()
-        settles queue-parked submits this way), and the frontend loop keeps
-        servicing timers instead of freezing inside a blocking put (#8678).
+        bridged put stays a cancellable task on that loop, and a cancelled
+        caller waits for the owning-loop task to settle before unwinding, so
+        an item that already resumed (a slot freed) lands before any abort
+        RPC the caller sends next — FIFO then aborts it instead of letting
+        the abort overtake an orphan ADD (#8678).
         """
         owner_loop = getattr(self, "orchestrator_loop", None)
         if owner_loop is None or owner_loop is asyncio.get_running_loop():
             await self.request_queue.async_q.put(item)
             return
-        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.request_queue.async_q.put(item), owner_loop))
+        await self._bridge_owned_put(self.request_queue.async_q.put(item))
+
+    async def _put_request_queue_group(
+        self,
+        msg: StageSubmissionMessage,
+        companions: list[AddCompanionRequestMessage],
+    ) -> None:
+        """Enqueue an ADD and its CFG companions as one cancellable unit.
+
+        Same owning-loop routing as :meth:`_put_request_queue`; the whole
+        group runs as a single task on that loop, so cancellation between
+        companion puts is handled where the queue state is visible (see
+        :meth:`_owned_enqueue_group`).
+        """
+        owner_loop = getattr(self, "orchestrator_loop", None)
+        if owner_loop is None or owner_loop is asyncio.get_running_loop():
+            await self._owned_enqueue_group(msg, companions)
+            return
+        await self._bridge_owned_put(self._owned_enqueue_group(msg, companions))
+
+    async def _bridge_owned_put(self, owned_put) -> None:
+        """Await an owning-loop put, settling it before propagating cancel."""
+        settled: concurrent.futures.Future = concurrent.futures.Future()
+
+        async def _run() -> None:
+            try:
+                await owned_put
+            finally:
+                if not settled.done():
+                    settled.set_result(None)
+
+        cf = asyncio.run_coroutine_threadsafe(_run(), getattr(self, "orchestrator_loop"))
+        try:
+            await asyncio.wrap_future(cf)
+        except asyncio.CancelledError:
+            cf.cancel()
+            # The owning-loop task is only cancelled via call_soon_threadsafe;
+            # if a slot freed first, the item can still land. Waiting for the
+            # settlement keeps the cancel-then-abort ordering honest.
+            try:
+                await asyncio.wrap_future(settled)
+            except asyncio.CancelledError:
+                pass
+            raise
+
+    async def _owned_enqueue_group(
+        self,
+        msg: StageSubmissionMessage,
+        companions: list[AddCompanionRequestMessage],
+    ) -> None:
+        """Put the ADD and its companions on the queue's owning loop.
+
+        Runs as one cancellable unit. If teardown happens after the parent
+        landed but before every companion did, the parent is revoked here —
+        it would otherwise hold scheduler and KV capacity for a CFG group
+        that can never complete. If nothing landed, the prepared artifacts
+        are removed.
+        """
+        parent_enqueued = False
+        try:
+            await self.request_queue.async_q.put(msg)
+            parent_enqueued = True
+            for companion in companions:
+                await self.request_queue.async_q.put(companion)
+        except asyncio.CancelledError:
+            if parent_enqueued:
+                self._spawn_orphan_parent_revoke(msg.request_id)
+            else:
+                for artifact_dir in msg.request_artifact_dirs or ():
+                    shutil.rmtree(artifact_dir, ignore_errors=True)
+            raise
+        except BaseException:
+            if not parent_enqueued:
+                for artifact_dir in msg.request_artifact_dirs or ():
+                    shutil.rmtree(artifact_dir, ignore_errors=True)
+            raise
+
+    def _spawn_orphan_parent_revoke(self, request_id: str) -> None:
+        """Revoke a half-enqueued CFG parent as soon as the queue has room.
+
+        Detached on the owning loop so the revoked caller unwinds at once;
+        FIFO places the abort behind the parent ADD, so the Orchestrator
+        aborts a request it actually admitted.
+        """
+        pending = getattr(self, "_orphan_revokes", None)
+        if pending is None:
+            pending = self._orphan_revokes = set[asyncio.Task[None]]()
+        tracked: set[asyncio.Task[None]] = pending
+
+        async def _revoke() -> None:
+            try:
+                await self.request_queue.async_q.put(AbortRequestMessage(request_ids=[request_id]))
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Failed to revoke half-enqueued CFG parent %s", request_id)
+            finally:
+                tracked.discard(revoke_task)
+
+        revoke_task = asyncio.get_running_loop().create_task(_revoke())
+        tracked.add(revoke_task)
+
+    async def _reset_frontend_mm_cache(self) -> None:
+        """Drop sender-cache entries recorded by a submit that never landed.
+
+        ``input_processor.process_inputs`` registers the request's media in
+        the process-global multimodal sender cache before the queue put; a
+        revoked submission means EngineCore never received the request, and a
+        later request with the same media would send only a cache reference
+        and fail with "Multi-modal processor cache miss". Clearing the whole
+        cache is coarse but this path only runs on rare cancelled submits.
+        """
+        processor = getattr(self, "input_processor", None)
+        renderer = getattr(processor, "renderer", None)
+        clear = getattr(renderer, "clear_mm_cache_async", None)
+        if clear is None:
+            return
+        try:
+            await clear()
+        except Exception:
+            logger.exception("Failed to clear the frontend multimodal cache after a revoked submit")
 
     async def add_request_async(
         self,
@@ -679,16 +809,19 @@ class AsyncOmniEngine(OmniEngineBase):
             **({"kv_hints": kv_hints} if kv_hints is not None else {}),
         )
         try:
-            await self._put_request_queue(msg)
+            await self._put_request_queue_group(msg, companions)
         except BaseException:
-            for artifact_dir in msg.request_artifact_dirs or ():
-                shutil.rmtree(artifact_dir, ignore_errors=True)
+            # Artifact cleanup for a group that never landed is handled by
+            # _owned_enqueue_group, which knows whether the parent was
+            # admitted. The frontend sender cache always needs the reset
+            # here: process_inputs recorded this request's media before the
+            # put, and a revoked submission must not leave later same-media
+            # requests with cache-miss failures.
+            await self._reset_frontend_mm_cache()
             raise
         finally:
             if isinstance(msg.original_prompt, dict):
                 msg.original_prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
-        for companion in companions:
-            await self._put_request_queue(companion)
         if companions:
             logger.info(
                 "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
@@ -737,8 +870,15 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         resumable: bool = True,
     ) -> None:
-        """Async wrapper for add_streaming_update()."""
-        self.add_streaming_update(
+        """Async wrapper for add_streaming_update().
+
+        Builds the same streaming_update message but enqueues it through
+        :meth:`_put_request_queue`: a full request queue suspends this
+        coroutine (cancellable) instead of blocking the frontend event loop
+        inside ``sync_q.put``, which would re-create the #8678 wedge for
+        streaming requests against a paused engine.
+        """
+        msg = self._build_add_request_message(
             request_id=request_id,
             prompt=prompt,
             prompt_text=prompt_text,
@@ -748,7 +888,9 @@ class AsyncOmniEngine(OmniEngineBase):
             arrival_time=arrival_time,
             lora_request=lora_request,
             resumable=resumable,
+            message_type="streaming_update",
         )
+        await self._put_request_queue(msg)
 
     def submit_interaction(
         self,

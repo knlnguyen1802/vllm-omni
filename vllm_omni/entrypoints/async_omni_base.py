@@ -475,6 +475,35 @@ class AsyncOmniBase(OmniBase):
         except Exception:
             logger.exception("[AsyncOmni] Cleanup abort failed for %s", ",".join(internal_req_ids))
 
+    async def _enqueue_synthetic_abort(self, request_id: str) -> None:
+        """Enqueue a finished abort output so generate() can end cleanly.
+
+        Used when the Orchestrator returned no abort output for a request
+        (OP not registered yet, unbound replica, orchestrator id drop, or the
+        request was revoked before admission) — without it generate() would
+        hang on ``queue.get``.
+        """
+        state = self.request_states.get(request_id)
+        queue = getattr(state, "queue", None)
+        if queue is None:
+            return
+        final_stage_id = getattr(state, "final_stage_id", None)
+        if final_stage_id is None:
+            final_stage_id = 0
+        stage_metadata = getattr(self, "_stage_meta_list", ())
+        final_output_type = (
+            getattr(stage_metadata[final_stage_id], "final_output_type", None)
+            if final_stage_id < len(stage_metadata)
+            else None
+        ) or "text"
+        await queue.put(
+            self._synthetic_abort_output_message(
+                request_id,
+                stage_id=final_stage_id,
+                final_output_type=final_output_type,
+            )
+        )
+
     async def _abort(self, request_ids: list[str], *, timeout: float | None = None) -> None:
         """Abort request IDs via the engine and enqueue terminal abort outputs.
 
@@ -503,25 +532,8 @@ class AsyncOmniBase(OmniBase):
         for rid in request_ids:
             state = self.request_states.get(rid)
             if state is not None and rid not in delivered:
-                queue = getattr(state, "queue", None)
-                if queue is not None:
-                    final_stage_id = getattr(state, "final_stage_id", None)
-                    if final_stage_id is None:
-                        final_stage_id = 0
-                    stage_metadata = getattr(self, "_stage_meta_list", ())
-                    final_output_type = (
-                        getattr(stage_metadata[final_stage_id], "final_output_type", None)
-                        if final_stage_id < len(stage_metadata)
-                        else None
-                    ) or "text"
-                    await state.queue.put(
-                        self._synthetic_abort_output_message(
-                            rid,
-                            stage_id=final_stage_id,
-                            final_output_type=final_output_type,
-                        )
-                    )
-                    delivered.add(rid)
+                await self._enqueue_synthetic_abort(rid)
+                delivered.add(rid)
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.get(rid)

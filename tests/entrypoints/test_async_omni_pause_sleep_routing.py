@@ -1346,6 +1346,230 @@ def test_abort_revokes_queue_parked_submit():
 
 
 @pytest.mark.cpu
+def test_revoked_submit_finishes_generate_as_abort():
+    """pause/sleep/abort revoking a parked submit must end generate() with a
+    finished abort output — not a CancelledError the caller never asked for
+    (the abort-retry RL client gathers over rollout batches, and a cancelled
+    member kills the whole gather)."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
+        omni._paused = False
+        omni._hold_admission_until_resume = False
+        omni.request_states = {}
+        omni.engine.num_stages = 1
+        omni.log_stats = False
+        omni._record_request_failure_once = lambda *args, **kwargs: None
+        omni._maybe_expand_sampling_params = lambda spl: spl
+        omni.resolve_sampling_params_list = lambda spl, **_: spl
+        omni._compute_final_stage_id = lambda output_modalities: 0
+        omni._compute_final_output_stage_ids = lambda output_modalities: [0]
+        omni._get_pd_separation_pair = lambda: None
+        omni._publish_request_gauges = lambda total: None
+        omni._log_summary_and_cleanup = lambda request_id, reason="stage_error": None
+
+        submit_parked = asyncio.Event()
+
+        async def parked_submit(*args, **kwargs):
+            await submit_parked.wait()
+
+        omni.engine.add_request_async = parked_submit
+
+        async def drain_until_finished(request_id, *args, **kwargs):
+            state = omni.request_states[request_id]
+            while True:
+                message = await state.queue.get()
+                assert message.finished
+                yield message
+                return  # a finished message ends the real results loop
+
+        omni._process_orchestrator_results = drain_until_finished
+
+        outputs: list = []
+
+        async def consume() -> None:
+            async for output in omni.generate("hi", sampling_params_list=[SimpleNamespace(max_tokens=1)]):
+                outputs.append(output)
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert len(omni._pending_submits) == 1
+
+        # pause_generation(mode="abort")/sleep()/abort() revoke the parked submit.
+        for pending in list(omni._pending_submits.values()):
+            pending.cancel()
+        await asyncio.wait_for(task, timeout=2)
+
+        assert outputs, "revoked submit produced no terminal output"
+        assert outputs[-1].finished
+        assert outputs[-1].engine_outputs.outputs[0].finish_reason == "abort"
+        assert not task.cancelled(), "generate() ended as cancelled, not aborted"
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_aborts_tracked_streaming_submit():
+    """A streaming ADD tracked via _submit_tracked holds an admission slot;
+    sleep(mode="abort") must cancel it and pass the ``_admitting == 0``
+    barrier without leaking a CancelledError into the pump (streaming
+    submits were invisible to the cancel set before this fix)."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
+        omni._admitting = 0
+        revoked = asyncio.Event()
+
+        async def parked_add() -> None:
+            await asyncio.Event().wait()
+
+        async def on_revoke() -> None:
+            revoked.set()
+            await asyncio.sleep(0)
+
+        async def pump() -> None:
+            task = asyncio.get_running_loop().create_task(parked_add())
+            await omni._submit_tracked("stream-1", task, on_revoke=on_revoke)
+
+        pump_task = asyncio.create_task(pump())
+        await asyncio.sleep(0.05)
+        assert omni._admitting == 1, "streaming ADD did not take its admission slot"
+
+        await asyncio.wait_for(omni.sleep(level=1, mode="abort"), timeout=2)
+
+        assert revoked.is_set(), "streaming submit was cancelled without the revoke conversion"
+        assert omni._admitting == 0
+        await asyncio.wait_for(pump_task, timeout=1)  # completes instead of raising
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_cancelled_companion_put_revokes_admitted_parent(mocker):
+    """Cancelling between parent and companion puts must revoke the parent:
+    it would otherwise sit admitted with scheduler and KV capacity for a CFG
+    group that can never complete."""
+
+    import faulthandler
+    import threading
+
+    import janus
+
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+    from vllm_omni.engine.messages import AbortRequestMessage
+
+    queue = janus.Queue(maxsize=2)
+    orch_loop = asyncio.new_event_loop()
+    orch_thread = threading.Thread(target=orch_loop.run_forever, daemon=True, name="orchestrator")
+    orch_thread.start()
+
+    faulthandler.dump_traceback_later(30, exit=True)
+    try:
+
+        async def run() -> None:
+            engine = object.__new__(AsyncOmniEngine)
+            engine.request_queue = queue
+            engine.orchestrator_loop = orch_loop
+
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(queue.async_q.join(), orch_loop))
+            queue.sync_q.put_nowait(object())  # leave room for exactly the parent
+
+            parent = SimpleNamespace(request_id="parent-1", request_artifact_dirs=None)
+            companion = object()
+            group = asyncio.create_task(engine._put_request_queue_group(parent, [companion]))
+            await asyncio.sleep(0.1)
+            assert not group.done(), "companion put should be parked on the full queue"
+            assert queue.sync_q.qsize() == 2, "parent should be enqueued ahead of the companion"
+
+            group.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await group
+
+            # Free the room the detached revoke is waiting for, then give the
+            # owning loop time to land the AbortRequestMessage behind the ADD.
+            queue.sync_q.get_nowait()
+            queue.sync_q.get_nowait()
+            for _ in range(100):
+                if queue.sync_q.qsize():
+                    break
+                await asyncio.sleep(0.02)
+            assert queue.sync_q.qsize() == 1, "orphan-parent revoke never landed"
+            revoked = queue.sync_q.get_nowait()
+            assert isinstance(revoked, AbortRequestMessage)
+            assert revoked.request_ids == ["parent-1"]
+
+        asyncio.run(run())
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        queue.close()
+        orch_loop.call_soon_threadsafe(orch_loop.stop)
+        orch_thread.join(timeout=5)
+        orch_loop.close()
+
+
+@pytest.mark.cpu
+def test_revoked_submit_resets_frontend_mm_cache(mocker):
+    """A submit revoked on a full queue must clear the frontend sender cache:
+    process_inputs already recorded the request's media, EngineCore never got
+    the request, and a later same-media request would fail with "Multi-modal
+    processor cache miss" (HTTP 503)."""
+
+    import janus
+
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    async def run() -> None:
+        engine = object.__new__(AsyncOmniEngine)
+        engine.request_queue = janus.Queue(maxsize=1)
+        engine.request_queue.sync_q.put_nowait(object())
+        engine.prompt_expand_func = None
+        engine.orchestrator_loop = None  # exercise the same-loop path
+        clear_mm_cache = AsyncMock()
+        engine.input_processor = SimpleNamespace(renderer=SimpleNamespace(clear_mm_cache_async=clear_mm_cache))
+        mocker.patch.object(
+            engine,
+            "_build_add_request_message",
+            return_value=SimpleNamespace(request_artifact_dirs=None, original_prompt=None),
+        )
+
+        submit = asyncio.create_task(engine.add_request_async(request_id="req-mm", prompt={"prompt": "hi"}))
+        await asyncio.sleep(0.05)
+        assert not submit.done()
+
+        submit.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        clear_mm_cache.assert_awaited_once()
+        assert engine.request_queue.sync_q.qsize() == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_prepare_add_request_drops_client_artifact_dirs_before_any_raise(mocker):
+    """The server-reserved artifact-dirs key must be popped before anything
+    can raise: the sampling-params ValueError fires before the transform's
+    own sanitization, and the failure handler rmtrees whatever the key
+    holds (CodeQL py/path-injection)."""
+
+    from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.prompt_expand_func = None
+    prompt = {"prompt": "hi", REQUEST_ARTIFACT_DIRS_KEY: ["/etc", "/important-data"]}
+    mocker.patch.object(engine, "_build_add_request_message", side_effect=ValueError("nope"))
+
+    with pytest.raises(ValueError, match="nope"):
+        engine._prepare_add_request(request_id="req-1", prompt=prompt, sampling_params_list=[object()])
+
+    assert REQUEST_ARTIFACT_DIRS_KEY not in prompt, "client-supplied artifact dirs survived a prepare failure"
+
+
+@pytest.mark.cpu
 def test_generate_waits_for_full_wake_instead_of_erroring():
     """After a partial wake (kv_cache still asleep), generate() parks at the
     admission gate instead of raising "partially or fully asleep" and forcing

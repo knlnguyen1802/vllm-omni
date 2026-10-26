@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -326,14 +326,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                         **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                     )
                 )
-                pending = getattr(self, "_pending_submits", None)
-                if pending is None:
-                    pending = self._pending_submits = {}
-                pending[request_id] = submit_task
-                try:
-                    await submit_task
-                finally:
-                    pending.pop(request_id, None)
+                await self._submit_tracked(
+                    request_id,
+                    submit_task,
+                    on_revoke=lambda: self._finish_revoked_submit(request_id),
+                )
             submit_ts = time.time()
             stage_first_ts = cast(list[float | None], req_state.metrics.stage_first_ts)
             stage_first_ts[0] = submit_ts
@@ -404,10 +401,56 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         Their queue puts suspend on a paused engine; without the cancel they
         would hold their admission slots forever and sleep() would wait on
         ``_admitting == 0`` indefinitely. Cancellation unwinds through
-        generate()'s normal abort handling, releasing the slot.
+        generate()'s normal abort handling, releasing the slot. Callers hold
+        ``_pause_cond`` (or run before any generate can pass the gate), so a
+        submit cannot register after this snapshot; the ``_admitting == 0``
+        barrier the callers wait on afterwards settles the rest.
         """
         for task in list(getattr(self, "_pending_submits", {}).values()):
             task.cancel()
+
+    async def _submit_tracked(
+        self,
+        request_id: str,
+        submit_task: asyncio.Task,
+        on_revoke: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Gate + await one engine submit, tracked for pause/sleep/abort revoke.
+
+        Registration happens before the admission gate so the cancel snapshot
+        inside ``pause_generation()``/``sleep()`` cannot miss a submit that is
+        still waiting for the gate. When the submit is revoked (the task is
+        cancelled while the generate() caller was not), ``on_revoke`` closes
+        the request out as an abort instead of letting the CancelledError
+        escape into a caller that never cancelled anything.
+        """
+        pending = getattr(self, "_pending_submits", None)
+        if pending is None:
+            pending = self._pending_submits = {}
+        pending[request_id] = submit_task
+        try:
+            await self._submit_with_admission(submit_task)
+        except asyncio.CancelledError:
+            # The submit task is cancelled only when pause/sleep/abort revoke
+            # it; a cancellation of the generate()/pump task itself arrives
+            # with the submit task still running and must keep propagating.
+            if not submit_task.cancelled():
+                raise
+            if on_revoke is not None:
+                await on_revoke()
+        finally:
+            pending.pop(request_id, None)
+
+    async def _finish_revoked_submit(self, request_id: str) -> None:
+        """Close out a submit revoked before admission as an aborted request.
+
+        The abort-retry RL client handles a normal generator end with
+        ``finish_reason="abort"`` (an admitted-then-aborted request ends
+        exactly that way); a CancelledError instead would mark the caller
+        task cancelled and kill a ``gather`` over the rollout batch.
+        """
+        self._record_request_failure_once(request_id, reason="client_abort")
+        await self._enqueue_synthetic_abort(request_id)
 
     async def _submit_with_admission(self, awaitable):
         """Wait for resume, hold one admission slot for a single EngineCore submit."""
@@ -470,6 +513,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 )
             )
 
+        async def _revoke_streaming() -> None:
+            # pause/sleep/abort revoked the parked submit: wake generate()
+            # (it may still wait on first_chunk_submitted) and end the
+            # request as aborted instead of unwinding the pump as a client
+            # disconnect.
+            _mark_first_chunk_submitted()
+            await self._finish_revoked_submit(request_id)
+
+        async def _submit_streaming_chunk(submit_coro) -> None:
+            """One streaming ADD/update: admission-gated and revoke-tracked."""
+            submit_task = asyncio.get_running_loop().create_task(submit_coro)
+            await self._submit_tracked(request_id, submit_task, on_revoke=_revoke_streaming)
+
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
             cancelled = False
@@ -483,7 +539,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     prompt_text, _, _ = extract_prompt_components(self.model_config, chunk_prompt)
 
                     if not has_submitted_first_chunk:
-                        await self._submit_with_admission(
+                        await _submit_streaming_chunk(
                             self.engine.add_request_async(
                                 request_id=request_id,
                                 prompt=chunk_prompt,
@@ -500,7 +556,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                         has_submitted_first_chunk = True
                         _mark_first_chunk_submitted()
                     else:
-                        await self._submit_with_admission(
+                        await _submit_streaming_chunk(
                             self.engine.add_streaming_update_async(
                                 request_id=request_id,
                                 prompt=chunk_prompt,
@@ -527,7 +583,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                         final_prompt = TokensPrompt(prompt_token_ids=[0])
 
                         if has_submitted_first_chunk:
-                            await self._submit_with_admission(
+                            await _submit_streaming_chunk(
                                 self.engine.add_streaming_update_async(
                                     request_id=request_id,
                                     prompt=final_prompt,
@@ -541,7 +597,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 )
                             )
                         else:
-                            await self._submit_with_admission(
+                            await _submit_streaming_chunk(
                                 self.engine.add_request_async(
                                     request_id=request_id,
                                     prompt=final_prompt,
@@ -1133,8 +1189,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # slept, so wake_up() has no tags to restore and never reaches the
         # block that clears ``_paused``.
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
-        if mode == "abort":
-            self._cancel_pending_submits()
 
         # Block admission before any sleep RPC so generate() waits on
         # _pause_cond during the drain/offload window. Wait until generate()
@@ -1142,6 +1196,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # failed) so EngineCore does not see ADD frames while sleeping.
         async with self._pause_cond:
             self._paused = True
+            # Cancel inside the lock, after the gate closed (matching
+            # pause_generation's ordering): a generate that has not passed
+            # the gate cannot register a submit this snapshot would miss.
+            if mode == "abort":
+                self._cancel_pending_submits()
             await self._pause_cond.wait_for(lambda: getattr(self, "_admitting", 0) == 0)
         # EngineCore.sleep resets receiver caches itself; only clear P0 here.
         if 0 in ar_stage_ids:
