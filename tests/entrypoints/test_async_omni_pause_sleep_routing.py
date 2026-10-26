@@ -466,10 +466,12 @@ def test_sleep_diffusion_only_skips_engine_core_collective_rpc():
 
 @pytest.mark.cpu
 def test_streaming_wait_for_first_chunk_does_not_block_sleep():
-    """Waiting for the next client chunk must not hold an admission slot."""
+    """Waiting for the next client chunk must not hold an admission slot, and
+    a chunk submit arriving after sleep() parks at the gate slot-free."""
 
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
         rpc_started = asyncio.Event()
         first_chunk = asyncio.Event()
 
@@ -482,7 +484,12 @@ def test_streaming_wait_for_first_chunk_does_not_block_sleep():
 
         async def wait_then_submit() -> None:
             await first_chunk.wait()
-            await omni._submit_with_admission(asyncio.sleep(0))
+            await omni._submit_tracked(
+                "stream-1",
+                lambda: asyncio.sleep(0),
+                hold_admission=True,
+                on_revoke=lambda: asyncio.sleep(0),
+            )
 
         wait_task = asyncio.create_task(wait_then_submit())
         sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
@@ -492,47 +499,15 @@ def test_streaming_wait_for_first_chunk_does_not_block_sleep():
         await asyncio.wait_for(sleep_task, timeout=1)
         assert rpc_started.is_set()
 
+        first_chunk.set()
+        await asyncio.sleep(0.05)
+        # Parked at the (now closed) admission gate: still no slot held.
+        assert not wait_task.done()
+        assert omni._admitting == 0
+
         wait_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await wait_task
-        assert omni._admitting == 0
-
-    asyncio.run(run())
-
-
-@pytest.mark.cpu
-def test_streaming_in_flight_add_blocks_sleep():
-    """Sleep must wait while a streaming ADD/update holds an admission slot."""
-
-    async def run() -> None:
-        omni = _make_omni(stage_types=["llm"])
-        add_started = asyncio.Event()
-        add_release = asyncio.Event()
-        rpc_started = asyncio.Event()
-
-        async def rpc_side_effect(**kwargs):
-            if kwargs.get("method") == "sleep":
-                rpc_started.set()
-            return [True]
-
-        omni.collective_rpc = AsyncMock(side_effect=rpc_side_effect)
-
-        async def slow_add() -> None:
-            add_started.set()
-            await add_release.wait()
-
-        add_task = asyncio.create_task(omni._submit_with_admission(slow_add()))
-        await add_started.wait()
-        sleep_task = asyncio.create_task(omni.sleep(level=1, mode="abort"))
-        await asyncio.sleep(0.05)
-        assert not sleep_task.done()
-        assert not rpc_started.is_set()
-        assert omni._admitting == 1
-
-        add_release.set()
-        await asyncio.wait_for(add_task, timeout=1)
-        await asyncio.wait_for(sleep_task, timeout=1)
-        assert rpc_started.is_set()
         assert omni._admitting == 0
 
     asyncio.run(run())
@@ -1431,18 +1406,90 @@ def test_sleep_aborts_tracked_streaming_submit():
             await asyncio.sleep(0)
 
         async def pump() -> None:
-            task = asyncio.get_running_loop().create_task(parked_add())
-            await omni._submit_tracked("stream-1", task, on_revoke=on_revoke)
+            await omni._submit_tracked("stream-1", parked_add, hold_admission=True, on_revoke=on_revoke)
 
         pump_task = asyncio.create_task(pump())
         await asyncio.sleep(0.05)
         assert omni._admitting == 1, "streaming ADD did not take its admission slot"
 
         await asyncio.wait_for(omni.sleep(level=1, mode="abort"), timeout=2)
+        await asyncio.wait_for(pump_task, timeout=1)  # completes instead of raising
 
         assert revoked.is_set(), "streaming submit was cancelled without the revoke conversion"
         assert omni._admitting == 0
-        await asyncio.wait_for(pump_task, timeout=1)  # completes instead of raising
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_tracked_non_streaming_submit_does_not_run_while_paused_and_holds_single_slot():
+    """Non-streaming generate() already holds the outer admission slot across
+    add_request: _submit_tracked must not stack a second one (sleep()'s
+    ``_admitting == 0`` barrier double-counts), and the gated submit body
+    must not start while the engine is paused."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
+        omni._admitting = 1  # generate()'s outer slot
+        omni._paused = True
+        body_started = asyncio.Event()
+
+        async def add() -> None:
+            body_started.set()
+
+        async def generate_like() -> None:
+            await omni._submit_tracked("req-1", add, hold_admission=False)
+
+        task = asyncio.create_task(generate_like())
+        await asyncio.sleep(0.05)
+        assert not body_started.is_set(), "submit body ran while the engine was paused"
+        assert omni._admitting == 1, "tracked non-streaming submit stacked a second admission slot"
+
+        omni._paused = False
+        async with omni._pause_cond:
+            omni._pause_cond.notify_all()
+
+        await asyncio.wait_for(task, timeout=1)
+        assert body_started.is_set()
+        assert omni._admitting == 1  # the slot still held is the caller's
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_sleep_releases_gate_parked_tracked_submit():
+    """A tracked submit parked at the admission gate when sleep() runs must be
+    revoked and unwound: its caller holds the outer slot, so a missed cancel
+    would deadlock sleep()'s ``_admitting == 0`` barrier behind a paused
+    engine."""
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
+        omni._admitting = 1  # generate()'s outer slot
+        omni._paused = True  # the gate closed before this submit registered
+        revoked = asyncio.Event()
+
+        async def add() -> None:
+            raise AssertionError("submit body must not run while paused")
+
+        async def on_revoke() -> None:
+            revoked.set()
+            await asyncio.sleep(0)
+
+        async def generate_like() -> None:
+            await omni._submit_tracked("req-1", add, hold_admission=False, on_revoke=on_revoke)
+            await omni._release_generate_admission()  # caller releases the outer slot
+
+        task = asyncio.create_task(generate_like())
+        await asyncio.sleep(0.05)
+        assert not task.done()
+
+        await asyncio.wait_for(omni.sleep(level=1, mode="abort"), timeout=2)
+        assert revoked.is_set()
+        assert omni._admitting == 0, "sleep's barrier stayed blocked behind a gate-parked submit"
+        await asyncio.wait_for(task, timeout=1)
 
     asyncio.run(run())
 
@@ -1453,6 +1500,7 @@ def test_cancelled_companion_put_revokes_admitted_parent(mocker):
     it would otherwise sit admitted with scheduler and KV capacity for a CFG
     group that can never complete."""
 
+    import concurrent.futures
     import faulthandler
     import threading
 
@@ -1473,13 +1521,16 @@ def test_cancelled_companion_put_revokes_admitted_parent(mocker):
             engine = object.__new__(AsyncOmniEngine)
             engine.request_queue = queue
             engine.orchestrator_loop = orch_loop
+            clear_mm_cache = AsyncMock()
+            engine.input_processor = SimpleNamespace(renderer=SimpleNamespace(clear_mm_cache_async=clear_mm_cache))
 
             await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(queue.async_q.join(), orch_loop))
             queue.sync_q.put_nowait(object())  # leave room for exactly the parent
 
             parent = SimpleNamespace(request_id="parent-1", request_artifact_dirs=None)
             companion = object()
-            group = asyncio.create_task(engine._put_request_queue_group(parent, [companion]))
+            settled: concurrent.futures.Future = concurrent.futures.Future()
+            group = asyncio.create_task(engine._put_request_queue_group(parent, [companion], settled))
             await asyncio.sleep(0.1)
             assert not group.done(), "companion put should be parked on the full queue"
             assert queue.sync_q.qsize() == 2, "parent should be enqueued ahead of the companion"
@@ -1487,6 +1538,11 @@ def test_cancelled_companion_put_revokes_admitted_parent(mocker):
             group.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await group
+            # The parent landed: its media is in the sender cache legitimately,
+            # so the frontend cache reset must be skipped (only the never-
+            # admitted case clears it).
+            assert settled.result() is True
+            clear_mm_cache.assert_not_awaited()
 
             # Free the room the detached revoke is waiting for, then give the
             # owning loop time to land the AbortRequestMessage behind the ADD.
@@ -1664,22 +1720,25 @@ def test_generate_waits_for_full_wake_instead_of_erroring():
 
 
 @pytest.mark.cpu
-def test_submit_with_admission_waits_for_full_wake():
-    """The streaming pump's per-submit admission gate also waits out a
-    partial wake instead of submitting into a partially-asleep engine
-    (#8678)."""
+def test_tracked_streaming_submit_waits_for_full_wake():
+    """The streaming pump's per-submit admission gate waits out a partial
+    wake inside the tracked task instead of submitting into a
+    partially-asleep engine (#8678) — the gated body must not start early."""
 
     async def run() -> None:
         omni = _make_omni(stage_types=["llm"])
+        omni._pending_submits = {}
         omni._sleeping_tags = {"kv_cache"}
 
         started = asyncio.Event()
 
-        async def payload() -> str:
+        async def payload() -> None:
             started.set()
-            return "done"
 
-        task = asyncio.create_task(omni._submit_with_admission(payload()))
+        async def pump() -> None:
+            await omni._submit_tracked("stream-1", payload, hold_admission=True)
+
+        task = asyncio.create_task(pump())
         await asyncio.sleep(0.05)
         # Parked before the gate: payload not started, no admission slot held.
         assert not started.is_set()
@@ -1689,7 +1748,8 @@ def test_submit_with_admission_waits_for_full_wake():
         async with omni._pause_cond:
             omni._pause_cond.notify_all()
 
-        assert await asyncio.wait_for(task, timeout=2) == "done"
+        await asyncio.wait_for(task, timeout=2)
+        assert started.is_set()
         assert omni._admitting == 0
 
     asyncio.run(run())
