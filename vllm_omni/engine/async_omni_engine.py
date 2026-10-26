@@ -16,6 +16,7 @@ from typing import Any, Literal, cast
 
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.multimodal.cache import ShmObjectStoreSenderCache
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
 
@@ -795,9 +796,19 @@ class AsyncOmniEngine(OmniEngineBase):
         later request with the same media would send only a cache reference
         and fail with "Multi-modal processor cache miss". Clearing the whole
         cache is coarse but this path only runs on rare cancelled submits.
+
+        The shm sender cache is skipped: it hands EngineCore shared-memory
+        addresses, so an entry whose request never landed is still readable,
+        and ``clear_cache()`` there resets the ring buffer under requests
+        that are still in flight. The cost is that the revoked request's
+        writer reference is never balanced by a reader, so its buffer stays
+        pinned and later media may fall back to full-payload IPC once the
+        ring fills; releasing it needs a writer-release API from vLLM.
         """
         processor = getattr(self, "input_processor", None)
         renderer = getattr(processor, "renderer", None)
+        if isinstance(getattr(renderer, "mm_processor_cache", None), ShmObjectStoreSenderCache):
+            return
         clear = getattr(renderer, "clear_mm_cache_async", None)
         if clear is None:
             return

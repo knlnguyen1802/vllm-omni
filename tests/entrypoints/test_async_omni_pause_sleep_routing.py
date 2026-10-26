@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from vllm.renderers import BaseRenderer
@@ -1863,6 +1863,48 @@ def test_revoked_submit_resets_frontend_mm_cache(mocker):
             await submit
         clear_mm_cache.assert_awaited_once()
         assert engine.request_queue.sync_q.qsize() == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_revoked_submit_keeps_shm_sender_cache(mocker):
+    """The shm sender cache hands EngineCore shared-memory addresses, so a
+    revoked submit's entries stay readable; a full clear there would reset
+    the ring buffer under requests that are still in flight."""
+
+    import janus
+    from vllm.multimodal.cache import ShmObjectStoreSenderCache
+
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    async def run() -> None:
+        engine = object.__new__(AsyncOmniEngine)
+        engine.request_queue = janus.Queue(maxsize=1)
+        engine.request_queue.sync_q.put_nowait(object())
+        engine.prompt_expand_func = None
+        engine.orchestrator_loop = None
+        clear_mm_cache = AsyncMock()
+        engine.input_processor = SimpleNamespace(
+            renderer=SimpleNamespace(
+                mm_processor_cache=MagicMock(spec=ShmObjectStoreSenderCache),
+                clear_mm_cache_async=clear_mm_cache,
+            )
+        )
+        mocker.patch.object(
+            engine,
+            "_build_add_request_message",
+            return_value=SimpleNamespace(request_artifact_dirs=None, original_prompt=None),
+        )
+
+        submit = asyncio.create_task(engine.add_request_async(request_id="req-mm", prompt={"prompt": "hi"}))
+        await asyncio.sleep(0.05)
+        assert not submit.done()
+
+        submit.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await submit
+        clear_mm_cache.assert_not_awaited()
 
     asyncio.run(run())
 
