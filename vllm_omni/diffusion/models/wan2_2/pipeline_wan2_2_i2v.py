@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_p
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
     resolve_wan_output_fps,
@@ -40,14 +41,18 @@ from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
+    apply_wan_runtime_scheduler,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    refresh_cache_for_denoise_schedule,
+    resolve_wan_boundary_ratio,
     resolve_wan_flow_shift,
     resolve_wan_guidance_scales,
     resolve_wan_sample_solver,
     retrieve_latents,
+    set_wan_scheduler_timesteps,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
@@ -204,6 +209,9 @@ class Wan22I2VPipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts.
+    default_num_inference_steps: ClassVar[int] = 40
     _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
@@ -324,7 +332,11 @@ class Wan22I2VPipeline(
 
         self._sample_solver = "unipc"
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
-        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: build_wan_scheduler(self._sample_solver, self._flow_shift),
+            local_files_only=os.path.exists(od_config.model),
+        )
 
         # VAE scale factors
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
@@ -515,7 +527,9 @@ class Wan22I2VPipeline(
         height = common.height or 480
         width = common.width or 832
         num_frames = common.num_frames or 81
-        num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+        num_steps = (
+            self.default_num_inference_steps if common.num_inference_steps is None else common.num_inference_steps
+        )
 
         output_type = common.output_type or "np"
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
@@ -528,10 +542,7 @@ class Wan22I2VPipeline(
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
 
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-        if boundary_ratio is None:
-            boundary_ratio = 0.875
-            logger.warning("boundary_ratio is required for I2V generation. using default value 0.875")
+        boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="I2V")
 
         # Validate inputs
         self.check_inputs(
@@ -625,21 +636,17 @@ class Wan22I2VPipeline(
         sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
         flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
         if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
-            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-            self._sample_solver = sample_solver
-            self._flow_shift = flow_shift
+            apply_wan_runtime_scheduler(self, sample_solver, flow_shift)
 
         # Timesteps
-        if sample_solver == "unipc":
-            self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
-        else:
-            self.scheduler.set_timesteps(num_steps, device=device)
+        set_wan_scheduler_timesteps(self, num_steps, device, sample_solver, flow_shift)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
         boundary_timestep = None
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         # Prepare latents (use out_channels=16 for VAE latent, not in_channels=36)
         num_channels_latents = self.transformer.config.out_channels

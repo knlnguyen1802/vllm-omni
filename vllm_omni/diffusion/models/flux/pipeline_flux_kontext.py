@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # This implementation is heavily inspired by the diffusers project.
 # Original implementation: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux/pipeline_flux_kontext.py
@@ -33,6 +33,7 @@ from vllm_omni.diffusion.models.flux import (
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -109,9 +110,13 @@ class FluxKontextPipeline(
         model = od_config.model
         local_files_only = os.path.exists(model)
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model,
-            subfolder="scheduler",
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model,
+                subfolder="scheduler",
+                local_files_only=local_files_only,
+            ),
             local_files_only=local_files_only,
         )
 
@@ -515,7 +520,6 @@ class FluxKontextPipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
     ) -> torch.Tensor:
         self.scheduler.set_begin_index(0)
-        self.transformer.do_true_cfg = do_true_cfg
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Test doubles for custom-pipeline E2E and RLHF integration.
 
@@ -27,6 +27,7 @@ from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 from msgspec import field
 
+from tests.e2e.features.helpers.custom_scheduler import mark_scheduler_event
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.qwen_image import QwenImagePipeline
@@ -69,7 +70,17 @@ class FlowMatchSDEDiscreteSchedulerForTest(FlowMatchEulerDiscreteScheduler):
     """SDE version of the FlowMatchEulerDiscreteScheduler.
     The implementation is based on FlowGRPO paper (https://arxiv.org/abs/2505.05470)
     and diffusers v0.37 branch.
+
+    When ``VLLM_OMNI_CUSTOM_SCHEDULER_MARKER`` is set, construction and
+    ``step`` append marker lines so scheduler-injection tests can observe
+    this class from the pytest process. ``set_timesteps`` is inherited
+    unchanged so Qwen-Image's ``retrieve_timesteps`` still sees ``sigmas``.
     """
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        mark_scheduler_event("constructed")
+        return super().from_pretrained(*args, **kwargs)
 
     def step(
         self,
@@ -122,6 +133,7 @@ class FlowMatchSDEDiscreteSchedulerForTest(FlowMatchEulerDiscreteScheduler):
             return_logprobs (`bool`, *optional*, defaults to True):
                 Whether to return log probabilities of the previous sample.
         """
+        mark_scheduler_event("stepped")
 
         if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
             raise ValueError(
@@ -290,6 +302,36 @@ class vLLMOmniColocateWorkerExtensionForTest(CustomPipelineWorkerExtension):
         """Return a stable identifier for assertions in unit tests."""
         return "vllm-omni-colocate-worker-extension-for-test"
 
+    def start_counting_synchronize_device(self) -> bool:
+        """Count pause-barrier runs on this rank (test-only)."""
+        self._synchronize_device_calls = 0
+        inner = type(self).synchronize_device
+
+        def _counted(timeout=None):
+            self._synchronize_device_calls += 1
+            return inner(self, timeout=timeout)
+
+        self.synchronize_device = _counted
+        return True
+
+    def synchronize_device_seen(self) -> bool:
+        """True from every rank only when each rank ran the barrier at least once."""
+        return getattr(self, "_synchronize_device_calls", 0) > 0
+
+    def set_synchronize_device_failure(self, rank: int, fail: bool) -> bool:
+        """Make (or stop making) the pause barrier fail on ``rank`` (test-only)."""
+        if self.rank != rank:
+            return True
+        if fail:
+
+            def _fail(timeout=None):
+                raise RuntimeError(f"injected barrier failure on rank {rank}")
+
+            self.synchronize_device = _fail
+        else:
+            self.__dict__.pop("synchronize_device", None)
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Pipeline layer
@@ -304,6 +346,9 @@ def _maybe_to_cpu(v):
 
 class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
     supports_request_batch = False
+    # Consumes OmniCustomPrompt.prompt_ids verbatim in forward(); declaring it
+    # keeps engine admission explicit for this RL-rollout style pipeline.
+    supports_pre_tokenized_prompt_ids = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)

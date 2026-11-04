@@ -47,6 +47,7 @@ from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
     GlmImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.schedulers import build_pipeline_scheduler
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -193,6 +194,10 @@ def retrieve_timesteps(
                 f" timestep or sigma schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, sigmas=sigmas, device=device, **kwargs)
+        # GLM-Image conditions the DiT on the *unshifted* timesteps while integrating with the
+        # resolution-shifted sigmas. FlowMatchEulerDiscreteScheduler.set_timesteps (diffusers >= 0.40)
+        # overwrites provided timesteps with `sigmas * num_train_timesteps`, so restore them here.
+        scheduler.timesteps = torch.as_tensor(timesteps, dtype=torch.float32, device=scheduler.timesteps.device)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif timesteps is not None:
@@ -277,8 +282,13 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
             model_path = download_weights_from_hf_specific(model, od_config.revision, ["*"])
 
         # Load scheduler
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model_path, subfolder="scheduler", local_files_only=True
+        self.scheduler = build_pipeline_scheduler(
+            od_config,
+            default_builder=lambda: FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model_path, subfolder="scheduler", local_files_only=True
+            ),
+            model=model_path,
+            local_files_only=True,
         )
 
         # Load text encoder (T5 for glyph embeddings)
